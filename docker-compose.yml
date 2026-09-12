@@ -1,0 +1,19 @@
+services:
+  receipt-scanner:
+    build:
+      context: .
+    init: true
+    restart: unless-stopped
+    environment:
+      DISPLAY: ":99"
+      TZ: "Europe/Kyiv"
+      RS_DATABASE_URL: "sqlite:////app/data/receipts.db"
+      RS_BASE_URL: "${RS_BASE_URL:-http://localhost:8001}"
+      # Keep this value stable after the first launch: changing it invalidates
+      # encrypted store credentials already saved in receipts.db.
+      RS_SECRET_KEY: "${RS_SECRET_KEY:-CHANGE_ME_dev_only_insecure_key_______________=}"
+    volumes:
+      - ./backend/data:/app/data
+    ports:
+      - "8001:8001"
+    shm_size: "512mb"

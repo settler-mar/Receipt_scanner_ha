@@ -1,0 +1,34 @@
+name: "Receipt Scanner"
+version: "0.1.0"
+slug: "receipt_scanner"
+description: "Збір, зберігання та перегляд чеків і гарантій магазинів"
+arch:
+  - amd64
+startup: application
+boot: auto
+init: false
+ingress: true
+ingress_port: 8001
+ingress_stream: true
+panel_icon: "mdi:receipt-text"
+panel_title: "Receipt Scanner"
+panel_admin: true
+watchdog: "http://[HOST]:[PORT:8001]/api/health"
+map:
+  - type: data
+    read_only: false
+    path: /app/data
+ports:
+  8001/tcp: null
+ports_description:
+  8001/tcp: "Прямий доступ без Ingress (необов'язково)"
+options:
+  base_url: ""
+  secret_key: "CHANGE_ME_dev_only_insecure_key_______________="
+  google_client_id: ""
+  google_client_secret: ""
+schema:
+  base_url: "str?"
+  secret_key: password
+  google_client_id: "str?"
+  google_client_secret: "password?"

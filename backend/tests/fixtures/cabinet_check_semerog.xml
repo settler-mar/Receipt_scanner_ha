@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<CHECK>
+  <CHECKHEAD>
+    <DOCTYPE>0</DOCTYPE>
+    <DOCSUBTYPE>0</DOCSUBTYPE>
+    <UID>a6008d71-b568-4a2b-8ce7-5ad28f8fd01d</UID>
+    <TIN>3074818469</TIN>
+    <ORGNM>СЕМЕРОГ ІННА ПЕТРІВНА</ORGNM>
+    <POINTNM>Магазин ФОП СЕМЕРОГ ІННА ПЕТРІВНА</POINTNM>
+    <POINTADDR>КИЇВСЬКА ОБЛАСТЬ, БУЧАНСЬКИЙ РАЙОН, СЕЛО СВЯТОПЕТРІВСЬКЕ ВУЛ. БОЯРСЬКА</POINTADDR>
+    <ORDERDATE>06092026</ORDERDATE>
+    <ORDERTIME>165327</ORDERTIME>
+    <ORDERNUM>7056</ORDERNUM>
+    <CASHDESKNUM>1</CASHDESKNUM>
+    <CASHREGISTERNUM>4001319262</CASHREGISTERNUM>
+    <CASHIER>Касир</CASHIER>
+    <VER>1</VER>
+  </CHECKHEAD>
+  <CHECKTOTAL>
+    <SUM>633.50</SUM>
+  </CHECKTOTAL>
+  <CHECKPAY>
+    <ROW ROWNUM="1">
+      <PAYFORMCD>1</PAYFORMCD>
+      <PAYFORMNM>КАРТКА</PAYFORMNM>
+      <SUM>633.50</SUM>
+    </ROW>
+  </CHECKPAY>
+  <CHECKBODY>
+    <ROW ROWNUM="1">
+      <CODE>38</CODE>
+      <NAME>Сік томатний 3л</NAME>
+      <AMOUNT>1</AMOUNT>
+      <PRICE>270.00</PRICE>
+      <COST>270.00</COST>
+    </ROW>
+    <ROW ROWNUM="2">
+      <CODE>197</CODE>
+      <NAME>Сік яблучний  3л</NAME>
+      <AMOUNT>1</AMOUNT>
+      <PRICE>225.00</PRICE>
+      <COST>225.00</COST>
+    </ROW>
+    <ROW ROWNUM="3">
+      <CODE>473</CODE>
+      <NAME>Малина</NAME>
+      <AMOUNT>0.554</AMOUNT>
+      <PRICE>250.00</PRICE>
+      <COST>138.50</COST>
+    </ROW>
+  </CHECKBODY>
+</CHECK>

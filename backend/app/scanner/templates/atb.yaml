@@ -1,0 +1,37 @@
+# АТБ-Маркет — fiscal receipt layout.
+#
+# Starter spec: markers are solid (ЄДРПОУ is stable), the field/line regexes are
+# modelled on АТБ's printed fiscal receipt but NOT yet verified against a batch
+# of real OCR output — tighten once app/scanner/scan_sample rows accumulate
+# (ROADMAP.md Крок 3). Until then a shaky parse just fails reconcile.py and the
+# pipeline escalates, so an imperfect spec here is safe.
+code: atb
+store_name: АТБ
+network_type: supermarket
+
+identify:
+  any:
+    - "АТБ-МАРКЕТ"
+    - "ТОВ \"АТБ-МАРКЕТ\""
+    - "AТБ"
+  edrpou:
+    - "30487219"
+
+fields:
+  total:
+    - 'СУМА ДО СПЛАТИ\D{0,6}([\d ]+[.,]\d{2})'
+    - 'УСЬОГО\D{0,6}([\d ]+[.,]\d{2})'
+  discount:
+    - 'ЗНИЖКА\D{0,6}([\d ]+[.,]\d{2})'
+    - 'Знижка на чек\D{0,6}([\d ]+[.,]\d{2})'
+  payment:
+    - '(ГОТІВКА|Картка платіжна|Безготівкова|БЕЗГОТІВКОВА)'
+  datetime:
+    - '(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}(?::\d{2})?)'
+
+line_item:
+  pattern: '^(?P<name>.+?)\s+(?P<qty>\d+(?:[.,]\d{1,3})?)\s*[xхХ*]\s*(?P<price>\d+(?:[.,]\d{2})?)\s+(?P<sum>\d+(?:[.,]\d{2})?)\s*[АБВГ]?$'
+  discount_pattern: 'Знижка\D{0,6}(?P<discount>\d+(?:[.,]\d{2})?)'
+
+date_formats:
+  - "%d.%m.%Y"

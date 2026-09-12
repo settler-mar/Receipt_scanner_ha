@@ -1,0 +1,63 @@
+# Local LLM backend for Receipt Scanner (ROADMAP.md § 0.1 "local").
+#
+#     ./ollama-docker.sh up
+#     # or: docker compose -f docker-compose.ollama.yml up -d --remove-orphans
+#
+# ⚠ The official ollama/ollama image bundles CUDA + ROCm runtimes and is ~4.5 GB
+#   (needs ~10 GB free while extracting). On a CPU-only box that's pure overhead —
+#   prefer `./ollama-docker.sh native` (host install, ~1.5 GB). Use this compose
+#   file only if you specifically want Ollama containerised.
+#
+# Then on the app's Settings page ("Налаштування → AI · моделі"):
+#   • Локальна модель:  on
+#   • URL:              http://<this-host-ip>:11434   (or http://ollama:11434
+#                       if the app runs in the same compose network)
+#   • Модель:           qwen2.5:3b
+#   • Контекст (num_ctx): 8192
+#   • Маршрутизація classify / normalize → "Тільки локально"
+#
+# Recommended model — Qwen2.5-3B-Instruct (Q4_K_M): best Ukrainian/Russian +
+# JSON adherence in the 2-4B class, ~1.9 GB, runs on an Orange Pi 5 Plus
+# (RK3588, CPU). Override with OLLAMA_MODEL if you want a different one
+# (e.g. qwen2.5:1.5b for ~2x speed, qwen2.5:7b if you have the compute).
+
+services:
+  ollama:
+    image: ollama/ollama:latest          # multi-arch: works on arm64 (RK3588) and amd64
+    container_name: receipt-scanner-ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-models:/root/.ollama       # pulled models persist here
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_KEEP_ALIVE: "30m"            # keep the model resident between the 10-min classify ticks
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    # RK3588 (Orange Pi 5 Plus): cores 4-7 are the A76 "big" cluster — pinning
+    # the LLM there keeps it off the weak A55 cores and away from the app.
+    # Uncomment on an RK3588 box (leave commented on machines with <8 cores):
+    #cpuset: "4-7"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # One-shot: pulls the model on first `up`, then exits. Safe to re-run
+  # (Ollama skips an already-present model).
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: receipt-scanner-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    entrypoint: ["/bin/sh", "-c", "ollama pull \"${OLLAMA_MODEL:-qwen2.5:3b}\""]
+    restart: "no"
+
+volumes:
+  ollama-models:

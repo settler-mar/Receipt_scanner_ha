@@ -1,0 +1,32 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+sqlalchemy>=2.0
+alembic>=1.13
+pydantic>=2.9
+pydantic-settings>=2.5
+apscheduler>=3.10
+croniter>=3.0
+httpx>=0.27
+# httpx stays a dependency too: the mcp client library (silpo.py) uses it
+# internally, and silpo.py's own OAuth token exchange still calls it directly.
+curl_cffi>=0.16
+cryptography>=43.0
+# Cloud LLM backend for app/services/ai.py (category classification, receipt OCR).
+# Only imported when the "cloud" AI backend is enabled on the Settings page.
+anthropic>=0.49
+python-dotenv>=1.0
+# MCP: client for adapters/silpo.py AND our own server (app/mcp_server.py, the
+# FastMCP sub-app at /mcp — ROADMAP Крок 4). Pinned: 2.x renamed/moved
+# streamablehttp_client used by silpo.py — revisit that import before bumping.
+mcp==1.29.0
+patchright==1.62.2
+pypdf>=6.0  # extracts warranty-expiry text from Дніпро-М's warranty-card PDF, see api/receipts.py
+# Receipt scanner pipeline (ROADMAP Крок 3, app/scanner/):
+Pillow>=10.0            # image dimensions / EXIF orientation on upload routing
+zxing-cpp>=2.2           # primary fiscal-QR decoder — reads dense codes on crumpled thermal paper that cv2 cannot
+opencv-python-headless>=4.9  # image prep, QR locating + fallback decode; headless = no GUI libs
+PyYAML>=6.0             # per-chain receipt layout templates (app/scanner/templates/*.yaml)
+# Local OCR for the template/generic stages. The Tesseract *binary* + `ukr`
+# traineddata is a system-image dependency (Dockerfile), not pip — app/scanner/ocr.py
+# degrades gracefully (OcrUnavailable) when it's missing, so this is effectively optional.
+pytesseract>=0.3.10

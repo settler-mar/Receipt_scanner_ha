@@ -1,0 +1,31 @@
+backend/venv/
+backend/data/
+backend/.env
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+
+frontend/node_modules/
+frontend/dist/
+
+apks/*.apk
+apks/*.keystore
+
+.DS_Store
+
+# Decoded/patched APK workspaces (gigabytes of tooling output)
+apks/*/
+*.keystore
+
+# IDE / tooling caches
+.idea/
+.pytest_cache/
+.claude/settings.local.json
+
+# Local runtime/debug artefacts with real account data
+backend/.env
+frontend/.env.local
+frontend/.env.*.local
+backend/dps_debug_output/
+backend/*_capture.json
+backend/data/browser_profiles/
