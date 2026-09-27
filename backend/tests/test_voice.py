@@ -4,6 +4,7 @@ Speech-to-text is mocked; what is tested is that the recording is kept whatever
 recognition does, can be played back and recognised again later.
 """
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,6 +18,16 @@ from app.models import scanner  # noqa: F401 — registers voice_messages
 from app.models import shopping  # noqa: F401 — registers shopping tables
 from app.models.scanner import VoiceMessage, VoiceStatus
 from app.services import stt, voice
+from app.api.voice import _shopping_item_label
+
+
+def test_voice_shopping_action_contains_item_details():
+    assert _shopping_item_label(SimpleNamespace(
+        raw_text="молоко", qty=2, unit="л", note="для кави",
+    )) == "молоко — 2 л (для кави)"
+    assert _shopping_item_label(SimpleNamespace(
+        raw_text="хліб", qty=1, unit=None, note=None,
+    )) == "хліб"
 
 
 @pytest.fixture()
@@ -149,3 +160,37 @@ def test_transcribe_reports_a_disabled_recogniser_as_a_conflict(client, db, monk
     resp = client.post(f"/api/voice/{row_id}/transcribe")
     assert resp.status_code == 409
     assert "вимкнено" in resp.json()["detail"]
+
+
+def test_a_recording_can_be_archived_and_brought_back(client, db):
+    """Same archive as the scan journal: the audio stays, the row just leaves
+    the working list — otherwise a handled message sits in the inbox (and in the
+    sidebar counter) forever."""
+    with db() as session:
+        row_id = voice.store(session, b"opus", content_type="audio/ogg").id
+
+    assert [r["id"] for r in client.get("/api/voice").json()] == [row_id]
+
+    archived = client.post(f"/api/voice/{row_id}/archive").json()
+    assert archived["archived_at"] is not None
+    assert client.get("/api/voice").json() == []                      # out of the queue
+    assert [r["id"] for r in client.get("/api/voice?include_archived=true").json()] == [row_id]
+    assert client.get(f"/api/voice/{row_id}/audio").status_code == 200  # audio kept
+
+    back = client.post(f"/api/voice/{row_id}/archive?archived=false").json()
+    assert back["archived_at"] is None
+    assert [r["id"] for r in client.get("/api/voice").json()] == [row_id]
+
+
+def test_open_count_ignores_archived_and_handled_recordings(db):
+    with db() as session:
+        waiting = voice.store(session, b"a", content_type="audio/ogg")
+        handled = voice.store(session, b"b", content_type="audio/ogg")
+        handled.applied = "список покупок: 2 позиції"
+        put_away = voice.store(session, b"c", content_type="audio/ogg")
+        voice.set_archived(session, put_away, True)
+        session.commit()
+
+        assert voice.open_count(session) == 1
+        voice.set_archived(session, waiting, True)
+        assert voice.open_count(session) == 0

@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.time import as_utc
@@ -24,6 +24,7 @@ from app.schemas.schemas import (
     ChannelBreakdown,
     DashboardStats,
     FuelPriceHistoryOut,
+    SavingsReceipt,
     StoreBreakdown,
     StoreCategoryCell,
     StoreCategoryItem,
@@ -130,6 +131,7 @@ def by_store(
             func.coalesce(func.sum(_receipt_spend(include_discount)), 0).label("total_spent"),
             func.coalesce(func.sum(_uah_amount(Receipt.total_discount)), 0).label("total_discount"),
             func.coalesce(func.sum(_uah_amount(Receipt.bonuses)), 0).label("total_bonuses"),
+            func.coalesce(func.sum(_uah_amount(Receipt.bonuses_used)), 0).label("total_bonuses_used"),
         )
         .where(*clauses)
         .group_by(Receipt.store_code)
@@ -145,6 +147,7 @@ def by_store(
             total_spent=float(r.total_spent),
             total_discount=float(r.total_discount),
             total_bonuses=float(r.total_bonuses),
+            total_bonuses_used=float(r.total_bonuses_used),
         )
         for r in rows
     ]
@@ -421,6 +424,9 @@ def timeseries(
             period,
             func.coalesce(func.sum(_receipt_spend(include_discount)), 0).label("total_spent"),
             func.count().label("receipt_count"),
+            func.coalesce(func.sum(_uah_amount(Receipt.total_discount)), 0).label("total_discount"),
+            func.coalesce(func.sum(_uah_amount(Receipt.bonuses)), 0).label("total_bonuses"),
+            func.coalesce(func.sum(_uah_amount(Receipt.bonuses_used)), 0).label("total_bonuses_used"),
         )
         .where(*clauses)
         .group_by(period)
@@ -428,7 +434,76 @@ def timeseries(
     )
     rows = db.execute(stmt).all()
     return [
-        TimeseriesPoint(period=r.period, total_spent=float(r.total_spent), receipt_count=r.receipt_count)
+        TimeseriesPoint(
+            period=r.period,
+            total_spent=float(r.total_spent),
+            receipt_count=r.receipt_count,
+            total_discount=float(r.total_discount),
+            total_bonuses=float(r.total_bonuses),
+            total_bonuses_used=float(r.total_bonuses_used),
+        )
+        for r in rows
+    ]
+
+
+@router.get("/savings/receipts", response_model=list[SavingsReceipt])
+def savings_receipts(
+    db: Session = Depends(get_db),
+    date_from: dt.datetime | None = None,
+    date_to: dt.datetime | None = None,
+    store_code: str | None = None,
+    sort: str = "bonuses",
+    limit: int = 50,
+):
+    """The receipts behind the "Заощаджено"/бонуси totals — the drill-down that
+    answers "звідки взялася ця сума". `sort`: "bonuses" | "bonuses_used" |
+    "discount" (biggest first, only receipts with that column non-zero) or
+    "date" (newest first, any receipt carrying a discount or bonuses). Amounts
+    are UAH-converted like every other dashboard number."""
+    clauses = _date_filters(date_from, date_to)
+    if store_code:
+        clauses.append(Receipt.store_code == store_code)
+
+    discount = _uah_amount(func.coalesce(Receipt.total_discount, 0))
+    bonuses = _uah_amount(func.coalesce(Receipt.bonuses, 0))
+    bonuses_used = _uah_amount(func.coalesce(Receipt.bonuses_used, 0))
+
+    if sort == "date":
+        order_col = Receipt.purchased_at
+        clauses.append(or_(discount > 0, bonuses > 0, bonuses_used > 0))
+    else:
+        order_col = {"discount": discount, "bonuses_used": bonuses_used}.get(sort, bonuses)
+        clauses.append(order_col > 0)
+
+    rows = db.execute(
+        select(
+            Receipt.id,
+            Receipt.purchased_at,
+            Receipt.store_code,
+            Receipt.shop_name,
+            _uah_amount(Receipt.total_amount).label("total_amount"),
+            discount.label("total_discount"),
+            bonuses.label("bonuses"),
+            bonuses_used.label("bonuses_used"),
+        )
+        .where(*clauses)
+        .order_by(order_col.desc())
+        .limit(max(1, min(limit, 200)))
+    ).all()
+    store_names = {s.code: s.name for s in db.execute(select(Store)).scalars().all()}
+
+    return [
+        SavingsReceipt(
+            receipt_id=r.id,
+            purchased_at=r.purchased_at,
+            store_code=r.store_code,
+            store_name=store_names.get(r.store_code, r.store_code),
+            shop_name=r.shop_name,
+            total_amount=float(r.total_amount),
+            total_discount=float(r.total_discount),
+            bonuses=float(r.bonuses),
+            bonuses_used=float(r.bonuses_used),
+        )
         for r in rows
     ]
 

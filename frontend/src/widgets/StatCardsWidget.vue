@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { RouterLink } from 'vue-router'
 import { api } from '@/lib/api'
-import { fmtMoneyFull, rangeParams } from '@/lib/dashboardFmt'
+import { fmtMoneyFull, METRIC_COLORS, rangeParams } from '@/lib/dashboardFmt'
 import { fmtDateTime } from '@/lib/datetime'
 import { useWidgetData } from '@/composables/useWidgetData'
 import type { DashboardRangeKey } from '@/types/api'
@@ -25,19 +25,25 @@ const { data: stats, status } = useWidgetData(
       <div class="stat-label">Всього чеків</div>
     </div>
     <div class="card">
-      <div class="stat">{{ fmtMoneyFull(stats.total_spent) }}</div>
+      <div class="stat" :style="{ color: METRIC_COLORS.spend }">{{ fmtMoneyFull(stats.total_spent) }}</div>
       <div class="stat-label">{{ includeDiscount ? 'Загальна сума' : 'Сума без знижки' }}</div>
     </div>
     <div class="card">
-      <div class="stat" style="color: var(--success)">{{ fmtMoneyFull(stats.total_discount) }}</div>
+      <div class="stat" :style="{ color: METRIC_COLORS.total_discount }">
+        {{ fmtMoneyFull(stats.total_discount) }}
+      </div>
       <div class="stat-label">Заощаджено (знижки)</div>
     </div>
     <div class="card">
-      <div class="stat" style="color: var(--accent)">{{ fmtMoneyFull(stats.total_bonuses) }}</div>
+      <div class="stat" :style="{ color: METRIC_COLORS.total_bonuses }">
+        {{ fmtMoneyFull(stats.total_bonuses) }}
+      </div>
       <div class="stat-label">Нараховано бонусів</div>
     </div>
     <div class="card">
-      <div class="stat">{{ fmtMoneyFull(stats.total_bonuses_used) }}</div>
+      <div class="stat" :style="{ color: METRIC_COLORS.total_bonuses_used }">
+        {{ fmtMoneyFull(stats.total_bonuses_used) }}
+      </div>
       <div class="stat-label">Використано бонусів</div>
     </div>
     <RouterLink to="/accounts" class="card" style="color: inherit">

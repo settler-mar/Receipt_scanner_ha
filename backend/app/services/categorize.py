@@ -16,12 +16,14 @@ touches it.
 from __future__ import annotations
 
 import datetime as dt
+import asyncio
 import json
 import logging
 import re
+import threading
 from collections import defaultdict
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.models.models import (
@@ -39,6 +41,26 @@ logger = logging.getLogger(__name__)
 # Below this the AI guess is recorded (so the name isn't re-queued) but not
 # applied to items — matches ROADMAP.md "впевненість низька" handling.
 _MIN_CONFIDENCE = 0.5
+_BACKFILL_LOCK = threading.Lock()
+
+
+def reserve_backfill() -> None:
+    if not _BACKFILL_LOCK.acquire(blocking=False):
+        raise RuntimeError("Класифікація вже виконується")
+
+
+def run_backfill_in_background(*, force: bool = False, include_other: bool = False) -> None:
+    """Run history classification outside the request event loop."""
+    from app.db import SessionLocal
+
+    async def _run() -> None:
+        with SessionLocal() as db:
+            await backfill_all(db, force=force, include_other=include_other)
+
+    try:
+        asyncio.run(_run())
+    finally:
+        _BACKFILL_LOCK.release()
 
 
 def _norm_path(p: str) -> str:
@@ -68,13 +90,38 @@ def taxonomy_paths(db: Session) -> list[str]:
     )
 
 
+# The app's own designated catch-all root ("Інше" in CATEGORY_TREE — see
+# app/seed.py). Hardcoded by path like the category-tree migrations do,
+# rather than a settings flag: there's exactly one such bucket per household.
+OTHER_CATEGORY_PATH = "inshe"
+
+
+def other_category_id(db: Session) -> str | None:
+    """id of the catch-all "Інше" root, or None if it's been renamed/removed —
+    callers then just fall back to the plain uncategorised-only behavior."""
+    return db.execute(
+        select(Category.id).where(Category.path == OTHER_CATEGORY_PATH, Category.parent_id.is_(None))
+    ).scalar_one_or_none()
+
+
+def _pending_clause(other_id: str | None):
+    """Items eligible for (re)classification: no category, or — when the
+    "Розібрати й «Інше»" checkbox is on — also filed under the catch-all."""
+    if other_id is None:
+        return ReceiptItem.category_id.is_(None)
+    return or_(ReceiptItem.category_id.is_(None), ReceiptItem.category_id == other_id)
+
+
 def _in_branch(path: str, root: str) -> bool:
     p, r = _norm_path(path), _norm_path(root)
     return bool(r) and (p == r or p.startswith(r + "/"))
 
 
 async def classify_hierarchical(
-    db: Session, names: list[str], taxonomy: list[str]
+    db: Session,
+    names: list[str],
+    taxonomy: list[str],
+    contexts: dict[str, dict] | None = None,
 ) -> dict[str, "ai.CategoryGuess"]:
     """Coarse-to-fine classification, to keep every model prompt small
     (ROADMAP.md Крок 1, "Токен-бюджет"):
@@ -90,9 +137,9 @@ async def classify_hierarchical(
     """
     roots = [p for p in taxonomy if "/" not in p]
     if not roots or not any("/" in p for p in taxonomy):
-        return await ai.classify_products(db, names, taxonomy)
+        return await ai.classify_products(db, names, taxonomy, contexts)
 
-    coarse = await ai.classify_products(db, names, roots)
+    coarse = await ai.classify_products(db, names, roots, contexts)
     root_by_norm = {_norm_path(r): r for r in roots}
 
     def _match_root(path: str) -> str | None:
@@ -124,7 +171,11 @@ async def classify_hierarchical(
         branch = [p for p in taxonomy if _in_branch(p, root)]
         if len(branch) <= 1:
             continue  # leaf root — the pass-1 answer is already final
-        fine = await ai.classify_products(db, bucket, branch)
+        bucket_contexts = (
+            {name: contexts[name] for name in bucket if name in contexts}
+            if contexts else None
+        )
+        fine = await ai.classify_products(db, bucket, branch, bucket_contexts)
         for name in bucket:
             fg = fine.get(name)
             coarse_conf = float(coarse[name].confidence) if coarse.get(name) else 0.0
@@ -177,15 +228,27 @@ def record_user_choice(db: Session, name: str, category_id: str | None) -> None:
         row.updated_at = dt.datetime.now(dt.timezone.utc)
 
 
-def pending_names(db: Session, limit: int) -> list[str]:
-    """Distinct normalised item names with no category and no cache row yet."""
-    known = set(
-        db.execute(select(ProductCategory.normalized_name)).scalars().all()
-    )
+def pending_names(db: Session, limit: int, *, include_other: bool = False) -> list[str]:
+    """Distinct normalised item names with no category (or, with `include_other`,
+    also ones currently sitting in the catch-all "Інше") and no cache row yet.
+
+    Filing something in "Інше" — by hand or by the AI's own "no better fit"
+    guess — always writes a `product_category` row, same as a real category
+    pick. With `include_other` that row must NOT count as "already handled" —
+    otherwise every name ever dumped in the catch-all would silently vanish
+    from this queue forever, and the checkbox would do nothing.
+    """
+    other_id = other_category_id(db) if include_other else None
+    known_query = select(ProductCategory.normalized_name)
+    if other_id is not None:
+        known_query = known_query.where(
+            ProductCategory.category_id.is_not(None),
+            ProductCategory.category_id != other_id,
+        )
+    known = set(db.execute(known_query).scalars().all())
+    clause = _pending_clause(other_id)
     seen: dict[str, None] = {}
-    rows = db.execute(
-        select(ReceiptItem.name).where(ReceiptItem.category_id.is_(None))
-    ).scalars()
+    rows = db.execute(select(ReceiptItem.name).where(clause)).scalars()
     for raw in rows:
         norm = normalize_name(raw)
         if norm and norm not in known and norm not in seen:
@@ -195,9 +258,39 @@ def pending_names(db: Session, limit: int) -> list[str]:
     return list(seen)
 
 
-def _apply_cached_rows(db: Session, norms: list[str]) -> int:
-    """Set category_id on every uncategorised item whose normalised name maps to
-    a cache row that has a category. Done name-by-name in Python because the
+def classification_contexts(db: Session, names: list[str], *, include_other: bool = False) -> dict[str, dict]:
+    """Receipt context for a classification batch, keyed by normalised name.
+
+    A product alias remains global, but the model now sees the shop(s) where the
+    still-uncategorised name occurred. Multiple shops are retained because the
+    same abbreviated receipt label can legitimately appear in more than one.
+    """
+    wanted = set(names)
+    stores: dict[str, list[str]] = defaultdict(list)
+    clause = _pending_clause(other_category_id(db) if include_other else None)
+    rows = db.execute(
+        select(ReceiptItem.name, Receipt.shop_name, Receipt.store_code)
+        .join(Receipt, Receipt.id == ReceiptItem.receipt_id)
+        .where(clause)
+    ).all()
+    for raw_name, shop_name, store_code in rows:
+        norm = normalize_name(raw_name)
+        if norm not in wanted:
+            continue
+        label = (shop_name or "").strip() or (store_code or "").strip()
+        if label and label not in stores[norm]:
+            stores[norm].append(label)
+    return {
+        name: {"store_names": labels[:5]}
+        for name, labels in stores.items()
+        if labels
+    }
+
+
+def _apply_cached_rows(db: Session, norms: list[str], *, include_other: bool = False) -> int:
+    """Set category_id on every pending item (uncategorised, or — with
+    `include_other` — currently in "Інше") whose normalised name maps to a
+    cache row that has a category. Done name-by-name in Python because the
     normalisation isn't expressible in SQL."""
     applied = 0
     resolved = {
@@ -211,9 +304,8 @@ def _apply_cached_rows(db: Session, norms: list[str]) -> int:
     }
     if not resolved:
         return 0
-    items = db.execute(
-        select(ReceiptItem).where(ReceiptItem.category_id.is_(None))
-    ).scalars()
+    clause = _pending_clause(other_category_id(db) if include_other else None)
+    items = db.execute(select(ReceiptItem).where(clause)).scalars()
     for item in items:
         cat_id = resolved.get(normalize_name(item.name))
         if cat_id is not None:
@@ -222,11 +314,11 @@ def _apply_cached_rows(db: Session, norms: list[str]) -> int:
     return applied
 
 
-async def run_classification_batch(db: Session, limit: int = 50) -> int:
-    """One batch: classify up to `limit` unknown names, cache + apply them.
-    Returns the number of names processed (0 when the queue is empty or no AI
-    backend is configured)."""
-    names = pending_names(db, limit)
+async def run_classification_batch(db: Session, limit: int = 50, *, include_other: bool = False) -> int:
+    """One batch: classify up to `limit` unknown (or, with `include_other`, also
+    "Інше") names, cache + apply them. Returns the number of names processed
+    (0 when the queue is empty or no AI backend is configured)."""
+    names = pending_names(db, limit, include_other=include_other)
     if not names:
         return 0
     taxonomy = taxonomy_paths(db)
@@ -235,7 +327,9 @@ async def run_classification_batch(db: Session, limit: int = 50) -> int:
         return 0
 
     try:
-        guesses = await classify_hierarchical(db, names, taxonomy)
+        guesses = await classify_hierarchical(
+            db, names, taxonomy, classification_contexts(db, names, include_other=include_other)
+        )
     except ai.AiConfigError as exc:
         logger.info("classification skipped: %s", exc)
         return 0
@@ -243,8 +337,45 @@ async def run_classification_batch(db: Session, limit: int = 50) -> int:
         logger.warning("classification batch failed", exc_info=True)
         return 0
 
-    counts = apply_guesses(db, {n: guesses.get(n) for n in names}, backend="")
+    counts = apply_guesses(db, {n: guesses.get(n) for n in names}, backend="", include_other=include_other)
     return counts["names"]
+
+
+async def classify_receipt_item(
+    db: Session,
+    receipt: Receipt,
+    item: ReceiptItem,
+    clarification: str,
+) -> str | None:
+    """Reclassify one concrete receipt line using a user's free-text hint.
+
+    This intentionally updates only the selected item. It does not rewrite the
+    global name alias, because a clarification such as "this is car shampoo"
+    may only be true for this otherwise ambiguous line.
+    """
+    norm = normalize_name(item.name)
+    taxonomy = taxonomy_paths(db)
+    if not norm or not taxonomy:
+        return None
+    context = {
+        "store_name": (receipt.shop_name or "").strip() or receipt.store_code,
+        "store_code": receipt.store_code,
+        "clarification": clarification.strip(),
+    }
+    if item.merchant_name:
+        context["merchant_name"] = item.merchant_name
+    if item.category_raw:
+        context["store_category"] = item.category_raw
+    guesses = await classify_hierarchical(db, [norm], taxonomy, {norm: context})
+    guess = guesses.get(norm)
+    if not guess or float(guess.confidence) < _MIN_CONFIDENCE:
+        return None
+    category_id = category_id_for_path(db, guess.category_path)
+    if category_id is None:
+        return None
+    item.category_id = category_id
+    db.commit()
+    return category_id
 
 
 def apply_guesses(
@@ -252,13 +383,18 @@ def apply_guesses(
     guesses: "dict[str, ai.CategoryGuess | None]",
     *,
     backend: str = "manual",
+    include_other: bool = False,
 ) -> dict:
     """Cache one batch of category guesses in `product_category`, apply them to
     matching receipt items, and log a summary. Shared by the live pass
     (`run_classification_batch`) and the manual "bring your own AI" flow
-    (`api/categories.py`). Never overrides a sticky `source="user"` row.
+    (`api/categories.py`). Never overrides a sticky `source="user"` row —
+    except one that itself points at the catch-all "Інше" while `include_other`
+    is set: being filed in the catch-all, even by hand, is what this whole pass
+    is meant to fix, so it doesn't get the usual sticky protection here.
     Caller need not commit — this does."""
     now = dt.datetime.now(dt.timezone.utc)
+    other_id = other_category_id(db) if include_other else None
     names = list(guesses)
     mapped = unknown_path = low_conf = no_guess = skipped_user = 0
     for norm in names:
@@ -278,7 +414,9 @@ def apply_guesses(
             unknown_path += 1  # a path that isn't in the tree
 
         existing = db.get(ProductCategory, norm)
-        if existing is not None and existing.source == ProductCategorySource.user:
+        sticky = existing is not None and existing.source == ProductCategorySource.user
+        catch_all_pick = other_id is not None and existing is not None and existing.category_id == other_id
+        if sticky and not catch_all_pick:
             skipped_user += 1
             continue
         if existing is None:
@@ -290,7 +428,7 @@ def apply_guesses(
             existing.confidence = confidence
             existing.updated_at = now
     db.flush()
-    items_tagged = _apply_cached_rows(db, names)
+    items_tagged = _apply_cached_rows(db, names, include_other=include_other)
     db.commit()
 
     parts = [f"{mapped} розкладено"]
@@ -452,13 +590,15 @@ def reset_all_classifications(db: Session) -> dict:
 
 
 async def backfill_all(
-    db: Session, batch_size: int = 50, max_batches: int = 100_000, *, force: bool = False
+    db: Session, batch_size: int = 50, max_batches: int = 100_000,
+    *, force: bool = False, include_other: bool = False,
 ) -> dict:
     """Classify everything that still needs it — the one-off history pass
     (ROADMAP.md "Разовий бекфіл усієї історії").
 
     Standard mode only touches the "Без категорії" queue (items with no category
-    and no alias row yet). `force=True` first wipes all AI-made classifications
+    and no alias row yet); `include_other=True` folds the catch-all "Інше" into
+    that same queue. `force=True` first wipes all AI-made classifications
     (keeping manual ones) so the entire history is re-split from scratch — for
     when the tree or the model changed a lot.
     """
@@ -469,7 +609,7 @@ async def backfill_all(
     total = 0
     batches = 0
     while batches < max_batches:
-        n = await run_classification_batch(db, batch_size)
+        n = await run_classification_batch(db, batch_size, include_other=include_other)
         if n == 0:
             break
         total += n

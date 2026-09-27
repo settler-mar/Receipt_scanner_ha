@@ -70,7 +70,21 @@ async function runSearch() {
   error.value = ''
   notice.value = ''
   try {
-    const run = await api.duplicates.run()
+    let run = await api.duplicates.run()
+    // The server starts the scan in a worker and returns its persistent run
+    // row immediately.  Keep the existing button UX while polling the same
+    // endpoint used by the history panel.
+    for (let attempt = 0; run.status === 'running' && attempt < 240; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 500))
+      const latest = (await api.duplicates.runs()).find(item => item.id === run.id)
+      if (latest) run = latest
+    }
+    if (run.status === 'running') {
+      throw new Error('Пошук дублікатів ще виконується — перевірте журнал запусків пізніше.')
+    }
+    if (run.status === 'error') {
+      throw new Error(run.error_message || 'Пошук дублікатів завершився помилкою.')
+    }
     notice.value = `Пошук завершено: перевірено ${run.scanned_receipts}, нових груп ${run.candidates_new}.`
     await refresh()
   } catch (err) {

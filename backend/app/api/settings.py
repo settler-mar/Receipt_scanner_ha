@@ -12,8 +12,10 @@ from app.db import get_db
 from app.models.models import AppSetting
 from app.schemas.schemas import SettingOut, SettingUpdate
 from app.services import ai
+from app.services import prompt_catalog
 from app.services import drive as drive_svc
 from app.services import mcp_config as mcp_cfg
+from app.services import shopping_settings
 from app.services import tax_cabinet_settings as tax_settings
 from app.services import telegram as telegram_svc
 
@@ -26,6 +28,7 @@ _RESERVED = {
     ai.CONFIG_KEY, ai.CLOUD_KEY_KEY, ai.USAGE_KEY, ai.LOG_KEY,
     drive_svc.TOKEN_KEY, drive_svc.CLIENT_KEY,
     mcp_cfg.CONFIG_KEY,
+    shopping_settings.CONFIG_KEY,
     tax_settings.TOKEN_KEY,
     telegram_svc.CONFIG_KEY, telegram_svc.TOKEN_KEY, telegram_svc.LEGACY_AUTH_KEY,
 }
@@ -35,6 +38,54 @@ _RESERVED = {
 def list_settings(db: Session = Depends(get_db)):
     rows = db.execute(select(AppSetting)).scalars().all()
     return [SettingOut(key=row.key, value=row.value) for row in rows if row.key not in _RESERVED]
+
+
+class AiPromptOut(BaseModel):
+    key: str
+    title: str
+    description: str
+    task: str
+    content: str
+    version: int
+    updated_at: dt.datetime
+
+
+class AiPromptRevisionOut(BaseModel):
+    id: str
+    prompt_key: str
+    version: int
+    content: str
+    note: str | None = None
+    changed_by: str | None = None
+    created_at: dt.datetime
+
+
+class AiPromptUpdate(BaseModel):
+    content: str
+    note: str | None = None
+    changed_by: str | None = None
+
+
+@router.get("/prompts", response_model=list[AiPromptOut])
+def list_ai_prompts(db: Session = Depends(get_db)):
+    return prompt_catalog.list_prompts(db)
+
+
+@router.get("/prompts/{key}/history", response_model=list[AiPromptRevisionOut])
+def ai_prompt_history(key: str, db: Session = Depends(get_db)):
+    if key not in {item.key for item in prompt_catalog.DEFAULTS}:
+        raise HTTPException(status_code=404, detail="Промт не знайдено")
+    return prompt_catalog.history(db, key)
+
+
+@router.put("/prompts/{key}", response_model=AiPromptOut)
+def update_ai_prompt(key: str, payload: AiPromptUpdate, db: Session = Depends(get_db)):
+    try:
+        return prompt_catalog.update(db, key, payload.content, payload.note, payload.changed_by)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Промт не знайдено") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- #

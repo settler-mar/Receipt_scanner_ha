@@ -17,3 +17,10 @@ services:
     ports:
       - "8001:8001"
     shm_size: "512mb"
+    # Fall back to public resolvers if the Docker embedded DNS (127.0.0.11)
+    # or the host's own resolver flaps — this container makes dozens of
+    # outbound calls to store/provider domains on every scheduled collection,
+    # and a single resolver hiccup was taking every account down at once.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8

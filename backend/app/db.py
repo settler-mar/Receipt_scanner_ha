@@ -1,10 +1,24 @@
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.core.config import settings
 
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine = create_engine(settings.database_url, connect_args=connect_args)
+
+if settings.database_url.startswith("sqlite"):
+    # SQLite parses FOREIGN KEY clauses but does not enforce them unless told
+    # to, per connection. Every relationship that should cascade already does
+    # so at the ORM level (Account/Receipt/ReceiptItem all declare
+    # cascade="all, delete-orphan") — this is a second, DB-level backstop so
+    # that any *non-ORM* delete (a raw script, a future migration, a manual
+    # `sqlite3` session) fails loudly instead of silently leaving orphaned
+    # rows behind, the way ~5290 receipt_items did historically before this
+    # was added (cleaned up by migration; see its docstring for the forensics).
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
@@ -23,8 +37,14 @@ def ensure_schema_upgrades() -> None:
             "warranty_text": "VARCHAR",
             "warranty_expires_at": "DATETIME",
             "warranty_checked_at": "DATETIME",
+            "product_code": "VARCHAR",
         },
-        "receipts": {"exchange_rate_to_uah": "NUMERIC"},
+        "receipts": {
+            "exchange_rate_to_uah": "NUMERIC",
+            "reconciliation_ignored_at": "DATETIME",
+            "total_adjustment": "NUMERIC",
+            "adjustment_reason": "VARCHAR",
+        },
         "accounts": {
             "fuel_prices_checked_at": "DATETIME",
             "fuel_discount_allowance": "NUMERIC",
@@ -32,6 +52,8 @@ def ensure_schema_upgrades() -> None:
             "fuel_discount_allowance_resets_at": "DATETIME",
         },
         "fiscal_queue_jobs": {"scan_job_id": "VARCHAR"},
+        "shopping_list_items": {"tag": "VARCHAR"},
+        "collection_runs": {"progress_current": "INTEGER", "progress_total": "INTEGER"},
     }
     inspector = inspect(engine)
     with engine.begin() as connection:

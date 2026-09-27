@@ -56,6 +56,7 @@ from app.adapters.base import (
     LoyaltyCode,
     NormalizedItem,
     NormalizedReceipt,
+    NormalizedReceiptComponent,
 )
 
 RPC_URL = "https://api2.mob.fora.ua/api/2.0/exec/FZGlobal/"
@@ -287,15 +288,57 @@ def _item_from_detail(name: str, qty: float, price_out, old_price, image_url: st
     price_out = float(price_out or 0)
     discount = 0.0
     if old_price is not None and float(old_price) > price_out:
-        discount = round((float(old_price) - price_out) * qty, 2)
+        # Fora's priceOut/oldPrice are already the final/list amount for the
+        # whole receipt line, including weighted products. Multiplying
+        # priceOut by qty turns 0.756 kg at 74.01 into 55.96 instead of the
+        # provider's line amount 74.01.
+        discount = round(float(old_price) - price_out, 2)
     return NormalizedItem(
         name=name.strip(),
         quantity=qty,
-        unit_price=price_out,
-        total_price=round(price_out * qty, 2),
+        unit_price=round(price_out / qty, 2) if qty else price_out,
+        total_price=round(price_out, 2),
         discount=discount,
         product_image_url=image_url,
     )
+
+
+def _money(value) -> float:
+    if isinstance(value, dict):
+        value = value.get("amount", value.get("value", value.get("sum")))
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _payment_components(detail: dict) -> list[NormalizedReceiptComponent]:
+    payment = detail.get("paymentDetail") or {}
+    components: list[NormalizedReceiptComponent] = []
+    delivery = _money(payment.get("deliveryPayment"))
+    if abs(delivery) >= 0.005:
+        components.append(NormalizedReceiptComponent(
+            kind="delivery", code="delivery", label="Доставка", amount=round(delivery, 2),
+            currency="UAH", source="fora.payment_detail", raw={"deliveryPayment": payment.get("deliveryPayment")},
+        ))
+    discount = _money(payment.get("discount"))
+    if abs(discount) >= 0.005:
+        components.append(NormalizedReceiptComponent(
+            kind="discount", code="receipt_discount", label="Знижка чека", amount=round(-abs(discount), 2),
+            currency="UAH", source="fora.payment_detail", raw={"discount": payment.get("discount")},
+        ))
+    return components
+
+
+def _reconciliation(total: float, items: list[NormalizedItem], components: list[NormalizedReceiptComponent], detail: dict):
+    if not items and isinstance(detail.get("items"), list):
+        return total, "Фора: API повернув чек без товарних рядків"
+    residual = round(
+        total - sum(float(item.total_price or 0) for item in items)
+        - sum(float(component.amount or 0) for component in components),
+        2,
+    )
+    return (residual, "Фора: залишок не пояснений доступними даними чека") if abs(residual) >= 0.01 else (0.0, None)
 
 
 def _normalize_offline(cheque: dict, detail: dict, purchased_at: dt.datetime) -> NormalizedReceipt:
@@ -309,14 +352,21 @@ def _normalize_offline(cheque: dict, detail: dict, purchased_at: dt.datetime) ->
         )
         for it in (detail.get("items") or [])
     ]
+    total = float(cheque.get("amount") or detail.get("amount") or 0)
+    components = _payment_components(detail)
+    adjustment, reason = _reconciliation(total, items, components, detail)
     return NormalizedReceipt(
         external_id=f"cheque:{cheque['id']}",
         purchased_at=purchased_at,
-        total_amount=float(cheque.get("amount") or 0),
+        total_amount=total,
         shop_name=cheque.get("filialName"),
         payment_type="offline",
         channel="offline",
         items=items,
+        components=components,
+        total_discount=round(sum(item.discount for item in items) + sum(-component.amount for component in components if component.amount < 0), 2),
+        total_adjustment=adjustment,
+        adjustment_reason=reason,
         bonuses=cheque.get("cashbackAmount"),
         raw={"list": cheque, "detail": detail},
     )
@@ -333,14 +383,21 @@ def _normalize_online(order: dict, detail: dict, purchased_at: dt.datetime) -> N
         )
         for it in (detail.get("items") or [])
     ]
+    total = float(order.get("amount") or detail.get("amount") or 0)
+    components = _payment_components(detail)
+    adjustment, reason = _reconciliation(total, items, components, detail)
     return NormalizedReceipt(
         external_id=f"online:{order['id']}",
         purchased_at=purchased_at,
-        total_amount=float(order.get("amount") or 0),
+        total_amount=total,
         shop_address=order.get("address"),
         payment_type="online delivery",
         channel="online",
         items=items,
+        components=components,
+        total_discount=round(sum(item.discount for item in items) + sum(-component.amount for component in components if component.amount < 0), 2),
+        total_adjustment=adjustment,
+        adjustment_reason=reason,
         bonuses=order.get("cashbackAmount"),
         raw={"list": order, "detail": detail},
     )

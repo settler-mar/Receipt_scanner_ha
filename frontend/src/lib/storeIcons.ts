@@ -2,6 +2,7 @@
 // table so a given store looks the same everywhere, not redefined per view.
 import brsmLogo from '@/assets/brsm-logo.webp'
 import venconLogo from '@/assets/vencon-logo.png'
+import monobankLogo from '@/assets/monobank-logo.png'
 
 // Direct logo URLs where a proper brand mark beats a tiny favicon.
 const STORE_LOGOS: Record<string, string> = {
@@ -11,6 +12,10 @@ const STORE_LOGOS: Record<string, string> = {
   foxtrot: 'https://www.foxtrot.com.ua/dist/images/favicon/android-icon-192x192.png',
   klo: 'https://commons.wikimedia.org/wiki/Special:FilePath/KLO_logo.svg',
   wog: 'https://commons.wikimedia.org/wiki/Special:FilePath/WOG_Logo.svg',
+  // The actual mono app icon (rounded black square + wordmark), pulled from
+  // the App Store listing — matches what's on the user's home screen, unlike
+  // the flat wordmark-only logo used elsewhere.
+  monobank: monobankLogo,
   // Official square brand mark; unlike the full wordmark it stays legible at
   // the 16–28 px sizes used in receipt tables and account cards.
   vencon: venconLogo,
@@ -35,9 +40,13 @@ const STORE_DOMAINS: Record<string, string> = {
   klo: 'klo.ua',
   vencon: 'vencon.ua',
   prom: 'prom.ua',
+  rozetka: 'rozetka.com.ua',
   aliexpress: 'aliexpress.com',
   brain: 'brain.com.ua',
   eva: 'eva.ua',
+  liki: 'liki.ua',
+  tabletki: 'tabletki.ua',
+  olx: 'olx.ua',
 }
 
 const FALLBACK_ICON: Record<string, string> = { scanner: '🧾' }

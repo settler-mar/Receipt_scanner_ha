@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.core.time import as_utc
 from app.db import get_db
+from app.models.models import TelegramMessageLog
 from app.models.scanner import VoiceMessage
 from app.services import ai, stt, voice
 
@@ -39,6 +40,7 @@ class VoiceOut(BaseModel):
     applied: str | None
     created_at: dt.datetime
     transcribed_at: dt.datetime | None
+    archived_at: dt.datetime | None = None
     audio_url: str
     # False when speech-to-text is not configured — the page then says so instead
     # of offering a button that can only fail.
@@ -46,9 +48,40 @@ class VoiceOut(BaseModel):
     # Languages this recording can be recognised in, primary first — the page
     # turns the ones already tried into "спробувати ще раз" buttons.
     languages: list[LanguageOut]
+    sender_display_name: str | None = None
+    sender_username: str | None = None
 
 
-def out(row: VoiceMessage, *, ready: bool, languages: list[LanguageOut]) -> VoiceOut:
+def _sender(row: VoiceMessage, db: Session) -> tuple[str | None, str | None]:
+    if row.source != "telegram" or not row.chat_id or not row.message_id:
+        return None, None
+    try:
+        chat_id = int(row.chat_id)
+    except (TypeError, ValueError):
+        return None, None
+    log = db.query(TelegramMessageLog).filter(
+        TelegramMessageLog.chat_id == chat_id,
+        TelegramMessageLog.message_id == row.message_id,
+    ).first()
+    # Older recordings stored the reply-to id instead of the voice message id.
+    # Recover their sender from the nearest voice log when the timestamp is close.
+    if log is None:
+        candidates = db.query(TelegramMessageLog).filter(
+            TelegramMessageLog.chat_id == chat_id,
+            TelegramMessageLog.content_type.in_(("voice", "audio", "video_note")),
+        ).all()
+        nearby = [candidate for candidate in candidates
+                  if abs((candidate.received_at - row.created_at).total_seconds()) <= 300]
+        if nearby:
+            log = min(nearby, key=lambda candidate: abs(
+                (candidate.received_at - row.created_at).total_seconds()))
+    if log is None:
+        return None, None
+    return log.sender_display_name, log.sender_username
+
+
+def out(row: VoiceMessage, *, ready: bool, languages: list[LanguageOut],
+        sender: tuple[str | None, str | None] = (None, None)) -> VoiceOut:
     return VoiceOut(
         id=row.id, source=row.source,
         status=row.status.value if hasattr(row.status, "value") else str(row.status),
@@ -57,8 +90,9 @@ def out(row: VoiceMessage, *, ready: bool, languages: list[LanguageOut]) -> Voic
         language=row.language, error=row.error,
         applied=row.applied, created_at=as_utc(row.created_at),
         transcribed_at=as_utc(row.transcribed_at) if row.transcribed_at else None,
+        archived_at=as_utc(row.archived_at) if row.archived_at else None,
         audio_url=f"/api/voice/{row.id}/audio", stt_ready=ready,
-        languages=languages,
+        languages=languages, sender_display_name=sender[0], sender_username=sender[1],
     )
 
 
@@ -76,10 +110,20 @@ def _row(db: Session, voice_id: str) -> VoiceMessage:
 
 
 @router.get("", response_model=list[VoiceOut])
-def list_voice(limit: int = 50, db: Session = Depends(get_db)):
+def list_voice(limit: int = 50, include_archived: bool = False,
+               db: Session = Depends(get_db)):
     ready = stt.stt_ready(db)
     languages = _languages(db)
-    return [out(row, ready=ready, languages=languages) for row in voice.recent(db, limit)]
+    rows = voice.recent(db, limit, include_archived=include_archived)
+    return [out(row, ready=ready, languages=languages, sender=_sender(row, db)) for row in rows]
+
+
+@router.post("/{voice_id}/archive", response_model=VoiceOut)
+def archive_voice(voice_id: str, archived: bool = True, db: Session = Depends(get_db)):
+    """Hide a handled recording from the working list (or bring it back) —
+    the same archive the scan journal has; nothing is deleted."""
+    row = voice.set_archived(db, _row(db, voice_id), archived)
+    return out(row, ready=stt.stt_ready(db), languages=_languages(db), sender=_sender(row, db))
 
 
 @router.get("/{voice_id}/audio")
@@ -111,7 +155,7 @@ async def transcribe(voice_id: str, apply: bool = True, language: str | None = N
         raise HTTPException(404, str(exc)) from exc
     if apply:
         voice.note_applied(db, row, await apply_transcript(db, text))
-    return out(row, ready=stt.stt_ready(db), languages=_languages(db))
+    return out(row, ready=stt.stt_ready(db), languages=_languages(db), sender=_sender(row, db))
 
 
 @router.post("/{voice_id}/apply", response_model=VoiceOut)
@@ -122,7 +166,7 @@ async def apply_again(voice_id: str, db: Session = Depends(get_db)):
     if not row.transcript:
         raise HTTPException(409, "Це повідомлення ще не розпізнане")
     voice.note_applied(db, row, await apply_transcript(db, row.transcript))
-    return out(row, ready=stt.stt_ready(db), languages=_languages(db))
+    return out(row, ready=stt.stt_ready(db), languages=_languages(db), sender=_sender(row, db))
 
 
 async def apply_transcript(db: Session, text: str) -> str:
@@ -144,9 +188,19 @@ async def apply_transcript(db: Session, text: str) -> str:
             return f"заправка не записана: {exc}"
         return f"заправка: {res['store_name']} · {res['liters']} л · {res['total_amount']} грн"
     if draft.intent == "shopping":
-        rows = capture.add_shopping_items(db, draft)
-        return f"список покупок: {len(rows)} позицій"
+        rows = capture.add_shopping_items(db, draft, added_method="voice", added_by="Voice")
+        details = ", ".join(_shopping_item_label(row) for row in rows)
+        return f"🛒 Додано до списку ({len(rows)}): {details}"
     return "не схоже ні на чек, ні на список покупок"
+
+
+def _shopping_item_label(row) -> str:
+    """Keep the voice action result useful without exposing the whole row."""
+    qty = ""
+    if row.qty and float(row.qty) != 1:
+        qty = f" — {float(row.qty):g}{(' ' + row.unit) if row.unit else ''}"
+    note = f" ({row.note})" if row.note else ""
+    return f"{row.raw_text}{qty}{note}"
 
 
 @router.delete("/{voice_id}", status_code=204)

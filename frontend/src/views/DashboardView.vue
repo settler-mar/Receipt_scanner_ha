@@ -10,8 +10,18 @@ import type { DashboardRangeKey } from '@/types/api'
 const range = ref<DashboardRangeKey>(DEFAULT_RANGE) // shared, session-only (not persisted)
 const configOpen = ref(false)
 
-const { entries, includeDiscount, loaded, load, visible, toggle, move, setRange, setIncludeDiscount } =
-  useDashboardLayout()
+const {
+  entries,
+  includeDiscount,
+  loaded,
+  load,
+  visible,
+  toggle,
+  move,
+  setRange,
+  setOptions,
+  setIncludeDiscount,
+} = useDashboardLayout()
 onMounted(load)
 
 function effectiveRange(entry: LayoutEntry): DashboardRangeKey {
@@ -137,7 +147,9 @@ const orderedEntries = computed(() => entries.value)
       :key="entry.key"
       :range="effectiveRange(entry)"
       :include-discount="meta.supportsDiscount ? includeDiscount : undefined"
+      :options="meta.supportsOptions ? entry.options : undefined"
       @update:include-discount="setIncludeDiscount"
+      @update:options="setOptions(entry.key, $event)"
       class="dashboard-widget"
     />
   </template>

@@ -28,6 +28,7 @@ const DRAFT_KEY = 'receipt-draft-v1'
 
 interface DraftItem {
   name: string
+  product_code: string
   quantity: number
   unit: string
   unit_price: number | ''
@@ -47,7 +48,7 @@ interface DraftForm {
 }
 
 function emptyItem(): DraftItem {
-  return { name: '', quantity: 1, unit: '', unit_price: '', total_price: 0, discount: 0 }
+  return { name: '', product_code: '', quantity: 1, unit: '', unit_price: '', total_price: 0, discount: 0 }
 }
 
 function nowLocal(): string {
@@ -180,6 +181,7 @@ async function submit() {
         total_price: Number(it.total_price) || 0,
         discount: Number(it.discount) || 0,
         barcode: null,
+        product_code: it.product_code || null,
       })),
     })
     if (receipt.duplicate) {
@@ -284,6 +286,7 @@ function fmtMoney(v: number) {
       <thead>
         <tr>
           <th>Назва</th>
+          <th>Код</th>
           <th>К-сть</th>
           <th>Од.</th>
           <th>Ціна</th>
@@ -295,6 +298,7 @@ function fmtMoney(v: number) {
       <tbody>
         <tr v-for="(it, i) in form.items" :key="i">
           <td><input v-model="it.name" style="width: 100%" /></td>
+          <td><input v-model="it.product_code" placeholder="код" style="width: 100px" /></td>
           <td>
             <input
               type="number"

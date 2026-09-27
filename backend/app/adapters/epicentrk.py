@@ -303,31 +303,36 @@ class EpicentrKAdapter(BaseAdapter):
 
     async def start_login(self, phone_number: str) -> AuthResult:
         phone_digits = phone_number.lstrip("+")
-        async with httpx.AsyncClient(timeout=20, base_url=BASE_URL) as client:
-            anon = await client.post(
-                "/api/v2/auth/anonymous-token",
-                headers=_base_headers(),
-                json={"appId": str(uuid.uuid4())},
-            )
-            if anon.status_code != 200:
-                raise AdapterError(f"Епіцентр К: не вдалось відкрити сесію ({anon.status_code})")
-            anon_token = anon.json()["accessToken"]
+        try:
+            async with httpx.AsyncClient(timeout=20, base_url=BASE_URL) as client:
+                anon = await client.post(
+                    "/api/v2/auth/anonymous-token",
+                    headers=_base_headers(),
+                    json={"appId": str(uuid.uuid4())},
+                )
+                if anon.status_code != 200:
+                    raise AdapterError(f"Епіцентр К: не вдалось відкрити сесію ({anon.status_code})")
+                anon_token = anon.json()["accessToken"]
 
-            session_headers = {**_base_headers(), "Authorization": f"Bearer {anon_token}"}
-            site_user = await client.get("/api/v2/auth/info/site-user", headers=session_headers)
-            if site_user.status_code != 200:
-                raise AdapterError(f"Епіцентр К: не вдалось отримати сесію ({site_user.status_code})")
-            info = site_user.json()
-            f_user_id, session_id = info["fUserId"], info["sessionId"]
+                session_headers = {**_base_headers(), "Authorization": f"Bearer {anon_token}"}
+                site_user = await client.get("/api/v2/auth/info/site-user", headers=session_headers)
+                if site_user.status_code != 200:
+                    raise AdapterError(f"Епіцентр К: не вдалось отримати сесію ({site_user.status_code})")
+                info = site_user.json()
+                f_user_id, session_id = info["fUserId"], info["sessionId"]
 
-            otp_headers = {**session_headers, "X-Fuser-Id": str(f_user_id)}
-            otp = await client.post(
-                f"/api/v2/auth/otp-codes/generate?session_id={session_id}",
-                headers=otp_headers,
-                json={"phoneNumber": phone_digits},
-            )
-            if otp.status_code != 200:
-                raise AdapterError(f"Епіцентр К: не вдалось надіслати SMS ({otp.status_code}): {otp.text[:200]}")
+                otp_headers = {**session_headers, "X-Fuser-Id": str(f_user_id)}
+                otp = await client.post(
+                    f"/api/v2/auth/otp-codes/generate?session_id={session_id}",
+                    headers=otp_headers,
+                    json={"phoneNumber": phone_digits},
+                )
+                if otp.status_code != 200:
+                    raise AdapterError(f"Епіцентр К: не вдалось надіслати SMS ({otp.status_code}): {otp.text[:200]}")
+        except httpx.HTTPError as exc:
+            raise AdapterError(f"Епіцентр К: помилка з'єднання ({exc})") from exc
+        except (KeyError, ValueError) as exc:
+            raise AdapterError(f"Епіцентр К: неочікувана відповідь сервера ({exc})") from exc
 
         return AuthResult(
             pending=True,
@@ -352,29 +357,34 @@ class EpicentrKAdapter(BaseAdapter):
             "Authorization": f"Bearer {anon_token}",
             "X-Fuser-Id": str(f_user_id),
         }
-        async with httpx.AsyncClient(timeout=20, base_url=BASE_URL) as client:
-            resp = await client.post(
-                f"/api/v2/auth/otp-codes/process?session_id={session_id}",
-                headers=headers,
-                json={"phoneNumber": phone_digits, "code": code},
-            )
-            if resp.status_code != 200:
-                raise AdapterError("Епіцентр К: невірний код підтвердження")
-            payload = resp.json()
-            real_token = payload["accessToken"]
+        try:
+            async with httpx.AsyncClient(timeout=20, base_url=BASE_URL) as client:
+                resp = await client.post(
+                    f"/api/v2/auth/otp-codes/process?session_id={session_id}",
+                    headers=headers,
+                    json={"phoneNumber": phone_digits, "code": code},
+                )
+                if resp.status_code != 200:
+                    raise AdapterError("Епіцентр К: невірний код підтвердження")
+                payload = resp.json()
+                real_token = payload["accessToken"]
 
-            # sessionId survives the anonymous->real upgrade, but fUserId does NOT —
-            # it's actually the user's own customer_id, only assigned once the token
-            # is a real (not anonymous) one. Re-deriving it with the anon fUserId
-            # gives a value the orders endpoints 500 on (confirmed live), so this
-            # second call is mandatory, not an optimization.
-            site_user = await client.get(
-                f"/api/v2/auth/info/site-user?session_id={session_id}",
-                headers={**_base_headers(), "Authorization": f"Bearer {real_token}", "X-Fuser-Id": str(f_user_id)},
-            )
-            if site_user.status_code != 200:
-                raise AdapterError(f"Епіцентр К: не вдалось оновити сесію після входу ({site_user.status_code})")
-            real_f_user_id = site_user.json()["fUserId"]
+                # sessionId survives the anonymous->real upgrade, but fUserId does NOT —
+                # it's actually the user's own customer_id, only assigned once the token
+                # is a real (not anonymous) one. Re-deriving it with the anon fUserId
+                # gives a value the orders endpoints 500 on (confirmed live), so this
+                # second call is mandatory, not an optimization.
+                site_user = await client.get(
+                    f"/api/v2/auth/info/site-user?session_id={session_id}",
+                    headers={**_base_headers(), "Authorization": f"Bearer {real_token}", "X-Fuser-Id": str(f_user_id)},
+                )
+                if site_user.status_code != 200:
+                    raise AdapterError(f"Епіцентр К: не вдалось оновити сесію після входу ({site_user.status_code})")
+                real_f_user_id = site_user.json()["fUserId"]
+        except httpx.HTTPError as exc:
+            raise AdapterError(f"Епіцентр К: помилка з'єднання ({exc})") from exc
+        except (KeyError, ValueError) as exc:
+            raise AdapterError(f"Епіцентр К: неочікувана відповідь сервера ({exc})") from exc
 
         expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=payload.get("expiresIn", 2592000))
         return AuthResult(
@@ -644,6 +654,7 @@ def _normalize(order: dict, channel: str) -> NormalizedReceipt:
                 total_price=lines_total,
                 discount=discount,
                 barcode=g.get("article") or g.get("articul1C"),
+                product_code=g.get("article") or g.get("articul1C"),
                 product_image_url=g.get("picture"),
             )
         )

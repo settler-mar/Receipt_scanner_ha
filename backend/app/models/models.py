@@ -57,6 +57,10 @@ class AuthType(str, enum.Enum):
     # barcode shown at checkout is derivable from the card number alone, same
     # as reading it off the physical card.
     card_number = "card_number"
+    # A pasted personal API token, no login flow at all — supports multiple
+    # independent accounts (each with its own token) the same way any other
+    # store does, via Account+Credential. First user: Monobank statement API.
+    api_token = "api_token"
 
 
 class AccountStatus(str, enum.Enum):
@@ -85,6 +89,13 @@ class DuplicateRunStatus(str, enum.Enum):
     running = "running"
     success = "success"
     error = "error"
+
+
+class BankTransactionStatus(str, enum.Enum):
+    unmatched = "unmatched"    # no candidate receipt found
+    matched = "matched"        # linked to exactly one receipt (auto or manual)
+    needs_review = "needs_review"  # more than one plausible receipt candidate
+    ignored = "ignored"        # user marked it as never producing a receipt
 
 
 class Store(Base):
@@ -150,6 +161,9 @@ class Account(Base):
     fuel_price_snapshots: Mapped[list["FuelPriceSnapshot"]] = relationship(
         back_populates="account", cascade="all, delete-orphan"
     )
+    bank_transactions: Mapped[list["BankTransaction"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
 
 
 class Credential(Base):
@@ -197,6 +211,13 @@ class CollectionRun(Base):
     receipts_found: Mapped[int] = mapped_column(default=0)
     receipts_new: Mapped[int] = mapped_column(default=0)
     error_message: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Coarse step progress for a long-running run (e.g. a deep bank-statement
+    # backfill chunked into several throttled requests) — None/None for a run
+    # that doesn't report progress, so existing receipt-collection rows are
+    # unaffected. Updated (and committed) as the run's own background task
+    # proceeds; polled by the account page while status == running.
+    progress_current: Mapped[int | None] = mapped_column(nullable=True)
+    progress_total: Mapped[int | None] = mapped_column(nullable=True)
 
     account: Mapped[Account] = relationship(back_populates="runs")
 
@@ -294,6 +315,49 @@ class AppSetting(Base):
     )
 
 
+class AppEvent(Base):
+    """One line of the unified operational journal (страница «Журнал»).
+
+    Most subsystems already keep their own history — collection runs, scan jobs,
+    duplicate runs, Telegram messages, the AI ring buffer — and `api/logs.py`
+    merges those on read. This table is for events that have nowhere else to
+    live: scheduled maintenance, automatic shopping-list categorization, and
+    anything else a background job wants to leave a trace of.
+    """
+
+    __tablename__ = "app_events"
+    __table_args__ = (Index("ix_app_events_created_source", "created_at", "source"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, index=True
+    )
+    source: Mapped[str] = mapped_column(String, index=True)   # shopping | scheduler | ai | ...
+    level: Mapped[str] = mapped_column(String, default="info")  # info | warning | error
+    title: Mapped[str] = mapped_column(String)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ReceiptComponent(Base):
+    """Signed receipt-level amount from a provider's order breakdown."""
+
+    __tablename__ = "receipt_components"
+    __table_args__ = (Index("ix_receipt_components_receipt", "receipt_id"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    receipt_id: Mapped[str] = mapped_column(ForeignKey("receipts.id"), index=True)
+    kind: Mapped[str] = mapped_column(String, index=True)
+    code: Mapped[str | None] = mapped_column(String, nullable=True)
+    label: Mapped[str] = mapped_column(String)
+    amount: Mapped[float] = mapped_column(Numeric(12, 2))
+    currency: Mapped[str] = mapped_column(String, default="UAH")
+    source: Mapped[str | None] = mapped_column(String, nullable=True)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    receipt: Mapped["Receipt"] = relationship(back_populates="components")
+
+
 class Receipt(Base):
     __tablename__ = "receipts"
     __table_args__ = (UniqueConstraint("account_id", "external_id", name="uq_receipt_account_external"),)
@@ -312,6 +376,11 @@ class Receipt(Base):
     payment_type: Mapped[str | None] = mapped_column(String, nullable=True)
     channel: Mapped[str] = mapped_column(String, default="offline")  # "offline" | "online"
     total_discount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)  # sum of item discounts
+    # Signed receipt-level correction for a provider amount that cannot be
+    # attributed to a product (for example an unexplained AliExpress order
+    # discount or extra charge). This is deliberately not a ReceiptItem field.
+    total_adjustment: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    adjustment_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     bonuses: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)  # loyalty points/cashback earned, when the store's API reports it
     bonuses_used: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)  # loyalty points/cashback spent as payment, when reported
     receipt_url: Mapped[str | None] = mapped_column(String, nullable=True)  # e.g. an SMS/email fiscal-receipt link (vencon.ua/receipt/... and similar)
@@ -334,11 +403,30 @@ class Receipt(Base):
     # back to a live adapter fetch otherwise.
     warranty_pdf_filename: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # A user may deliberately hide a known line-total mismatch from the open
+    # problems queue. Keep the timestamp so the decision remains auditable.
+    reconciliation_ignored_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Denormalized reconciliation snapshot. It is refreshed when receipt data
+    # changes so list pages and navigation never aggregate all item rows.
+    items_total: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    components_total: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    reconciled_total: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    reconciliation_delta: Mapped[float] = mapped_column(Numeric(12, 2), default=0, index=True)
+    reconciliation_status: Mapped[str] = mapped_column(String, default="ok", index=True)
+    reconciliation_calculated_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     raw: Mapped[dict] = mapped_column(JSON, default=dict)  # original payload, for future re-parsing
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     account: Mapped[Account] = relationship(back_populates="receipts")
     items: Mapped[list["ReceiptItem"]] = relationship(back_populates="receipt", cascade="all, delete-orphan")
+    components: Mapped[list[ReceiptComponent]] = relationship(
+        back_populates="receipt", cascade="all, delete-orphan", order_by="ReceiptComponent.id"
+    )
     tags: Mapped[list["ReceiptTag"]] = relationship(
         back_populates="receipt", cascade="all, delete-orphan",
         order_by="ReceiptTag.tag",
@@ -439,6 +527,7 @@ class ReceiptItem(Base):
 
     name: Mapped[str] = mapped_column(String)
     barcode: Mapped[str | None] = mapped_column(String, nullable=True)
+    product_code: Mapped[str | None] = mapped_column(String, nullable=True)
     # Raw category string as the store's own API labelled it (mostly NULL) —
     # kept verbatim; the resolved tree category is category_id below.
     category_raw: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -462,6 +551,40 @@ class ReceiptItem(Base):
 
     receipt: Mapped[Receipt] = relationship(back_populates="items")
     category: Mapped["Category | None"] = relationship()
+    files: Mapped[list["ReceiptItemFile"]] = relationship(
+        back_populates="item", cascade="all, delete-orphan", order_by="ReceiptItemFile.created_at"
+    )
+
+
+class ReceiptItemFile(Base):
+    """A manually attached image for one line item — a photo of the product or
+    of a paper warranty card. This is the non-PDF path for warranties: stores
+    that hand out a stamped paper talon (or none at all) leave nothing to
+    download, so the scan/photo taken by hand is the only document there is.
+    An attachment is either an uploaded file (data/item_files/, same on-disk
+    pattern as receipt photos — see api/receipts.py) or just a link to an image
+    hosted elsewhere; `filename` and `source_url` are mutually exclusive."""
+
+    __tablename__ = "receipt_item_files"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    item_id: Mapped[str] = mapped_column(
+        ForeignKey("receipt_items.id", ondelete="CASCADE"), index=True
+    )
+    # "warranty" - гарантійний талон / чек на гарантію, "photo" - the product itself.
+    kind: Mapped[str] = mapped_column(String, default="warranty")
+    # Exactly one of the two is set: an uploaded copy under data/item_files/, or
+    # a link to an image that already lives somewhere else (store's product
+    # page, Drive, a chat). A link costs nothing to keep and can rot; an upload
+    # is ours forever — both are legitimate, so neither is forced.
+    filename: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    original_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    note: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    item: Mapped[ReceiptItem] = relationship(back_populates="files")
 
 
 def derive_unit_price(quantity: float, total_price: float) -> float | None:
@@ -473,12 +596,133 @@ def derive_unit_price(quantity: float, total_price: float) -> float | None:
     return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+def derive_quantity(unit_price: float, total_price: float) -> float | None:
+    """Calculate a three-decimal quantity (including weight) from line prices."""
+    unit_value = Decimal(str(unit_price or 0))
+    if unit_value <= 0:
+        return None
+    value = Decimal(str(total_price or 0)) / unit_value
+    return float(value.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
+
+def _is_weight_or_volume_unit(unit: str | None) -> bool:
+    return (unit or "").strip().lower() in {"кг", "kg", "г", "g", "л", "l", "мл", "ml"}
+
+
 @event.listens_for(ReceiptItem, "before_insert")
 @event.listens_for(ReceiptItem, "before_update")
 def _persist_derived_unit_price(_mapper, _connection, item: ReceiptItem) -> None:
-    """Keep unit_price complete for every writer, including scanners/importers."""
+    """Keep manually entered line prices and quantity complete for every writer."""
+    # A blank quantity is sent as 0 by the manual form. In that case the two
+    # entered prices are enough to recover the sold quantity/weight.
+    if (
+        item.unit_price is not None
+        and (item.quantity is not None and item.quantity <= 0 or _is_weight_or_volume_unit(item.unit))
+    ):
+        derived_quantity = derive_quantity(item.unit_price, item.total_price)
+        if derived_quantity is not None:
+            item.quantity = derived_quantity
+    # Manual forms may leave the line total at its initial zero while a unit
+    # price is already entered. Persist the mathematically expected line total.
+    if item.total_price is not None and item.total_price <= 0 and item.unit_price is not None and item.quantity:
+        item.total_price = float(
+            (Decimal(str(item.unit_price)) * Decimal(str(item.quantity))).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        )
     if item.unit_price is None and item.total_price is not None:
         item.unit_price = derive_unit_price(item.quantity, item.total_price)
+
+
+class BankTransaction(Base):
+    """One line of a bank statement (services/monobank.py + future bank
+    adapters) — an Account/Credential of a store with AuthType.api_token, same
+    as any other store, so more than one bank *and* more than one connection
+    per bank (several personal tokens) both fall out for free.
+
+    A separate entity from Receipt on purpose: a single transaction can cover
+    several receipts (one card swipe for a shared basket) and a single receipt
+    can be paid across several transactions (installments, a tip added after
+    the fact) — so v1 keeps a nullable single link for the clean 1:1 case and
+    leaves anything ambiguous in `needs_review` for a person to resolve,
+    instead of forcing a guess.
+    """
+
+    __tablename__ = "bank_transactions"
+    __table_args__ = (
+        UniqueConstraint("account_id", "external_id", name="uq_bank_transaction_account_external"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    store_code: Mapped[str] = mapped_column(String, index=True)  # denormalized, like Receipt.store_code
+    external_id: Mapped[str] = mapped_column(String, index=True)  # the bank's own transaction id
+
+    amount: Mapped[float] = mapped_column(Numeric(12, 2))
+    currency: Mapped[str] = mapped_column(String, default="UAH")
+    mcc: Mapped[int | None] = mapped_column(nullable=True)
+    description: Mapped[str | None] = mapped_column(String, nullable=True)
+    # comment, the bank's own receiptId, masked card info, etc — identifiers
+    # only, kept verbatim for the review UI and future re-matching.
+    counterparty_raw: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    occurred_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    status: Mapped[BankTransactionStatus] = mapped_column(
+        Enum(BankTransactionStatus), default=BankTransactionStatus.unmatched, index=True
+    )
+    linked_receipt_id: Mapped[str | None] = mapped_column(
+        ForeignKey("receipts.id"), nullable=True, index=True
+    )
+    # Free label for a transaction that never produces a receipt at all
+    # ("utilities" / "phone_topup" / "pocket_money" / custom text).
+    ignore_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    category_override_id: Mapped[str | None] = mapped_column(
+        ForeignKey("categories.id", ondelete="SET NULL"), nullable=True
+    )
+    # Which BankTransactionRule last set ignore_reason/category_override_id
+    # here, if any — services/bank_transaction_rules.py's marker for "safe to
+    # recompute on the next pass" vs. "a person chose this by hand, leave it".
+    auto_rule_id: Mapped[str | None] = mapped_column(
+        ForeignKey("bank_transaction_rules.id", ondelete="SET NULL"), nullable=True
+    )
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    account: Mapped["Account"] = relationship(back_populates="bank_transactions")
+    linked_receipt: Mapped["Receipt | None"] = relationship()
+    category_override: Mapped["Category | None"] = relationship()
+
+
+class BankTransactionRule(Base):
+    """A named auto-categorization rule for bank transactions, matched by a
+    counterparty substring (Monobank puts a person's name in `description` for
+    peer-to-peer transfers — there's no merchant/MCC to key off of).
+
+    `branches` is an ordered list of {condition, category_id, ignore_reason}
+    dicts, evaluated top to bottom — the first branch whose condition holds
+    wins. Conditions can see the transaction's amount and its position/count
+    among same-rule matches in the same calendar month, which is what makes
+    "the first transfer to Женя each month is rent, the rest are utilities,
+    and if there's only one that month it's utilities" expressible as one
+    rule instead of a hardcoded special case. See
+    services/bank_transaction_rules.py for the condition kinds and the
+    evaluation/grouping logic.
+    """
+
+    __tablename__ = "bank_transaction_rules"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    label: Mapped[str] = mapped_column(String)
+    counterparty_match: Mapped[str] = mapped_column(String)
+    # Lower runs first; only meaningful for ordering *between* rules — each
+    # rule's own branches already have their own evaluation order.
+    priority: Mapped[int] = mapped_column(default=0)
+    branches: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
 class TelegramMessageLog(Base):

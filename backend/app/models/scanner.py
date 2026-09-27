@@ -176,3 +176,8 @@ class VoiceMessage(Base):
     transcribed_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Same idea as ScanJob.archived_at: the audio and the record stay, the row
+    # just leaves the working list once the user is done with it.
+    archived_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )

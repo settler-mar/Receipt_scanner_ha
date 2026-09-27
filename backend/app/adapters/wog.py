@@ -244,8 +244,11 @@ def _normalize(op: dict) -> NormalizedReceipt:
     goods = op.get("LISTGOODS") or []
     items = [_normalize_item(g) for g in goods]
 
-    bonuses_earned = sum(_to_float((g.get("BONUSES") or {}).get("INCREASE")) for g in goods) or None
-    bonuses_used = sum(_to_float((g.get("BONUSES") or {}).get("DECREASE")) for g in goods) or None
+    # BONUSES.INCREASE/DECREASE come in бали, i.e. hundredths of a hryvnia —
+    # the same convention as the balance endpoint (get_balance divides by 100).
+    # The rest of the app treats bonuses as money, so convert here.
+    bonuses_earned = sum(_to_float((g.get("BONUSES") or {}).get("INCREASE")) for g in goods) / 100 or None
+    bonuses_used = sum(_to_float((g.get("BONUSES") or {}).get("DECREASE")) for g in goods) / 100 or None
     total_amount = sum(_to_float(g.get("SUMM")) for g in goods)
 
     return NormalizedReceipt(

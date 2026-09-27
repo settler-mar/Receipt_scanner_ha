@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -12,9 +12,11 @@ router = APIRouter(prefix="/api/duplicates", tags=["duplicates"])
 
 
 @router.post("/run", response_model=DuplicateRunOut)
-def run_duplicate_search(db: Session = Depends(get_db)):
+def run_duplicate_search(background: BackgroundTasks, db: Session = Depends(get_db)):
     try:
-        return duplicates.run_duplicate_search(db, trigger="manual")
+        run = duplicates.start_duplicate_search(db, trigger="manual")
+        background.add_task(duplicates.finish_duplicate_search, run.id)
+        return run
     except duplicates.DuplicateRunAlreadyRunning as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

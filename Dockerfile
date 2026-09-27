@@ -25,7 +25,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     DISPLAY=:99 \
     TZ=Europe/Kyiv \
-    RS_FRONTEND_DIST=/app/frontend_dist
+    RS_FRONTEND_DIST=/app/frontend_dist \
+    RS_VERSION="${BUILD_VERSION}"
 
 WORKDIR /app
 

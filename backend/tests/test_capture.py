@@ -109,6 +109,26 @@ def test_shopping_list_shared_modifier_expands():
     assert draft.shopping[-1].note is None
 
 
+def test_shopping_list_moves_person_suffix_into_note():
+    draft = capture.parse_payload({
+        "intent": "shopping", "confidence": 0.9,
+        "shopping": [{"text": "ягоды для Миланы"}],
+    })
+
+    assert draft.shopping[0].text == "ягоды"
+    assert draft.shopping[0].note == "для Миланы"
+
+
+def test_shopping_list_keeps_object_purpose_in_name():
+    draft = capture.parse_payload({
+        "intent": "shopping", "confidence": 0.9,
+        "shopping": [{"text": "крепеж для телевизора"}],
+    })
+
+    assert draft.shopping[0].text == "крепеж для телевизора"
+    assert draft.shopping[0].note is None
+
+
 # --------------------------------------------------------------------------- #
 # Reading edge cases
 # --------------------------------------------------------------------------- #
@@ -191,8 +211,9 @@ def test_parse_capture_uses_the_ai_backend(db, monkeypatch):
     async def fake_run(db_, cfg, task, *, make_call, prompt_preview=""):
         seen["task"] = task
         seen["preview"] = prompt_preview
-        return {"intent": "shopping", "confidence": 0.9,
-                "shopping": [{"text": "молоко", "qty": 1}]}
+        return capture.ai.AiAnswer({"intent": "shopping", "confidence": 0.9,
+                                    "shopping": [{"text": "молоко", "qty": 1}]},
+                                   provider="local", model="qwen")
 
     monkeypatch.setattr(capture.ai, "_run", fake_run)
     draft = asyncio.run(capture.parse_capture(db, " додай в список молоко "))

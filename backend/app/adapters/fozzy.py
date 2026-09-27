@@ -60,6 +60,7 @@ from app.adapters.base import (
     LoyaltyCode,
     NormalizedItem,
     NormalizedReceipt,
+    NormalizedReceiptComponent,
 )
 
 BASE_URL = "https://loyaltyexpapi.fozzy.ua/api"
@@ -442,16 +443,30 @@ async def _fetch_detail(client: httpx.AsyncClient, headers: dict, header: dict) 
 def _normalize_offline(header: dict, detail: dict, purchased_at: dt.datetime) -> NormalizedReceipt:
     lines = detail.get("chequeLines") or []
     items = [_normalize_item(line) for line in lines]
+    total = float(header.get("sumReg") or detail.get("sumReg") or 0)
+    line_total = round(sum(item.total_price for item in items), 2)
+    residual = round(total - line_total, 2)
+    components = []
+    if abs(residual) >= 0.01:
+        components.append(NormalizedReceiptComponent(
+            kind="discount" if residual < 0 else "other",
+            code="order_discount" if residual < 0 else "order_residual",
+            label="Знижка замовлення" if residual < 0 else "Різниця підсумку замовлення",
+            amount=residual, currency="UAH", source="fozzy.cheque_totals",
+            raw={"sumReg": header.get("sumReg"), "sumDiscount": header.get("sumDiscount")},
+        ))
 
     return NormalizedReceipt(
         external_id=str(header["chequeId"]),
         purchased_at=purchased_at,
-        total_amount=float(header.get("sumReg") or 0),
+        total_amount=total,
         shop_name=header.get("filialName"),
         shop_address=header.get("cityName"),
         payment_type=header.get("payTypeName"),
         channel="offline",
         items=items,
+        components=components,
+        total_discount=round(sum(item.discount for item in items) + sum(-component.amount for component in components if component.amount < 0), 2),
         raw={"header": header, "detail": detail},
     )
 
@@ -479,16 +494,36 @@ def _normalize_online(head: dict, detail: dict, purchased_at: dt.datetime) -> No
         if it.get("lineStateId") != 1 and (it.get("countActual") or 0) > 0
     ]
 
+    total = float(head.get("sumActual") or 0)
+    line_total = round(sum(item.total_price for item in items), 2)
+    delivery = float(detail.get("sumActualDelivery") or 0)
+    components = []
+    if abs(delivery) >= 0.01:
+        components.append(NormalizedReceiptComponent(
+            kind="delivery", code="delivery", label="Доставка", amount=round(delivery, 2),
+            currency="UAH", source="fozzy.order_totals", raw={"sumActualDelivery": detail.get("sumActualDelivery")},
+        ))
+    order_residual = round(total - line_total - delivery, 2)
+    if abs(order_residual) >= 0.01:
+        components.append(NormalizedReceiptComponent(
+            kind="discount" if order_residual < 0 else "other",
+            code="order_discount" if order_residual < 0 else "order_residual",
+            label="Знижка замовлення" if order_residual < 0 else "Різниця підсумку замовлення",
+            amount=order_residual, currency="UAH", source="fozzy.order_totals",
+            raw={"sumActual": head.get("sumActual"), "sumActualGoods": detail.get("sumActualGoods"),
+                 "sumActualDiscount": head.get("sumActualDiscount")},
+        ))
     return NormalizedReceipt(
         external_id=f"online:{head['id']}",
         purchased_at=purchased_at,
-        total_amount=float(head.get("sumActual") or 0),
+        total_amount=total,
         shop_name=head.get("filialName"),
         shop_address=head.get("deliveryAddress"),
         payment_type=head.get("paymentTypeName"),
         channel="online",
         items=items,
-        total_discount=abs(float(head.get("sumActualDiscount") or 0)),
+        components=components,
+        total_discount=round(sum(item.discount for item in items) + sum(-component.amount for component in components if component.amount < 0), 2),
         raw={"head": head, "detail": detail},
     )
 

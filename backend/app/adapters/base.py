@@ -12,6 +12,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 import datetime as dt
+from typing import Callable
 
 
 # Browser-backed adapters can rotate their cookie jar while handling a request.
@@ -28,6 +29,9 @@ class NormalizedItem:
     unit: str | None = None
     unit_price: float | None = None
     barcode: str | None = None
+    # Store/seller product code (article, PLU, internal SKU), separate from
+    # the retail barcode when a receipt provides both.
+    product_code: str | None = None
     category: str | None = None
     discount: float = 0
     product_url: str | None = None
@@ -43,6 +47,24 @@ class NormalizedItem:
     warranty_text: str | None = None
     warranty_expires_at: dt.datetime | None = None
     warranty_checked_at: dt.datetime | None = None
+
+
+@dataclasses.dataclass
+class NormalizedReceiptComponent:
+    """Signed receipt-level amount, never a product line.
+
+    Positive amounts add to the payable total (shipping, tax, service fee);
+    negative amounts reduce it (coupon, discount, coins). The provider-neutral
+    code/label pair lets adapters expose new breakdowns without schema changes.
+    """
+
+    kind: str
+    code: str | None
+    label: str
+    amount: float
+    currency: str = "UAH"
+    source: str | None = None
+    raw: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -64,12 +86,18 @@ class NormalizedReceipt:
     # Fora is the one store so far with a genuine online branch (see fora.py).
     channel: str = "offline"
     items: list[NormalizedItem] = dataclasses.field(default_factory=list)
+    components: list[NormalizedReceiptComponent] = dataclasses.field(default_factory=list)
     raw: dict = dataclasses.field(default_factory=dict)
     # Override for the receipt-level discount total. Leave None to have the
     # collector sum item discounts instead — set this when the store's API gives
     # an authoritative total directly but doesn't break it down per line (e.g.
     # Fozzy's online orders only expose sumActualDiscount at the order level).
     total_discount: float | None = None
+    # Signed receipt-level amount that remains unexplained after the provider's
+    # known line discounts/fees are considered. Positive means an extra charge,
+    # negative means an order-level reduction. Never put this on an item.
+    total_adjustment: float | None = None
+    adjustment_reason: str | None = None
     # Loyalty points/cashback the store's own API says this purchase earned — only
     # set when the store actually reports it (ATB/Fozzy don't expose this anywhere
     # we've found; see RESEARCH.md).
@@ -163,6 +191,30 @@ class CatalogProduct:
     image_url: str | None = None
     product_url: str | None = None
     in_stock: bool | None = None  # None when the store's search doesn't report stock at all
+    seller_name: str | None = None
+    seller_phone: str | None = None
+
+
+@dataclasses.dataclass
+class NormalizedBankTransaction:
+    """One line of a bank statement (services/monobank.py) — deliberately not a
+    NormalizedReceipt: a bank transaction has no line items and often no
+    matching receipt at all (utilities, a phone top-up, a transfer). The
+    transaction<->receipt link is a separate, reviewable step in
+    services/bank_transactions.py, not something an adapter decides."""
+
+    external_id: str
+    occurred_at: dt.datetime
+    # Signed, in the bank's own major currency unit (e.g. hryvnia, not kopecks):
+    # negative is money leaving the account (a purchase — what can plausibly
+    # match a receipt), positive is money coming in (a refund, a transfer in)
+    # and is never something a receipt would be issued for.
+    amount: float
+    currency: str = "UAH"
+    mcc: int | None = None
+    description: str | None = None
+    counterparty: dict = dataclasses.field(default_factory=dict)
+    raw: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -191,6 +243,14 @@ class BaseAdapter(abc.ABC):
     # Public catalogs may opt out so product search still works before login.
     catalog_search_requires_auth: bool = True
 
+    # What an Account's `phone_number` slot actually holds for this store, so the
+    # UI can label the field honestly instead of asking every store for a phone:
+    # "phone" (default), "email" (Tabletki.ua's cabinet logs in by email only) or
+    # "phone_or_email" (AliExpress/Liki accept either). Same idea as
+    # `capabilities` above — derived from the adapter, never hardcoded per store
+    # code in the frontend.
+    login_field: str = "phone"
+
     # Whether fetch_receipts is meant to work at all for this store — distinct
     # from whether it *currently* succeeds (ATB's is fully implemented but
     # blocked by Cloudflare at runtime; that's still "supported", just failing —
@@ -204,6 +264,13 @@ class BaseAdapter(abc.ABC):
     # no purchase history at all) — only scanner.py sets this True, and it's what
     # the UI uses to show a "Додати чек" button instead of collection controls.
     manual_receipts_supported: bool = False
+
+    # Whether this store is a bank/card-statement feed rather than a retail
+    # source — transactions get pulled instead of receipts, and matched to
+    # existing receipts as a separate step (see fetch_transactions,
+    # services/bank_transactions.py). Only bank adapters (monobank.py) set
+    # this True; it and receipts_supported are never both True.
+    transactions_supported: bool = False
 
     @property
     def capabilities(self) -> dict[str, bool]:
@@ -220,6 +287,7 @@ class BaseAdapter(abc.ABC):
         return {
             "receipts": self.receipts_supported,
             "manual_receipts": self.manual_receipts_supported,
+            "transactions": self.transactions_supported,
             "phone_otp_login": overrides("start_login"),
             "phone_password_login": overrides("login_with_password"),
             "oauth_browser_login": overrides("oauth_authorize_url"),
@@ -233,6 +301,9 @@ class BaseAdapter(abc.ABC):
             "fuel_prices": overrides("get_fuel_prices"),
             "catalog_search": overrides("search_catalog"),
             "warranty_document": overrides("get_warranty_document"),
+            # A manually pasted token can be checked against the store's API
+            # before relying on it — see the "Токен доступу вручну" card.
+            "token_test": overrides("test_token"),
         }
 
     async def login_with_password(self, phone_number: str, password: str) -> AuthResult:
@@ -294,6 +365,25 @@ class BaseAdapter(abc.ABC):
         this store blocks server-side automation — see atb.py) into normalized
         receipts, without making any network call. Optional; default: unsupported."""
         raise NotImplementedYet(f"{self.store_code}: manual import not supported")
+
+    async def fetch_transactions(
+        self,
+        access_token: str,
+        extra: dict,
+        since: dt.datetime | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> list[NormalizedBankTransaction]:
+        """For AuthType.api_token bank-feed adapters only (monobank.py):
+        return statement lines since `since`. `on_progress(done, total)`, when
+        given, fires as a multi-request fetch proceeds — adapters that only
+        ever need one request may ignore it. Optional; default: unsupported."""
+        raise NotImplementedYet(f"{self.store_code}: transaction fetch not supported")
+
+    async def test_token(self, access_token: str) -> dict:
+        """Cheap round-trip that proves a manually pasted token still works,
+        without a full collection run. Returns {"ok": bool, "detail": str}.
+        Optional; default: unsupported."""
+        raise NotImplementedYet(f"{self.store_code}: token test not supported")
 
     async def get_loyalty_code(self, access_token: str, extra: dict) -> LoyaltyCode:
         """Fetch the account's loyalty-card code for on-screen display (see

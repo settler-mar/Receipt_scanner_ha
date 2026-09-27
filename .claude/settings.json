@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(rg:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(sed -n:*)",
+      "Bash(wc:*)",
+      "Bash(cd backend && venv/bin/python -m pytest:*)",
+      "Bash(venv/bin/python -m pytest:*)",
+      "Bash(./venv/bin/python -m pytest:*)",
+      "Bash(venv/bin/python -c \"import app.main\")",
+      "Bash(venv/bin/python -m pyflakes:*)",
+      "Bash(npm run build)",
+      "Bash(npx vue-tsc --noEmit:*)",
+      "Bash(curl -s localhost:8001/api/:*)",
+      "Bash(curl -s localhost:18002/api/:*)"
+    ],
+    "deny": [
+      "Read(./backend/data/**)",
+      "Read(./frontend/node_modules/**)",
+      "Read(./frontend/dist/**)",
+      "Read(./backend/venv/**)",
+      "Read(./apks/**)",
+      "Read(./.env)",
+      "Read(./backend/.env)",
+      "Bash(rm -rf backend/data:*)"
+    ]
+  }
+}

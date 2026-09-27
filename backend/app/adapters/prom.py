@@ -174,6 +174,7 @@ def _graphql_item(data: dict) -> NormalizedItem:
     quantity = _number(data.get("quantity"), 1.0) or 1.0
     unit_price = _number(data.get("productPrice"))
     base_price = _number(data.get("productBasePrice"), unit_price)
+    is_gift = bool(data.get("isGift"))
     unit = ((product.get("measureUnit") or {}).get("value")
             or (data.get("measureUnit") or {}).get("value")
             or data.get("measureUnitByQuantity") or "шт")
@@ -181,9 +182,9 @@ def _graphql_item(data: dict) -> NormalizedItem:
         name=str(product.get("name") or data.get("productName") or "Товар Prom.ua").strip(),
         quantity=quantity,
         unit=unit,
-        unit_price=unit_price,
-        total_price=unit_price * quantity,
-        discount=max(0.0, (base_price - unit_price) * quantity),
+        unit_price=0.0 if is_gift else unit_price,
+        total_price=0.0 if is_gift else unit_price * quantity,
+        discount=(base_price * quantity) if is_gift else max(0.0, (base_price - unit_price) * quantity),
         barcode=str(data.get("productId")) if data.get("productId") is not None else None,
         product_image_url=product.get("imageUrl"),
     )

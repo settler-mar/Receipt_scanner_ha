@@ -14,6 +14,14 @@ def _db(tmp_path):
     return sessionmaker(bind=engine, expire_on_commit=False)()
 
 
+def test_trip_uncategorized_menu_offers_distribution_and_continue():
+    reply = telegram._uncategorized_trip_menu([SimpleNamespace(raw_text="молоко")])
+
+    assert "без категорії" in reply.text
+    callbacks = [row["callback_data"] for row in reply.keyboard for row in row]
+    assert callbacks == ["tri:categorize", "tri:uncategorized", "tri:continue"]
+
+
 def test_config_and_secrets_roundtrip(tmp_path):
     with _db(tmp_path) as db:
         cfg = telegram.save_config(db, telegram.TelegramConfig(
@@ -123,6 +131,27 @@ def test_mcp_commands_validate_arguments():
     assert telegram._mcp_command("/find") == "Формат: /find молоко"
     assert telegram._mcp_command("/add") == "Формат: /add молоко"
     assert telegram._mcp_command("hello") is None
+
+
+def test_bot_command_menu_is_configured_once(monkeypatch):
+    calls = []
+
+    async def fake_api(token, method, payload=None):
+        calls.append((token, method, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(telegram, "_api", fake_api)
+    monkeypatch.setattr(telegram, "_commands_configured_token", None)
+
+    import asyncio
+    asyncio.run(telegram._ensure_bot_commands("token-1"))
+    asyncio.run(telegram._ensure_bot_commands("token-1"))
+
+    assert len(calls) == 1
+    assert calls[0][1] == "setMyCommands"
+    assert [row["command"] for row in calls[0][2]["commands"]] == [
+        "start", "trip", "receipts", "spending"
+    ]
 
 
 def test_vchasno_html_prefers_tax_cabinet_link_over_preview():
@@ -312,6 +341,25 @@ def test_send_threads_reply_and_attaches_keyboard(monkeypatch):
     assert captured["payload"]["reply_parameters"] == {"message_id": 99, "allow_sending_without_reply": True}
     assert captured["payload"]["message_thread_id"] == 77
     assert captured["payload"]["reply_markup"]["inline_keyboard"][0][0]["text"] == "a"
+
+
+def test_edit_message_reuses_the_same_telegram_message(monkeypatch):
+    import asyncio
+
+    captured = {}
+
+    async def fake_api(token, method, payload=None):
+        captured["method"] = method
+        captured["payload"] = payload
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(telegram, "_api", fake_api)
+    asyncio.run(telegram._edit_message(
+        "t", 5, 99, "Чеклист", [[{"text": "Куплено", "callback_data": "tri:item:x"}]],
+    ))
+    assert captured["method"] == "editMessageText"
+    assert captured["payload"]["message_id"] == 99
+    assert captured["payload"]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "tri:item:x"
 
 
 def test_fiscal_unavailable_message_keeps_qr_facts_and_instructions():
@@ -673,3 +721,80 @@ def test_a_photo_nothing_came_out_of_still_offers_actions(tmp_path, monkeypatch)
     # Nothing to accept, everything else on offer.
     assert "rev:save:job-x" not in codes
     assert codes == ["rev:rescan:job-x", "rev:ai:job-x", "ser:add:job-x", "rev:del:job-x"]
+
+
+def test_the_reply_says_which_model_read_the_photo():
+    """"QR" and "AI: <service> / <model>" mean different things for how far the
+    result can be trusted, so the chat says which one it was."""
+    from app.models.scanner import ScanJob
+    from app.services import scan_jobs
+
+    qr_job = ScanJob(id="j1", method="qr", raw_ocr={})
+    assert scan_jobs.recognised_by(qr_job) == "QR"
+    assert telegram._source_line(qr_job) == "🔎 Розпізнано: QR"
+
+    ai_job = ScanJob(id="j2", method="ai",
+                     raw_ocr={"ai": {"service": "google", "model": "gemini-a"}})
+    assert telegram._source_line(ai_job) == "🔎 Розпізнано: AI: google / gemini-a"
+
+    # A batch keeps its series prefix in `method`; the source is still the one
+    # that read the glued photo.
+    series_job = ScanJob(id="j3", method="series:3·qr", raw_ocr={})
+    assert scan_jobs.recognised_by(series_job) == "QR"
+
+    # Nothing recognised it — no line rather than an empty label.
+    assert telegram._source_line(ScanJob(id="j4", method="none", raw_ocr={})) == ""
+
+
+def test_the_stronger_ai_button_names_the_step_it_would_run():
+    """"Stronger" is only the wording: the button spells out the service and
+    model so the user sees which step of their own route is next."""
+    rows = telegram._review_keyboard("job-1", next_ai=("openai", "gpt-b", "OpenAI"))
+    labels = [button["text"] for row in rows for button in row]
+    data = [button.get("callback_data") for row in rows for button in row]
+
+    assert "⚡ Сильніша AI → OpenAI / gpt-b" in labels
+    assert "rev:up:job-1" in data
+
+    # Route exhausted: the action disappears instead of offering a dead step.
+    plain = [b["text"] for row in telegram._review_keyboard("job-1") for b in row]
+    assert not any(text.startswith("⚡") for text in plain)
+
+
+def test_the_chat_says_what_the_recognition_cost():
+    """Same record the inbox shows expanded, folded onto one line: only the
+    stages that actually spent time or tokens are worth naming in a chat."""
+    from app.models.scanner import ScanJob
+
+    job = ScanJob(id="j5", method="ai", raw_ocr={"trace": [
+        {"stage": "qr", "outcome": "none", "detail": "коду не знайдено", "ms": 1900,
+         "tokens_in": 0, "tokens_out": 0},
+        {"stage": "ocr", "outcome": "skip", "detail": "недоступний", "ms": 0,
+         "tokens_in": 0, "tokens_out": 0},
+        {"stage": "ai", "outcome": "ok", "detail": "google / gemini-a", "ms": 1200,
+         "tokens_in": 1100, "tokens_out": 90},
+    ]})
+    line = telegram._trace_line(job)
+
+    assert line.startswith("⏱ ")
+    assert "qr 1.9с" in line and "ai 1.2с" in line
+    assert "1190 ток." in line
+    # A stage that cost nothing measurable is left out rather than padded in.
+    assert "ocr" not in line
+
+    # Rows scanned before the trace existed simply say nothing.
+    assert telegram._trace_line(ScanJob(id="j6", method="qr", raw_ocr={})) == ""
+
+
+def test_slow_buttons_say_they_started_before_they_finish():
+    """A press that runs recognition takes tens of seconds. Telegram gives up on
+    an unanswered callback in a few, so the press has to be acknowledged first
+    and the work announced — silence read as a dead button."""
+    assert telegram._started_line("rev", "ai") == "🤖 Розпізнаю через AI…"
+    assert telegram._started_line("rev", "up") == "⚡ Пробую сильнішу AI…"
+    # The "x" suffix only means "replace the saved receipt"; same action.
+    assert telegram._started_line("rev", "aix") == "🤖 Розпізнаю через AI…"
+    assert telegram._started_line("ser", "one") == "🧩 Склеюю кадри в один чек…"
+    # Instant actions say nothing rather than posting a pointless line.
+    assert telegram._started_line("rev", "del") == ""
+    assert telegram._started_line("cap", "undo") == ""

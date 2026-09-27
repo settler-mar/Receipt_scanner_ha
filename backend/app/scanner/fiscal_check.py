@@ -262,7 +262,8 @@ class FiscalCheck:
                 quantity=line.quantity or 1.0,
                 unit_price=line.unit_price,
                 discount=round(max(line.discount, 0.0), 2),
-                barcode=line.barcode or line.uktzed,
+                barcode=line.barcode,
+                product_code=line.article,
             )
             for line in self.lines
         ]
@@ -479,8 +480,18 @@ def parse_check_xml(data: bytes | str, *, raw_url: str | None = None,
     if not check.total:
         check.total = check.net_total
 
-    mac = root.findtext("MAC")
-    check.mac = mac.strip() if mac else None
+    mac = root.find("MAC")
+    if mac is not None:
+        check.mac = (mac.text or "").strip() or None
+        # ПРРО builds that carry MAC/@ID give the document an id of their own,
+        # and that is the one ДПС addresses it by — it is what the QR's
+        # `cashregs/check?id=…` holds and what the cabinet names the download
+        # after. E/@NO is only the receipt's number within the shift: it repeats
+        # across receipts of the same till, so keying on it made two different
+        # purchases look like one.
+        document_id = (mac.get("ID") or "").strip()
+        if document_id:
+            check.document_id = document_id
 
     _apply_loyalty(check)
     if plaintext:

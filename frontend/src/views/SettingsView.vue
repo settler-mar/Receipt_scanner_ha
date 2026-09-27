@@ -12,6 +12,8 @@ import type {
   AiModelChoices,
   AiProviderModels,
   AiProviderMeta,
+  AiPrompt,
+  AiPromptRevision,
   AiRouteTarget,
   AiSettings,
   AiTask,
@@ -66,6 +68,12 @@ const sttProviderList = ref<AiSettings['stt_providers']>([])
 const speechLanguageList = ref<SpeechLanguage[]>([])
 const keyHints = ref<Record<string, string | null>>({})
 const models = ref<AiModelChoices>({ local: [], providers: {}, live: [], stt: {} })
+const prompts = ref<AiPrompt[]>([])
+const selectedPromptKey = ref('')
+const promptDraft = ref('')
+const promptNote = ref('')
+const promptHistory = ref<AiPromptRevision[]>([])
+const promptBusy = ref(false)
 // One key field / test result per provider: several services can be active at
 // once, and each keeps its own key.
 const keyInputs = reactive<Record<string, string>>({})
@@ -715,6 +723,8 @@ const telegramMessages = ref<TelegramMessageLog[]>([])
 const telegramMessageTotal = ref(0)
 const telegramLogLoading = ref(false)
 const telegramConversation = ref('')
+const telegramLogPageSize = 20
+const telegramLogPage = ref(0)
 
 const telegramConversations = computed(() => {
   const rows = new Map<string, string>()
@@ -727,9 +737,16 @@ const telegramConversations = computed(() => {
   return [...rows.entries()]
 })
 
-const visibleTelegramMessages = computed(() => telegramConversation.value
+const filteredTelegramMessages = computed(() => telegramConversation.value
   ? telegramMessages.value.filter((message) => message.conversation_key === telegramConversation.value)
   : telegramMessages.value)
+
+const visibleTelegramMessages = computed(() => {
+  const start = telegramLogPage.value * telegramLogPageSize
+  return filteredTelegramMessages.value.slice(start, start + telegramLogPageSize)
+})
+
+watch(telegramConversation, () => { telegramLogPage.value = 0 })
 
 async function refreshTelegramMessages() {
   telegramLogLoading.value = true
@@ -737,6 +754,7 @@ async function refreshTelegramMessages() {
     const result = await api.telegram.messages()
     telegramMessages.value = result.items
     telegramMessageTotal.value = result.total
+    telegramLogPage.value = 0
   } catch (e) {
     error.value = (e as Error).message
   } finally {
@@ -937,6 +955,74 @@ async function browseFromRoot() {
   await openFolder(base, 0)
 }
 
+// Список покупок: автоклассификация позиций без категории.
+const shopping = reactive({ auto_categorize: true, auto_categorize_delay_minutes: 10 })
+const shoppingBusy = ref(false)
+const shoppingSaved = ref('')
+
+async function loadShopping() {
+  Object.assign(shopping, await api.shoppingSettings.get())
+}
+
+async function selectPrompt(key: string) {
+  const prompt = prompts.value.find((item) => item.key === key)
+  if (!prompt) return
+  selectedPromptKey.value = key
+  promptDraft.value = prompt.content
+  promptNote.value = ''
+  try {
+    promptHistory.value = await api.ai.promptHistory(key)
+  } catch (e) {
+    error.value = (e as Error).message
+  }
+}
+
+const selectedPrompt = computed(() => prompts.value.find((item) => item.key === selectedPromptKey.value))
+
+async function loadPrompts() {
+  prompts.value = await api.ai.prompts()
+  if (!selectedPromptKey.value && prompts.value[0]) await selectPrompt(prompts.value[0].key)
+}
+
+async function savePrompt() {
+  if (!selectedPromptKey.value || !promptDraft.value.trim()) return
+  promptBusy.value = true
+  error.value = ''
+  try {
+    const saved = await api.ai.savePrompt(selectedPromptKey.value, promptDraft.value, promptNote.value)
+    const index = prompts.value.findIndex((item) => item.key === saved.key)
+    if (index >= 0) prompts.value[index] = saved
+    promptDraft.value = saved.content
+    promptNote.value = ''
+    promptHistory.value = await api.ai.promptHistory(saved.key)
+    showToast(`Версія ${saved.version} збережена`, 'success')
+  } catch (e) {
+    error.value = (e as Error).message
+  } finally {
+    promptBusy.value = false
+  }
+}
+
+function usePromptRevision(revision: AiPromptRevision) {
+  promptDraft.value = revision.content
+  promptNote.value = `Відновлено з версії ${revision.version}`
+}
+async function saveShopping() {
+  shoppingBusy.value = true
+  shoppingSaved.value = ''
+  try {
+    Object.assign(shopping, await api.shoppingSettings.save({
+      auto_categorize: shopping.auto_categorize,
+      auto_categorize_delay_minutes: Number(shopping.auto_categorize_delay_minutes) || 10,
+    }))
+    shoppingSaved.value = 'Збережено'
+  } catch (e) {
+    error.value = (e as Error).message
+  } finally {
+    shoppingBusy.value = false
+  }
+}
+
 onMounted(async () => {
   try {
     apply(await api.ai.get())
@@ -949,6 +1035,8 @@ onMounted(async () => {
     await refreshTelegram()
     await refreshTelegramMessages()
     await loadDrive()
+    await loadShopping()
+    await loadPrompts()
     if (drive.value?.connected) await browseFromRoot()
   } catch (e) {
     error.value = (e as Error).message
@@ -1016,6 +1104,7 @@ const SECTIONS: Record<string, { title: string; items: { id: string; label: stri
       { id: 'ai-usage', label: 'Використання та журнал' },
     ],
   },
+  'ai-prompts': { title: 'AI · промти', items: [] },
   integrations: {
     title: 'Інтеграції та доступ',
     items: [
@@ -1034,13 +1123,33 @@ const SECTIONS: Record<string, { title: string; items: { id: string; label: stri
     title: 'Зберігання документів',
     items: [{ id: 'drive', label: 'Google Drive' }],
   },
+  shopping: {
+    title: 'Список покупок',
+    items: [{ id: 'shopping-auto', label: 'Автоматична класифікація' }],
+  },
 }
 
-const currentSections = computed(() => SECTIONS[group.value] ?? SECTIONS['ai-providers']!)
+const currentSections = computed(() => {
+  if (group.value === 'ai-prompts') {
+    return {
+      title: 'AI · промти',
+      items: prompts.value.map((prompt) => ({ id: prompt.key, label: prompt.title })),
+    }
+  }
+  return SECTIONS[group.value] ?? SECTIONS['ai-providers']!
+})
 const activeSection = ref<string>('')
 
 function scrollToSection(id: string) {
   document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+function selectSection(id: string) {
+  if (group.value === 'ai-prompts') {
+    void selectPrompt(id)
+    return
+  }
+  scrollToSection(id)
 }
 
 let observer: IntersectionObserver | null = null
@@ -1101,8 +1210,8 @@ onBeforeUnmount(() => {
             :key="it.id"
             type="button"
             class="settings-tree-link is-child"
-            :class="{ 'is-active': activeSection === it.id }"
-            @click="scrollToSection(it.id)"
+            :class="{ 'is-active': group === 'ai-prompts' ? selectedPromptKey === it.id : activeSection === it.id }"
+            @click="selectSection(it.id)"
           >
             {{ it.label }}
           </button>
@@ -1175,11 +1284,22 @@ onBeforeUnmount(() => {
           <span class="badge" :class="keyHints[p.id] ? 'badge-active' : ''">
             {{ keyHints[p.id] ? `ключ ${keyHints[p.id]}` : 'без ключа' }}
           </span>
-          <span v-if="p.enabled" class="muted" style="font-size: 12px">
-            активних моделей: {{ p.models.length }}
+          <span class="badge" :class="p.models.length ? 'badge-active' : ''">
+            моделей: {{ p.models.length }}<template v-if="providerCatalogue(p.id).length">
+              з {{ providerCatalogue(p.id).length }}</template>
           </span>
           <a v-if="p.usage_url" :href="p.usage_url" target="_blank" rel="noopener" style="font-size: 12px">📊 витрати ↗</a>
           <button v-if="p.custom" class="danger" @click="removeProvider(p.id)">Видалити</button>
+        </div>
+
+        <!-- Which models are ticked, without opening the service: the checklist
+             is long and scrollable, so the answer to "what is this service
+             allowed to run" must be readable from the collapsed card. -->
+        <div v-if="p.models.length" class="ai-provider-models">
+          <span v-for="m in p.models" :key="m" class="ai-model-chip">{{ m }}</span>
+        </div>
+        <div v-else-if="p.enabled" class="ai-provider-models muted" style="font-size: 12px">
+          жодної моделі не позначено — маршрути не зможуть викликати цей сервіс
         </div>
 
         <div v-if="p.enabled" class="ai-provider-body">
@@ -1436,6 +1556,45 @@ onBeforeUnmount(() => {
     </section>
     </template>
 
+    <template v-if="group === 'ai-prompts'">
+    <h3 class="settings-group">AI · каталог промтов</h3>
+    <p class="muted" style="margin-top: 0">
+      Все рабочие инструкции AI собраны здесь. Изменения применяются ко всем новым
+      вызовам и сохраняются отдельной версией с историей.
+    </p>
+    <section id="ai-prompts-editor" class="card" style="margin-bottom: 16px">
+      <div class="toolbar" style="align-items: flex-start; margin-bottom: 12px">
+        <div>
+          <h3 style="margin: 0">{{ selectedPrompt?.title || 'Промты' }}</h3>
+          <div v-if="selectedPrompt" class="muted" style="font-size: 12px; margin-top: 4px">
+            версия {{ selectedPrompt.version }} · {{ selectedPrompt.task }}
+          </div>
+        </div>
+      </div>
+      <p v-if="selectedPrompt" class="muted" style="font-size: 12px">
+        <strong>Для чего нужен:</strong> {{ selectedPrompt.description }}
+      </p>
+      <textarea v-model="promptDraft" rows="12" style="width: 100%; resize: vertical" spellcheck="false" />
+      <div class="toolbar" style="margin-top: 10px">
+        <input v-model="promptNote" placeholder="Комментарий к изменению (необязательно)" style="min-width: 260px; flex: 1" />
+        <button :disabled="promptBusy || !promptDraft.trim()" @click="savePrompt">Сохранить новую версию</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3 style="margin-top: 0">История правок</h3>
+      <div v-if="!promptHistory.length" class="muted">История пока пуста.</div>
+      <div v-for="revision in promptHistory" :key="revision.id" class="settings-history-row">
+        <div>
+          <strong>Версия {{ revision.version }}</strong>
+          <span class="muted" style="margin-left: 8px">{{ fmtDateTime(revision.created_at) }}</span>
+          <span v-if="revision.note" class="muted" style="margin-left: 8px">{{ revision.note }}</span>
+        </div>
+        <button class="secondary" @click="usePromptRevision(revision)">Загрузить в редактор</button>
+      </div>
+    </section>
+    </template>
+
     <template v-if="group === 'ai-routing'">
     <h3 class="settings-group">AI · маршрути задач</h3>
     <p class="muted" style="margin-top: 0">
@@ -1548,6 +1707,10 @@ onBeforeUnmount(() => {
           <div class="stat-label">токенів локально · {{ usage.local_calls }} запитів<span v-if="usage.local_errors" style="color: var(--danger)"> · {{ usage.local_errors }} помилок</span></div>
         </div>
         <div>
+          <div class="stat">{{ usage.cloud_cached_tokens.toLocaleString('uk-UA') }}</div>
+          <div class="stat-label">вхідних токенів отримано з кешу</div>
+        </div>
+        <div>
           <div class="stat">
             {{ config.monthly_token_budget ? Math.max(0, config.monthly_token_budget - usage.cloud_tokens_in - usage.cloud_tokens_out).toLocaleString('uk-UA') : '∞' }}
           </div>
@@ -1557,7 +1720,8 @@ onBeforeUnmount(() => {
       <p class="muted" style="font-size: 12px; margin: 8px 0 0">
         Тут рахується лише те, що витратив цей застосунок. Реальний рахунок і
         безкоштовні ліміти — у консолях сервісів (посилання «витрати» на сторінці
-        «AI · сервіси»).
+        «AI · сервіси»). Кешовані токени входять у загальну кількість, але сервіс
+        зазвичай тарифікує їх значно дешевше.
       </p>
 
       <h4 style="margin: 18px 0 6px">Журнал AI</h4>
@@ -1576,7 +1740,10 @@ onBeforeUnmount(() => {
                 <td class="muted" style="white-space: nowrap">{{ expanded.has(i) ? '▾ ' : '▸ ' }}{{ fmtLogTime(e.ts) }}</td>
                 <td>{{ e.task }}</td>
                 <td>{{ e.backend || '—' }}<span v-if="e.model" class="muted"> · {{ e.model }}</span></td>
-                <td style="white-space: nowrap">{{ e.tokens_in || e.tokens_out ? `${e.tokens_in}/${e.tokens_out}` : '—' }}</td>
+                <td style="white-space: nowrap">
+                  {{ e.tokens_in || e.tokens_out ? `${e.tokens_in}/${e.tokens_out}` : '—' }}
+                  <span v-if="e.cached_tokens" class="muted"> · кеш {{ e.cached_tokens }}</span>
+                </td>
                 <td style="white-space: nowrap">{{ e.duration_ms ? (e.duration_ms / 1000).toFixed(1) + ' с' : '—' }}</td>
                 <td :style="e.ok ? {} : { color: 'var(--danger)' }">{{ e.error || e.note || (e.ok ? 'ok' : 'помилка') }}</td>
               </tr>
@@ -1702,6 +1869,14 @@ onBeforeUnmount(() => {
             </tr>
           </tbody>
         </table>
+      </div>
+      <div v-if="filteredTelegramMessages.length > telegramLogPageSize" class="toolbar" style="margin-top: 12px">
+        <button class="secondary" :disabled="telegramLogPage === 0" @click="telegramLogPage--">← Назад</button>
+        <span class="muted">
+          {{ telegramLogPage * telegramLogPageSize + 1 }}–{{ Math.min((telegramLogPage + 1) * telegramLogPageSize, filteredTelegramMessages.length) }}
+          з {{ filteredTelegramMessages.length }}
+        </span>
+        <button class="secondary" :disabled="(telegramLogPage + 1) * telegramLogPageSize >= filteredTelegramMessages.length" @click="telegramLogPage++">Далі →</button>
       </div>
     </section>
 
@@ -1891,6 +2066,36 @@ onBeforeUnmount(() => {
           <button :disabled="fiscalBrowserBusy||!fiscalWebResponse.trim()" @click="importFiscalWebResponse">Імпортувати XML-текст</button>
         </details>
       </div>
+    </section>
+    </template>
+
+    <template v-if="group === 'shopping'">
+    <h3 class="settings-group">Список покупок</h3>
+    <section id="shopping-auto" class="card">
+      <h3 style="margin-top: 0">Автоматична класифікація</h3>
+      <p class="muted" style="margin-top: -4px">
+        Позиції без категорії розкладаються самі: спочатку за словниками й історією
+        чеків, потім — через AI. Пауза рахується від останнього доданого товару,
+        тож серія додавань обробляється один раз. Кожен запуск потрапляє в
+        <RouterLink to="/logs">журнал</RouterLink>.
+      </p>
+      <div class="form-row">
+        <label>Вмикати автоматично</label>
+        <input v-model="shopping.auto_categorize" type="checkbox" />
+      </div>
+      <div class="form-row">
+        <label>Пауза після останнього додавання, хв</label>
+        <input
+          v-model.number="shopping.auto_categorize_delay_minutes"
+          type="number"
+          min="1"
+          max="1440"
+          style="width: 110px"
+          :disabled="!shopping.auto_categorize"
+        />
+      </div>
+      <button :disabled="shoppingBusy" @click="saveShopping">Зберегти</button>
+      <span v-if="shoppingSaved" class="muted" style="margin-left: 8px">{{ shoppingSaved }}</span>
     </section>
     </template>
 
@@ -2126,6 +2331,14 @@ onBeforeUnmount(() => {
   flex: 1;
   min-width: 0;
 }
+.settings-history-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
 
 .settings-side {
   flex-shrink: 0;
@@ -2251,6 +2464,20 @@ section[id] {
   align-items: center;
   gap: 6px;
   font-size: 13px;
+}
+.ai-provider-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-top: 8px;
+}
+.ai-model-chip {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 /* One task's priority list (Settings block 2). */

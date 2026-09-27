@@ -9,26 +9,33 @@ export interface LayoutEntry {
   key: string
   visible: boolean
   range: DashboardRangeKey | null // null = follow the dashboard's shared range
+  /** Per-widget settings the widget itself defines (spend-trend: overlay series). */
+  options: Record<string, unknown> | null
 }
 
 function defaults(): LayoutEntry[] {
-  return WIDGETS.map((w) => ({ key: w.key, visible: w.defaultVisible, range: null }))
+  return WIDGETS.map((w) => ({ key: w.key, visible: w.defaultVisible, range: null, options: null }))
 }
 
 // Drop unknown/duplicate keys from the stored layout, then append any widget
 // that's new since it was saved (visible by default) — same tolerant pattern as
 // the fuel-block config.
-function reconcile(stored: LayoutEntry[] | null | undefined): LayoutEntry[] {
+function reconcile(stored: DashboardLayout['widgets'] | null | undefined): LayoutEntry[] {
   const known = new Set(WIDGETS.map((w) => w.key))
   const seen = new Set<string>()
   const out: LayoutEntry[] = []
   for (const e of stored ?? []) {
     if (!e || !known.has(e.key) || seen.has(e.key)) continue
     seen.add(e.key)
-    out.push({ key: e.key, visible: e.visible !== false, range: e.range ?? null })
+    out.push({
+      key: e.key,
+      visible: e.visible !== false,
+      range: e.range ?? null,
+      options: e.options ?? null,
+    })
   }
   for (const w of WIDGETS) {
-    if (!seen.has(w.key)) out.push({ key: w.key, visible: w.defaultVisible, range: null })
+    if (!seen.has(w.key)) out.push({ key: w.key, visible: w.defaultVisible, range: null, options: null })
   }
   return out
 }
@@ -99,5 +106,26 @@ export function useDashboardLayout() {
     }
   }
 
-  return { entries, includeDiscount, loaded, load, save, visible, toggle, move, setRange, setIncludeDiscount }
+  /** Replace a widget's own settings blob (widgets own its shape). */
+  function setOptions(key: string, options: Record<string, unknown>) {
+    const e = entries.value.find((x) => x.key === key)
+    if (e) {
+      e.options = options
+      save()
+    }
+  }
+
+  return {
+    entries,
+    includeDiscount,
+    loaded,
+    load,
+    save,
+    visible,
+    toggle,
+    move,
+    setRange,
+    setOptions,
+    setIncludeDiscount,
+  }
 }

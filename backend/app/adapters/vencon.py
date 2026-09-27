@@ -4,12 +4,13 @@ from __future__ import annotations
 import calendar
 import datetime as dt
 import html
+import io
 import json
 import re
-from dataclasses import dataclass, field
-from html.parser import HTMLParser
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
+
+from pypdf import PdfReader
 
 from app.adapters.base import (
     AdapterError,
@@ -20,6 +21,7 @@ from app.adapters.base import (
     NormalizedItem,
     NormalizedReceipt,
 )
+from app.adapters.html_tree import number_in, text_of, tree as _tree
 from app.core.config import BASE_DIR
 from app.core.http import AsyncClient, RequestException
 
@@ -31,7 +33,7 @@ KYIV = ZoneInfo("Europe/Kyiv")
 
 
 def _text(fragment: str) -> str:
-    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", fragment)).split())
+    return text_of(fragment)
 
 
 def _money(fragment: str) -> float:
@@ -40,76 +42,7 @@ def _money(fragment: str) -> float:
 
 
 def _number(fragment: str | None) -> float | None:
-    if not fragment:
-        return None
-    match = re.search(r"-?\d[\d\s]*(?:[,.]\d+)?", fragment)
-    if not match:
-        return None
-    return float(match.group(0).replace(" ", "").replace(",", "."))
-
-
-@dataclass
-class _Node:
-    tag: str
-    attrs: dict[str, str] = field(default_factory=dict)
-    children: list["_Node"] = field(default_factory=list)
-    own_text: list[str] = field(default_factory=list)
-
-    @property
-    def classes(self) -> set[str]:
-        return set(self.attrs.get("class", "").split())
-
-    def text(self) -> str:
-        chunks = [*self.own_text]
-        for child in self.children:
-            chunks.append(child.text())
-        return " ".join(" ".join(chunks).split())
-
-    def descendants(self):
-        for child in self.children:
-            yield child
-            yield from child.descendants()
-
-    def find_class(self, class_name: str) -> "_Node | None":
-        return next((node for node in self.descendants() if class_name in node.classes), None)
-
-    def find_all_class(self, class_name: str) -> list["_Node"]:
-        return [node for node in self.descendants() if class_name in node.classes]
-
-
-class _TreeParser(HTMLParser):
-    _void = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.root = _Node("document")
-        self.stack = [self.root]
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        node = _Node(tag, {key: value or "" for key, value in attrs})
-        self.stack[-1].children.append(node)
-        if tag not in self._void:
-            self.stack.append(node)
-
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        node = _Node(tag, {key: value or "" for key, value in attrs})
-        self.stack[-1].children.append(node)
-
-    def handle_endtag(self, tag: str) -> None:
-        for index in range(len(self.stack) - 1, 0, -1):
-            if self.stack[index].tag == tag:
-                del self.stack[index:]
-                return
-
-    def handle_data(self, data: str) -> None:
-        if data.strip():
-            self.stack[-1].own_text.append(data)
-
-
-def _tree(html_text: str) -> _Node:
-    parser = _TreeParser()
-    parser.feed(html_text)
-    return parser.root
+    return number_in(fragment)
 
 
 def _parse_search(html_text: str) -> list[CatalogProduct]:
@@ -282,6 +215,33 @@ async def _save_receipt(client: AsyncClient, url: str, external_id: str) -> str 
     return filename
 
 
+def _fiscal_pdf_items(filename: str) -> list[NormalizedItem]:
+    """Read paid lines from Vencon's fiscal PDF when order HTML is stale."""
+    try:
+        path = RECEIPT_DIR / filename
+        text = "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+    except Exception:
+        return []
+    items: list[NormalizedItem] = []
+    lines = [line.strip() for line in text.splitlines()]
+    for index, line in enumerate(lines):
+        match = re.match(r"(?P<qty>\d+(?:[.,]\d+)?)\s+x\s+(?P<price>\d+(?:[.,]\d+)?)", line)
+        if not match:
+            continue
+        qty = float(match.group("qty").replace(",", "."))
+        price = float(match.group("price").replace(",", "."))
+        name_lines: list[str] = []
+        for candidate in lines[index + 1:]:
+            if re.match(r"^\d+(?:[.,]\d+)?\s+[АA]$", candidate) or candidate.startswith("ТЕРМІНАЛ"):
+                break
+            if candidate:
+                name_lines.append(candidate)
+        name = " ".join(name_lines).strip()
+        if name and price:
+            items.append(NormalizedItem(name=name, quantity=qty, unit="шт", unit_price=price / qty, total_price=price))
+    return items
+
+
 class VenconAdapter(BaseAdapter):
     store_code = "vencon"
     catalog_search_requires_auth = False
@@ -344,6 +304,14 @@ class VenconAdapter(BaseAdapter):
                         filename = await _save_receipt(client, receipt.receipt_url, receipt.external_id)
                         if filename:
                             receipt.raw["receipt_file"] = filename
+                            fiscal_items = _fiscal_pdf_items(filename)
+                            if fiscal_items:
+                                receipt.items = fiscal_items
+                                receipt.total_amount = round(sum(item.total_price for item in fiscal_items), 2)
+                                receipt.raw["fiscal_pdf_items"] = [
+                                    {"name": item.name, "quantity": item.quantity, "total_price": item.total_price}
+                                    for item in fiscal_items
+                                ]
         except RequestException as exc:
             raise AdapterError("ВЕНКОН: не вдалося завантажити замовлення") from exc
         return selected

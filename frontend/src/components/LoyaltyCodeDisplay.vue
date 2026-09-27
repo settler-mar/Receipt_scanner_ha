@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import bwipjs from 'bwip-js'
+// The package's root export is condition-only (browser/node/electron), which
+// resolves at bundle time but not for the type-checker; the explicit browser
+// subpath is the same module with types attached.
+import bwipjs, { type RenderOptions } from 'bwip-js/browser'
 import type { LoyaltyCode } from '@/types/api'
 import { fmtDateTime } from '@/lib/datetime'
 
@@ -29,7 +32,7 @@ const svg = computed(() => {
   // (present-but-undefined isn't the same as absent) — only 1D/2D-stacked
   // formats want it set at all, so build the object conditionally rather than
   // passing `height: undefined` for QR.
-  const opts: Record<string, unknown> = {
+  const opts: RenderOptions = {
     bcid: BCID[format.value],
     text: props.code.value,
     scale: format.value === 'qr' ? 5 : 3,
@@ -37,7 +40,7 @@ const svg = computed(() => {
   }
   if (format.value !== 'qr') opts.height = 12
   try {
-    return bwipjs.toSVG(opts as Parameters<typeof bwipjs.toSVG>[0])
+    return bwipjs.toSVG(opts)
   } catch {
     return ''
   }

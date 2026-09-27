@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+import datetime as dt
 import json
 import secrets
 
@@ -26,7 +27,6 @@ from app.models.models import (
     Schedule,
     Store,
 )
-from app.integrations import FullHistoryImport
 from app.schemas.schemas import (
     AccountCreate,
     AccountOut,
@@ -53,9 +53,16 @@ from app.schemas.schemas import (
     ScheduleUpdate,
     TokenBootstrap,
 )
-from app.services.collector import collect_for_account, ensure_fresh_token, import_for_account
+from app.services.collector import (
+    collect_for_account,
+    ensure_fresh_token,
+    import_for_account,
+    run_collection_in_background,
+    start_collection,
+)
 from app.services.fuel_prices import persist_fuel_prices
 from app.services import prom_login
+from app.services import store_classes
 from app.services.aliexpress_login import close_login as close_aliexpress_login
 from app.services.aliexpress_login import check_manual_login as check_aliexpress_manual_login
 from app.services.aliexpress_login import control_login_click as control_aliexpress_login_click
@@ -81,10 +88,39 @@ def _to_out(db: Session, account: Account) -> AccountOut:
             CollectionRun.account_id == account.id, CollectionRun.status == RunStatus.success
         )
     ).scalar_one()
+    day_ago = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+    failed_24h = db.execute(
+        select(func.count()).select_from(CollectionRun).where(
+            CollectionRun.account_id == account.id,
+            CollectionRun.status == RunStatus.error,
+            CollectionRun.started_at >= day_ago,
+        )
+    ).scalar_one()
+    last_failed = db.execute(
+        select(CollectionRun).where(
+            CollectionRun.account_id == account.id,
+            CollectionRun.status == RunStatus.error,
+        ).order_by(CollectionRun.started_at.desc()).limit(1)
+    ).scalars().first()
+    last_run = db.execute(
+        select(CollectionRun).where(
+            CollectionRun.account_id == account.id,
+            CollectionRun.status != RunStatus.running,
+        ).order_by(CollectionRun.started_at.desc()).limit(1)
+    ).scalars().first()
+
     out = AccountOut.model_validate(account)
     out.receipt_count = count
     out.last_collected_at = last_collected_at
-    out.store.capabilities = get_adapter(account.store.code).capabilities
+    out.failed_runs_24h = failed_24h
+    out.last_failed_at = last_failed.finished_at or last_failed.started_at if last_failed else None
+    out.last_failed_error = last_failed.error_message if last_failed else None
+    out.last_run_failed = last_run is not None and last_run.status == RunStatus.error
+    adapter = get_adapter(account.store.code)
+    out.store.capabilities = adapter.capabilities
+    out.store.login_field = adapter.login_field
+    out.store.store_class = store_classes.class_for_store(account.store)
+    out.store.store_class_name = store_classes.label(out.store.store_class)
     return out
 
 
@@ -219,6 +255,7 @@ def login_card(
 @router.post("/{account_id}/login/device")
 async def login_device(
     payload: DeviceUuidLogin,
+    background: BackgroundTasks,
     account: Account = Depends(get_account_or_404),
     db: Session = Depends(get_db),
 ):
@@ -232,7 +269,8 @@ async def login_device(
     account.status = AccountStatus.active
     account.last_error = None
     db.commit()
-    run = await collect_for_account(db, account, trigger="login")
+    run = start_collection(db, account, trigger="login")
+    background.add_task(run_collection_in_background, run.id, account.id, trigger="login")
     return {
         "status": account.status.value,
         "collection_status": run.status.value,
@@ -244,6 +282,7 @@ async def login_device(
 @router.post("/{account_id}/login/device-registration")
 async def login_device_registration(
     payload: DeviceRegistrationLogin,
+    background: BackgroundTasks,
     account: Account = Depends(get_account_or_404),
     db: Session = Depends(get_db),
 ):
@@ -256,7 +295,8 @@ async def login_device_registration(
     account.status = AccountStatus.active
     account.last_error = None
     db.commit()
-    run = await collect_for_account(db, account, trigger="login")
+    run = start_collection(db, account, trigger="login")
+    background.add_task(run_collection_in_background, run.id, account.id, trigger="login")
     return {
         "status": account.status.value,
         "collection_status": run.status.value,
@@ -268,16 +308,20 @@ async def login_device_registration(
 @router.post("/{account_id}/login/password")
 async def login_password(
     payload: PasswordLogin,
+    background: BackgroundTasks,
     account: Account = Depends(get_account_or_404),
     db: Session = Depends(get_db),
 ):
     """Phone/login + password authentication.  Only the resulting encrypted
     session is persisted; the submitted password is never stored."""
+    adapter = get_adapter(account.store.code)
     if not account.phone_number:
-        raise HTTPException(status_code=400, detail="У акаунта не вказано номер телефону")
+        missing = {"email": "email", "phone_or_email": "телефон або email"}.get(
+            adapter.login_field, "номер телефону",
+        )
+        raise HTTPException(status_code=400, detail=f"У акаунта не вказано {missing}")
     if not payload.password:
         raise HTTPException(status_code=400, detail="Вкажіть пароль")
-    adapter = get_adapter(account.store.code)
     try:
         result = await adapter.login_with_password(account.phone_number, payload.password)
     except AdapterError as exc:
@@ -287,7 +331,8 @@ async def login_password(
     account.status = AccountStatus.active
     account.last_error = None
     db.commit()
-    run = await collect_for_account(db, account, trigger="login")
+    run = start_collection(db, account, trigger="login")
+    background.add_task(run_collection_in_background, run.id, account.id, trigger="login")
     return {
         "status": account.status.value,
         "collection_status": run.status.value,
@@ -322,6 +367,17 @@ def logout(account: Account = Depends(get_account_or_404), db: Session = Depends
         db.delete(account.credential)
     account.status = AccountStatus.pending_otp
     account.last_error = None
+    db.commit()
+    db.refresh(account)
+    return _to_out(db, account)
+
+
+@router.post("/{account_id}/reset-error", response_model=AccountOut)
+def reset_error(account: Account = Depends(get_account_or_404), db: Session = Depends(get_db)):
+    """Clear a failed state while preserving the stored authorization."""
+    account.last_error = None
+    if account.status in {AccountStatus.needs_reauth, AccountStatus.error}:
+        account.status = AccountStatus.active
     db.commit()
     db.refresh(account)
     return _to_out(db, account)
@@ -375,53 +431,37 @@ def update_schedule(
 
 
 @router.post("/{account_id}/collect", response_model=RunOut)
-async def collect_now(account: Account = Depends(get_account_or_404), db: Session = Depends(get_db)):
+def collect_now(
+    background: BackgroundTasks,
+    account: Account = Depends(get_account_or_404),
+    db: Session = Depends(get_db),
+):
     if not get_adapter(account.store.code).capabilities["receipts"]:
         raise HTTPException(status_code=400, detail=f"{account.store.name}: автоматичний збір чеків не підтримується")
-    run = await collect_for_account(db, account, trigger="manual")
+    run = start_collection(db, account, trigger="manual")
+    background.add_task(
+        run_collection_in_background, run.id, account.id, trigger="manual",
+    )
     return run
 
 
 @router.post("/{account_id}/collect-all", response_model=RunOut)
-async def collect_all(account: Account = Depends(get_account_or_404), db: Session = Depends(get_db)):
-    """Walk AliExpress order history until its end on the initial backfill.
-
-    After a complete backfill, a later run stops as soon as the first already
-    stored order is seen. This keeps the explicit action useful for catching a
-    few new pages without re-reading the whole account every time.
-    """
-    if account.store.code != "aliexpress":
-        raise HTTPException(status_code=400, detail="Повне завантаження доступне лише для AliExpress")
-    # Compatibility for accounts whose full import completed before the
-    # credential marker was introduced. A successful manual_all run proves
-    # that history has already been walked to its end.
-    history_loaded = bool(
-        account.credential
-        and (account.credential.extra or {}).get(FullHistoryImport.marker_key(account.store.code))
-    )
-    if not history_loaded:
-        previous_full_run = db.execute(
-            select(CollectionRun.id).where(
-                CollectionRun.account_id == account.id,
-                CollectionRun.trigger == "manual_all",
-                CollectionRun.status == RunStatus.success,
-            ).limit(1)
-        ).scalar_one_or_none()
-        if previous_full_run and account.credential is not None:
-            account.credential.extra = {
-                **(account.credential.extra or {}),
-                FullHistoryImport.marker_key(account.store.code): True,
-            }
-            db.commit()
-    known_order_ids = db.execute(
-        select(Receipt.external_id).where(Receipt.account_id == account.id)
-    ).scalars().all()
-    return await collect_for_account(
-        db,
-        account,
+def collect_all(
+    background: BackgroundTasks,
+    account: Account = Depends(get_account_or_404),
+    db: Session = Depends(get_db),
+):
+    """Force a full history refresh for any source with receipt collection."""
+    if not get_adapter(account.store.code).capabilities["receipts"]:
+        raise HTTPException(status_code=400, detail="Повне завантаження для цього джерела не підтримується")
+    run = start_collection(db, account, trigger="manual_all")
+    background.add_task(
+        run_collection_in_background,
+        run.id,
+        account.id,
         trigger="manual_all",
-        adapter_options=FullHistoryImport.options(list(known_order_ids)),
     )
+    return run
 
 
 @router.post("/{account_id}/import", response_model=RunOut)
@@ -650,11 +690,13 @@ async def _finish_prom_login(db: Session, account: Account, step: dict) -> AliLo
 
 
 def _require_prom(account: Account) -> None:
-    if account.store.code != "prom":
-        raise HTTPException(status_code=400, detail="Цей вхід доступний лише для Prom.ua")
+    if account.store.code not in {"prom", "rozetka", "olx"}:
+        raise HTTPException(status_code=400, detail="Цей вхід доступний лише для Prom.ua, Rozetka.ua або OLX")
 
 
 @router.post("/{account_id}/prom/login/start", response_model=AliLoginOut)
+@router.post("/{account_id}/rozetka/login/start", response_model=AliLoginOut)
+@router.post("/{account_id}/olx/login/start", response_model=AliLoginOut)
 async def prom_login_start(
     payload: PromLoginStart,
     account: Account = Depends(get_account_or_404),
@@ -664,13 +706,18 @@ async def prom_login_start(
     if not account.phone_number:
         raise HTTPException(status_code=400, detail="Вкажіть номер телефону в налаштуваннях акаунта")
     try:
-        step = await prom_login.start_login(account.id, account.phone_number, payload.session_id)
+        step = await prom_login.start_login(
+            account.id, account.phone_number, payload.session_id,
+            site=account.store.code if account.store.code in {"rozetka", "olx"} else "prom",
+        )
         return await _finish_prom_login(db, account, step)
     except AdapterError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{account_id}/prom/login/{session_id}/status", response_model=AliLoginOut)
+@router.get("/{account_id}/rozetka/login/{session_id}/status", response_model=AliLoginOut)
+@router.get("/{account_id}/olx/login/{session_id}/status", response_model=AliLoginOut)
 async def prom_login_status(session_id: str, account: Account = Depends(get_account_or_404)):
     try:
         return AliLoginOut(**prom_login.get_login_progress(account.id, session_id))
@@ -679,6 +726,8 @@ async def prom_login_status(session_id: str, account: Account = Depends(get_acco
 
 
 @router.get("/{account_id}/prom/login/{session_id}/screenshot")
+@router.get("/{account_id}/rozetka/login/{session_id}/screenshot")
+@router.get("/{account_id}/olx/login/{session_id}/screenshot")
 async def prom_login_screenshot(session_id: str, account: Account = Depends(get_account_or_404)):
     try:
         image = await prom_login.get_login_screenshot(account.id, session_id)
@@ -688,6 +737,8 @@ async def prom_login_screenshot(session_id: str, account: Account = Depends(get_
 
 
 @router.post("/{account_id}/prom/login/{session_id}/click", status_code=204)
+@router.post("/{account_id}/rozetka/login/{session_id}/click", status_code=204)
+@router.post("/{account_id}/olx/login/{session_id}/click", status_code=204)
 async def prom_login_click(
     session_id: str, payload: AliBrowserClick, account: Account = Depends(get_account_or_404),
 ):
@@ -698,6 +749,8 @@ async def prom_login_click(
 
 
 @router.post("/{account_id}/prom/login/{session_id}/pointer", status_code=204)
+@router.post("/{account_id}/rozetka/login/{session_id}/pointer", status_code=204)
+@router.post("/{account_id}/olx/login/{session_id}/pointer", status_code=204)
 async def prom_login_pointer(
     session_id: str, payload: AliBrowserPointer, account: Account = Depends(get_account_or_404),
 ):
@@ -710,6 +763,8 @@ async def prom_login_pointer(
 
 
 @router.post("/{account_id}/prom/login/{session_id}/takeover", response_model=AliLoginOut)
+@router.post("/{account_id}/rozetka/login/{session_id}/takeover", response_model=AliLoginOut)
+@router.post("/{account_id}/olx/login/{session_id}/takeover", response_model=AliLoginOut)
 async def prom_login_takeover(session_id: str, account: Account = Depends(get_account_or_404)):
     try:
         return AliLoginOut(**await prom_login.request_manual_takeover(account.id, session_id))
@@ -718,6 +773,8 @@ async def prom_login_takeover(session_id: str, account: Account = Depends(get_ac
 
 
 @router.post("/{account_id}/prom/login/{session_id}/key", status_code=204)
+@router.post("/{account_id}/rozetka/login/{session_id}/key", status_code=204)
+@router.post("/{account_id}/olx/login/{session_id}/key", status_code=204)
 async def prom_login_key(
     session_id: str, payload: AliBrowserKey, account: Account = Depends(get_account_or_404),
 ):
@@ -731,6 +788,8 @@ async def prom_login_key(
 
 
 @router.post("/{account_id}/prom/login/{session_id}/text", status_code=204)
+@router.post("/{account_id}/rozetka/login/{session_id}/text", status_code=204)
+@router.post("/{account_id}/olx/login/{session_id}/text", status_code=204)
 async def prom_login_text(
     session_id: str, payload: AliBrowserText, account: Account = Depends(get_account_or_404),
 ):
@@ -741,6 +800,8 @@ async def prom_login_text(
 
 
 @router.post("/{account_id}/prom/login/{session_id}/check", response_model=AliLoginOut)
+@router.post("/{account_id}/rozetka/login/{session_id}/check", response_model=AliLoginOut)
+@router.post("/{account_id}/olx/login/{session_id}/check", response_model=AliLoginOut)
 async def prom_login_check(
     session_id: str,
     account: Account = Depends(get_account_or_404),
@@ -754,6 +815,8 @@ async def prom_login_check(
 
 
 @router.post("/{account_id}/prom/login/otp", response_model=AliLoginOut)
+@router.post("/{account_id}/rozetka/login/otp", response_model=AliLoginOut)
+@router.post("/{account_id}/olx/login/otp", response_model=AliLoginOut)
 async def prom_login_otp(
     payload: AliLoginOtp,
     account: Account = Depends(get_account_or_404),
@@ -768,10 +831,12 @@ async def prom_login_otp(
 
 
 @router.post("/{account_id}/prom/login/close", status_code=204)
+@router.post("/{account_id}/rozetka/login/close", status_code=204)
+@router.post("/{account_id}/olx/login/close", status_code=204)
 async def prom_login_close(
     payload: AliLoginClose, account: Account = Depends(get_account_or_404),
 ):
-    if account.store.code == "prom":
+    if account.store.code in {"prom", "rozetka", "olx"}:
         await prom_login.close_login(payload.session_id)
 
 

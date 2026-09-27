@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import asyncio
 import logging
 
 from sqlalchemy import select
@@ -26,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.models.scanner import ScanJob, ScanStatus
 from app.scanner import stitch
+from app.scanner import fiscal_qr
 from app.scanner.fiscal_qr import fiscal_identity, scan_qr
 
 logger = logging.getLogger(__name__)
@@ -159,6 +161,13 @@ def frame_fiscal_codes(parts: list[tuple[bytes, str, str | None]]) -> list[str |
     return codes
 
 
+async def frame_fiscal_codes_async(
+    parts: list[tuple[bytes, str, str | None]],
+) -> list[str | None]:
+    """Decode a batch's QR codes without blocking the async request handler."""
+    return await asyncio.to_thread(frame_fiscal_codes, parts)
+
+
 def distinct_fiscal_codes(parts: list[tuple[bytes, str, str | None]]) -> list[str]:
     seen: list[str] = []
     for code in frame_fiscal_codes(parts):
@@ -208,7 +217,7 @@ async def scan_batch(
         previous = frames_of(job)
         return await _recognise_one(db, previous + list(parts), previous_job=job)
 
-    kind, why = (choice, "") if choice else decide(frame_fiscal_codes(parts))
+    kind, why = (choice, "") if choice else decide(await frame_fiscal_codes_async(parts))
     if kind == SEPARATE:
         return await _recognise_separately(db, parts, note=why)
     if kind == ASK:
@@ -265,21 +274,34 @@ async def _recognise_separately(db: Session, parts, *, note: str = "") -> Series
 
 
 async def _recognise_one(db: Session, parts, *, note: str = "",
-                         previous_job: ScanJob | None = None) -> SeriesOutcome:
+                         previous_job: ScanJob | None = None,
+                         ai_first: bool = False,
+                         ai_after: tuple[str, str] | None = None) -> SeriesOutcome:
     """One receipt: glue the frames, then recognise the result as one photo."""
     from app.api.inbox import _handle_receipt
 
     frames = [data for data, _media_type, _filename in parts]
     notes = [note] if note else []
     try:
-        image, seam_notes = stitch.stitch(frames)
+        # Stitching decodes/resizes every frame and is CPU-bound.
+        image, seam_notes = await asyncio.to_thread(stitch.stitch, frames)
         notes += seam_notes
     except stitch.StitchError as exc:
         logger.warning("stitching failed: %s", exc)
         notes.append(f"склеїти кадри не вдалося ({exc}) — розпізнано лише перший кадр")
         image = frames[0]
 
-    result = await _handle_receipt(db, image, parts[0][2], "image/jpeg")
+    # The QR is looked for in every original frame, not in the glued picture:
+    # the code is legible in exactly one of them as often as not, and stitching
+    # can land the seam straight through it.
+    qr = fiscal_qr.scan_images(frames)
+    if qr.state == fiscal_qr.QR_DECODED:
+        notes.append(f"QR прочитано з кадру {qr.image_index + 1}")
+    result = await _handle_receipt(db, image, parts[0][2], "image/jpeg",
+                                   ai_first=ai_first or ai_after is not None,
+                                   ai_after=ai_after,
+                                   ai_images=frames if len(frames) > 1 else None,
+                                   qr_scan=qr)
     job = db.get(ScanJob, result.scan_job_id)
     if job is not None:
         store_frames(job.id, parts)
@@ -300,12 +322,22 @@ async def _recognise_one(db: Session, parts, *, note: str = "",
                          scan_job_id=result.scan_job_id)
 
 
-async def rescan_series(db: Session, job: ScanJob, *, ai_first: bool = True):
-    """Re-run a whole batch: glue its frames again and recognise the result."""
+async def rescan_series(db: Session, job: ScanJob, *, ai_first: bool = True,
+                        escalate: bool = False):
+    """Re-run a whole batch: glue its frames again and recognise the result.
+
+    `escalate` resumes the AI route after the step this batch already used,
+    exactly as it does for a single photo.
+    """
+    from app.services import scan_jobs
+
     frames = frames_of(job)
     if not frames:
         raise ValueError("оригінали кадрів не збережено — завантажте фото ще раз")
-    outcome = await _recognise_one(db, frames, previous_job=job)
+    outcome = await _recognise_one(
+        db, frames, previous_job=job, ai_first=ai_first,
+        ai_after=scan_jobs.used_ai_step(job) if escalate else None,
+    )
     return outcome.results[0]
 
 

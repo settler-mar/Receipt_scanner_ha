@@ -55,7 +55,7 @@ def _frames(count: int, height: int = 600):
 
 def _fiscal_url(document: str) -> str:
     return ("https://cabinet.tax.gov.ua/cashregs/check?"
-            f"id={document}&fn=4001118996&date=20260912&time=121046&sm=100.00")
+            f"id={document}&fn=4000000002&date=20260912&time=121046&sm=100.00")
 
 
 def _qr_photo(url: str) -> bytes:
@@ -68,14 +68,28 @@ def _qr_photo(url: str) -> bytes:
     return buf.tobytes()
 
 
+class _Handled(list):
+    """The images the stubbed pipeline received, and the kwargs alongside them."""
+
+    def __init__(self):
+        super().__init__()
+        self.kwargs: list[dict] = []
+
+
 def _stub_single_photo(monkeypatch, *, status=ScanStatus.parsed):
-    """Stand in for the ordinary single-photo pipeline; records what it was given."""
-    handled: list[bytes] = []
+    """Stand in for the ordinary single-photo pipeline; records what it was given.
+
+    `handled` holds the image each call received; `handled.kwargs` the keyword
+    arguments, which is where the frames destined for the model and the QR
+    verdict taken over every frame arrive.
+    """
+    handled = _Handled()
 
     async def fake_handle(session, data, filename, media_type, **kwargs):
         from app.api.inbox import UploadResult
 
         handled.append(data)
+        handled.kwargs.append(kwargs)
         job = ScanJob(status=status, method="ai", confidence="high",
                       source_filename=filename, raw_ocr={"notes": []},
                       receipt_id=f"receipt-{len(handled)}" if status is ScanStatus.parsed else None)
@@ -172,6 +186,22 @@ def test_answering_one_receipt_glues_the_frames_into_one_photo(db, monkeypatch):
     assert row.method.startswith("series:3")
     # The row the question was asked on is gone: one batch stays one row.
     assert db.query(ScanJob).count() == 1
+
+
+def test_the_model_gets_the_original_frames_not_the_seam(db, monkeypatch):
+    """The glue is an approximation and the originals are not, so the model is
+    given every frame of the receipt while the local stages keep the glued
+    picture. One receipt, one call, three pictures."""
+    handled = _stub_single_photo(monkeypatch)
+    parked = asyncio.run(series_scan.scan_batch(db, _frames(3)))
+
+    asyncio.run(series_scan.resolve(db, db.get(ScanJob, parked.scan_job_id), series_scan.ONE))
+
+    kwargs = handled.kwargs[0]
+    assert len(kwargs["ai_images"]) == 3
+    assert kwargs["ai_images"][0] != handled[0], "the glued image is not a frame"
+    # And the QR was looked for across the frames, not in the seam.
+    assert kwargs["qr_scan"] is not None
 
 
 def test_answering_separate_receipts_splits_the_batch_into_rows(db, monkeypatch):

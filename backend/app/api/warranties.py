@@ -4,7 +4,7 @@ import datetime as dt
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.time import as_utc
 from app.db import get_db
@@ -22,12 +22,16 @@ def list_warranty_products(db: Session = Depends(get_db)):
         .join(Account, Account.id == Receipt.account_id)
         .join(Store, Store.id == Account.store_id)
         .where(ReceiptItem.has_warranty.is_(True))
+        .options(selectinload(ReceiptItem.files))
     ).all()
     now = dt.datetime.now(dt.timezone.utc)
     products = []
     for item, receipt, account, store in rows:
         expires_at = as_utc(item.warranty_expires_at)
         quantity = float(item.quantity) or 1.0
+        file_urls = [
+            f"/api/receipts/{receipt.id}/items/{item.id}/files/{f.id}" for f in item.files
+        ]
         products.append(
             WarrantyProductOut(
                 item_id=item.id,
@@ -42,7 +46,11 @@ def list_warranty_products(db: Session = Depends(get_db)):
                 warranty_expires_at=expires_at,
                 expired=bool(expires_at and expires_at < now),
                 product_url=item.product_url,
-                image_url=item.product_image_url,
+                # Hand-attached photos win over the store's catalogue picture:
+                # if the талон/product was photographed by hand, that is the
+                # copy worth showing on the warranty card.
+                image_url=(file_urls[0] if file_urls else item.product_image_url),
+                file_urls=file_urls,
             )
         )
     products.sort(

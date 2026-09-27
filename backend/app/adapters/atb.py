@@ -329,17 +329,7 @@ def _normalize(entry: dict) -> NormalizedReceipt:
   )
   external_id = f"{rcpt.get('rroFiscal', shop.get('id'))}:{rcpt.get('rNum')}:{rcpt.get('zNum')}"
 
-  items = [
-    NormalizedItem(
-      name=d.get("name", "").strip(),
-      quantity=float(d.get("qty") or 1),
-      unit_price=_to_float(d.get("price")),
-      total_price=_to_float(d.get("sum")) or 0,
-      discount=_to_float(d.get("discount")) or 0,
-      barcode=d.get("bar") or None,
-    )
-    for d in details
-  ]
+  items = [_normalize_item(d) for d in details]
 
   return NormalizedReceipt(
     external_id=external_id,
@@ -357,3 +347,27 @@ def _to_float(value) -> float | None:
   if value in (None, ""):
     return None
   return float(str(value).replace(",", "."))
+
+
+def _normalize_item(data: dict) -> NormalizedItem:
+  """АТБ returns ``sum`` before the line discount, while ``rcpt.total`` is net.
+
+  The normalized contract stores ``total_price`` net and keeps the discount in
+  its own field. Keeping both on the same basis is required for receipt-level
+  reconciliation and for the dashboard's gross/net toggle.
+  """
+  quantity = float(data.get("qty") or 1)
+  gross_total = _to_float(data.get("sum")) or 0
+  discount = _to_float(data.get("discount")) or 0
+  gross_unit_price = _to_float(data.get("price"))
+  unit_price = gross_unit_price
+  if unit_price is not None and quantity > 0 and discount:
+    unit_price = round(unit_price - discount / quantity, 2)
+  return NormalizedItem(
+    name=data.get("name", "").strip(),
+    quantity=quantity,
+    unit_price=unit_price,
+    total_price=round(max(gross_total - discount, 0), 2),
+    discount=discount,
+    barcode=data.get("bar") or None,
+  )

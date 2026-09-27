@@ -43,6 +43,16 @@ export function rangeDateFromShort(range: DashboardRangeKey): string | undefined
   return rangeDateFrom(range)?.slice(0, 10)
 }
 
+/** One colour per dashboard metric, shared by the chart lines, the legend, the
+ * tooltip rows and the savings table — so a number is always the colour of the
+ * line it belongs to. Bonuses get their own hue: --accent is the spend bars. */
+export const METRIC_COLORS = {
+  spend: 'var(--accent)',
+  total_discount: 'var(--success)',
+  total_bonuses: 'var(--bonus)',
+  total_bonuses_used: 'var(--warning)',
+} as const
+
 export function fmtMoney(v: number): string {
   return new Intl.NumberFormat('uk-UA', {
     style: 'currency',

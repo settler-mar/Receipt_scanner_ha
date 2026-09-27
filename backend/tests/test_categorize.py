@@ -64,8 +64,9 @@ def test_run_classification_batch(monkeypatch, db):
 
     calls: list[list[str]] = []
 
-    async def fake_classify(session, names, taxonomy):
+    async def fake_classify(session, names, taxonomy, contexts=None):
         calls.append(list(taxonomy))
+        assert contexts == {name: {"store_names": ["s1"]} for name in names}
         if taxonomy == ["produkty"]:  # pass 1 — route to a top-level category
             return {
                 "молоко": ai.CategoryGuess(category_path="produkty", confidence=0.95),
@@ -97,7 +98,7 @@ def test_run_classification_batch(monkeypatch, db):
 def test_hierarchical_falls_back_to_top_level_when_subcategory_unclear(monkeypatch, db):
     _receipt_with(db, "Молоко")
 
-    async def fake_classify(session, names, taxonomy):
+    async def fake_classify(session, names, taxonomy, contexts=None):
         if taxonomy == ["produkty"]:
             return {"молоко": ai.CategoryGuess(category_path="produkty", confidence=0.9)}
         return {"молоко": ai.CategoryGuess(category_path="", confidence=0.0)}  # no subcat
@@ -114,7 +115,7 @@ def test_hierarchical_single_level_tree_uses_one_flat_call(monkeypatch, db):
     _receipt_with(db, "Молоко")
     calls: list[list[str]] = []
 
-    async def fake_classify(session, names, taxonomy):
+    async def fake_classify(session, names, taxonomy, contexts=None):
         calls.append(list(taxonomy))
         return {"молоко": ai.CategoryGuess(category_path="produkty", confidence=0.9)}
 
@@ -124,12 +125,37 @@ def test_hierarchical_single_level_tree_uses_one_flat_call(monkeypatch, db):
     assert db.get(ProductCategory, "молоко").category_id == db._paths["food"]
 
 
+def test_item_clarification_uses_shop_context_and_only_updates_selected_item(monkeypatch, db):
+    rec = _receipt_with(db, "Омивач", "Омивач")
+    rec.shop_name = "Аврора"
+    db.commit()
+    selected, untouched = rec.items
+    seen_contexts = []
+
+    async def fake_classify(session, names, taxonomy, contexts=None):
+        seen_contexts.append(contexts)
+        path = "produkty" if taxonomy == ["produkty"] else "produkty/molochne"
+        return {"омивач": ai.CategoryGuess(category_path=path, confidence=0.9)}
+
+    monkeypatch.setattr(ai, "classify_products", fake_classify)
+    category_id = asyncio.run(
+        categorize.classify_receipt_item(db, rec, selected, "це молочний напій")
+    )
+
+    assert category_id == db._paths["dairy"]
+    assert selected.category_id == db._paths["dairy"]
+    assert untouched.category_id is None
+    assert seen_contexts[0]["омивач"]["store_name"] == "Аврора"
+    assert seen_contexts[0]["омивач"]["clarification"] == "це молочний напій"
+    assert db.get(ProductCategory, "омивач") is None
+
+
 def test_user_choice_is_sticky(monkeypatch, db):
     _receipt_with(db, "Молоко")
     categorize.record_user_choice(db, "Молоко", db._paths["food"])
     db.commit()
 
-    async def fake_classify(session, names, taxonomy):
+    async def fake_classify(session, names, taxonomy, contexts=None):
         return {"молоко": ai.CategoryGuess(category_path="produkty/molochne", confidence=0.99)}
 
     monkeypatch.setattr(ai, "classify_products", fake_classify)
@@ -153,7 +179,7 @@ def test_forced_reset_keeps_user_choices(monkeypatch, db):
     categorize.record_user_choice(db, "Молоко", db._paths["food"])
     db.commit()
 
-    async def fake(session, names, taxonomy):
+    async def fake(session, names, taxonomy, contexts=None):
         path = "produkty" if taxonomy == ["produkty"] else "produkty/molochne"
         return {n: ai.CategoryGuess(category_path=path, confidence=0.9) for n in names}
 
@@ -228,3 +254,70 @@ def test_apply_guesses_manual_path(db):
     by_name = {i.name: i.category_id for i in db.get(Receipt, rec.id).items}
     assert by_name["Молоко"] == db._paths["food"]
     assert by_name["Кефір"] == db._paths["dairy"]
+
+
+def test_include_other_requeues_names_parked_in_the_catch_all(db):
+    """A name filed under "Інше" — by hand or by a prior AI pass — always has a
+    sticky product_category row (record_user_choice / apply_guesses both write
+    one). Without include_other that row must keep it out of the pending queue
+    exactly like a real category pick; with include_other it must come back,
+    including overriding a source="user" row, since "Інше" is a catch-all, not
+    a confirmed final answer."""
+    other = Category(name="Інше", slug="inshe", path="inshe", sort_order=1)
+    db.add(other)
+    db.commit()
+
+    rec = _receipt_with(db, "Дивний товар")
+    norm = "дивний товар"
+    rec.items[0].category_id = other.id
+    db.add(ProductCategory(normalized_name=norm, category_id=other.id,
+                           source=ProductCategorySource.user, confidence=1.0))
+    db.commit()
+
+    assert categorize.pending_names(db, 50) == []
+    assert categorize.pending_names(db, 50, include_other=True) == [norm]
+
+    # Without include_other, apply_guesses respects the sticky pick and leaves
+    # everything as-is (still parked in "Інше").
+    out = categorize.apply_guesses(
+        db, {norm: ai.CategoryGuess(category_path="produkty/molochne", confidence=0.9)},
+        backend="manual",
+    )
+    assert out["skipped_manual"] == 1
+    db.expire_all()
+    assert db.get(Receipt, rec.id).items[0].category_id == other.id
+
+    # With include_other, the same sticky "Інше" pick is overridden.
+    out = categorize.apply_guesses(
+        db, {norm: ai.CategoryGuess(category_path="produkty/molochne", confidence=0.9)},
+        backend="manual", include_other=True,
+    )
+    assert out == {"names": 1, "mapped": 1, "unknown_path": 0, "low_confidence": 0,
+                   "no_guess": 0, "skipped_manual": 0, "items_tagged": 1}
+    db.expire_all()
+    assert db.get(Receipt, rec.id).items[0].category_id == db._paths["dairy"]
+    assert categorize.pending_names(db, 50, include_other=True) == []
+
+
+def test_include_other_leaves_real_manual_picks_alone(db):
+    """A name manually sorted into a REAL category must stay fully sticky even
+    with include_other — only picks pointing at "Інше" itself lose protection."""
+    other = Category(name="Інше", slug="inshe", path="inshe", sort_order=1)
+    db.add(other)
+    db.commit()
+
+    rec = _receipt_with(db, "Улюблений сир")
+    norm = "улюблений сир"
+    rec.items[0].category_id = db._paths["dairy"]
+    db.add(ProductCategory(normalized_name=norm, category_id=db._paths["dairy"],
+                           source=ProductCategorySource.user, confidence=1.0))
+    db.commit()
+
+    assert categorize.pending_names(db, 50, include_other=True) == []
+    out = categorize.apply_guesses(
+        db, {norm: ai.CategoryGuess(category_path="produkty", confidence=0.9)},
+        backend="manual", include_other=True,
+    )
+    assert out["skipped_manual"] == 1
+    db.expire_all()
+    assert db.get(Receipt, rec.id).items[0].category_id == db._paths["dairy"]

@@ -129,6 +129,50 @@ async def localize_product_items(items: list[object]) -> None:
                     item.product_image_url = local_url
 
 
+class ImageDownloadError(Exception):
+    """A pasted image URL could not be turned into a file we can keep."""
+
+
+async def download_image(source_url: str) -> tuple[bytes, str, str]:
+    """Fetch one image by URL → (content, extension, content_type).
+
+    For hand-attached links (see api/receipts.py item files): a link is only an
+    input method, the bytes are copied to our own storage so the attachment
+    survives the other host deleting or rotating the file. Unlike the
+    best-effort cache above, failures here are reported to the caller — the
+    user pasted this URL and must be told when it is not an image.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=25,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 ReceiptScanner/1.0", "Accept": "image/*"},
+        ) as client:
+            async with client.stream("GET", source_url) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                extension = _CONTENT_EXTENSIONS.get(content_type)
+                if extension is None:
+                    extension = Path(urlparse(str(response.url)).path).suffix.lower()
+                    if extension not in set(_CONTENT_EXTENSIONS.values()):
+                        raise ImageDownloadError("За посиланням не зображення")
+
+                content = bytearray()
+                async for chunk in response.aiter_bytes():
+                    content.extend(chunk)
+                    if len(content) > MAX_IMAGE_BYTES:
+                        raise ImageDownloadError("Зображення завелике (максимум 12 МБ)")
+    except httpx.HTTPError as exc:
+        logger.warning("Не вдалося завантажити зображення %s: %s", source_url, exc)
+        raise ImageDownloadError(f"Не вдалося завантажити зображення: {exc}") from exc
+
+    if not content:
+        raise ImageDownloadError("Порожня відповідь за посиланням")
+    if not _looks_like_image(bytes(content), extension):
+        raise ImageDownloadError("Формат файлу не підтримується")
+    return bytes(content), extension, content_type or f"image/{extension.lstrip('.')}"
+
+
 async def _download_one(client: httpx.AsyncClient, source_url: str) -> str | None:
     try:
         async with client.stream("GET", source_url) as response:

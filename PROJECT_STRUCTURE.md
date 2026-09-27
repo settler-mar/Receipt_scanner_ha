@@ -8,8 +8,14 @@ intentionally short to save context.
 - `README.md` - run modes, Docker/dev commands, Node requirements.
 - `AGENTS.md` - coding and validation rules for AI agents.
 - `CLAUDE.md` - Claude-specific session guidance.
-- `DOCS.md`, `SERVICE.md`, `ROADMAP.md`, `RESEARCH.md` - larger reference docs.
-  Open only when the task asks for product/service context or historical plans.
+- `.agents/playbooks/` - shared task recipes (adapter, API, DB, frontend,
+  scanner, debugging, checks, token budget). Read the one matching the task.
+- `.claude/skills/`, `.claude/agents/` - Claude Code skills and subagents.
+- `.codex/` - Codex `/rs-*` prompts and ChatGPT project instructions.
+- `DOCS.md`, `SERVICE.md`, `RESEARCH.md` - larger reference docs. Open only
+  when the task asks for product/service context or adapter research.
+- `docs/tasks/{done,in-progress,planned}/` - task/plan documents (ROADMAP.md,
+  SHOPPING_LIST_WORKPLAN.md, etc.), sorted by status. See `docs/tasks/README.md`.
 - `config.yaml` - app configuration defaults.
 - `dev-docker.sh`, `local-docker.sh`, `ollama-docker.sh` - local run helpers.
 - `docker-compose*.yml`, `Dockerfile`, `docker-entrypoint.sh` - container setup.

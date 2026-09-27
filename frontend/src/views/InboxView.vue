@@ -9,15 +9,23 @@ import { fmtDateTime } from '@/lib/datetime'
 import type {
   DriveFolder,
   DriveStatus,
+  FiscalJob,
   InboxDocument,
+  ScanEvent,
   ScanJob,
+  ScanStage,
   ScanStats,
   UploadResult,
   VoiceMessage,
+  XmlImportResult,
 } from '@/types/api'
 
 const docs = ref<InboxDocument[]>([])
 const voices = ref<VoiceMessage[]>([])
+// ДПС queue rows that still owe us a receipt. They used to be visible only in
+// Settings, so their counter pointed at a page that did not show them.
+const fiscalJobs = ref<FiscalJob[]>([])
+const fiscalBusy = ref('')
 const voiceBusy = ref('')
 const scans = ref<ScanJob[]>([])
 const stats = ref<ScanStats | null>(null)
@@ -49,8 +57,9 @@ async function refresh() {
       api.inbox.scans(showArchived.value),
       api.inbox.scanStats(),
       api.inbox.driveStatus(),
-      api.voice.list(),
+      api.voice.list(showArchived.value),
     ])
+    fiscalJobs.value = await api.fiscalQueue.list(true).catch(() => [])
     // Rows that are gone (deleted, or filtered out of this listing) must not
     // stay selected: a later action would target ids the journal no longer has.
     const live = new Set(scans.value.map((j) => j.id))
@@ -88,7 +97,105 @@ async function recognizeVoice(row: VoiceMessage, language?: string) {
     ])
   } catch (e) {
     error.value = (e as Error).message
-    voices.value = await api.voice.list()
+    voices.value = await api.voice.list(showArchived.value)
+  } finally {
+    voiceBusy.value = ''
+  }
+}
+
+const fiscalNote = ref('')
+const fiscalPaste = ref('')
+
+async function reloadFiscal() {
+  fiscalJobs.value = await api.fiscalQueue.list(true).catch(() => [])
+}
+
+// The backend decides what the file turned into (new receipt, merge into an
+// existing one, a fresh inbox row) — it is the only side that knows, so its
+// wording is what the user is shown.
+function importedNote(result: XmlImportResult) {
+  if (!result.receipt_id) return 'Відповідь прийнято.'
+  return result.message || 'Чек збережено з XML-відповіді ДПС.'
+}
+
+async function retryFiscal(job: FiscalJob) {
+  fiscalBusy.value = job.id
+  fiscalNote.value = ''
+  try {
+    await api.fiscalQueue.runPublicApi(job.id)
+  } catch (e) {
+    error.value = (e as Error).message
+  } finally {
+    fiscalBusy.value = ''
+    await reloadFiscal()
+  }
+}
+
+// The queue can only wait for ДПС; this is the way out of it — the XML the user
+// saved from the cabinet in their own browser (per row, or on its own when the
+// receipt never made it into the queue at all).
+// Where the file landed is the half of the answer the note alone can't give:
+// the import picks the journal row itself, so point at the row it picked.
+async function showImported(result: XmlImportResult) {
+  fiscalNote.value = importedNote(result)
+  await refresh()
+  if (!result.scan_job_id) return
+  noteRow(result.scan_job_id, result.message)
+  await goToScan(result.scan_job_id)
+}
+
+async function importFiscalFile(event: Event, job?: FiscalJob) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  fiscalBusy.value = job?.id ?? 'import'
+  fiscalNote.value = ''
+  error.value = ''
+  try {
+    await showImported(
+      await api.fiscalQueue.importResponseFile(
+        file,
+        job?.scan_job_id ?? undefined,
+        // Named so the file is checked against this row: every download from
+        // the cabinet is called check.xml, and the wrong one used to be taken.
+        job?.id,
+      ),
+    )
+  } catch (e) {
+    error.value = (e as Error).message
+  } finally {
+    input.value = ''
+    fiscalBusy.value = ''
+  }
+}
+
+async function importFiscalPaste() {
+  const value = fiscalPaste.value.trim()
+  if (!value) return
+  fiscalBusy.value = 'import'
+  fiscalNote.value = ''
+  error.value = ''
+  try {
+    fiscalPaste.value = ''
+    await showImported(await api.fiscalQueue.importResponse(value))
+  } catch (e) {
+    error.value = (e as Error).message
+  } finally {
+    fiscalBusy.value = ''
+  }
+}
+
+// The scan journal has an archive; recordings need the same, or a handled
+// message stays in the working list (and in the sidebar count) forever.
+async function archiveVoice(row: VoiceMessage) {
+  voiceBusy.value = row.id
+  try {
+    const next = await api.voice.archive(row.id, !row.archived_at)
+    voices.value = showArchived.value
+      ? voices.value.map((v) => (v.id === next.id ? next : v))
+      : voices.value.filter((v) => v.id !== next.id)
+  } catch (e) {
+    error.value = (e as Error).message
   } finally {
     voiceBusy.value = ''
   }
@@ -135,11 +242,22 @@ function voiceLength(row: VoiceMessage) {
   return parts.join(' · ')
 }
 
+/** The scan whose recognition log is open, or null. */
+const traceJob = ref<ScanJob | null>(null)
+
+function onModalKey(e: KeyboardEvent) {
+  if (e.key === 'Escape') traceJob.value = null
+}
+
 onMounted(() => {
   refresh()
   window.addEventListener('paste', onPaste)
+  window.addEventListener('keydown', onModalKey)
 })
-onUnmounted(() => window.removeEventListener('paste', onPaste))
+onUnmounted(() => {
+  window.removeEventListener('paste', onPaste)
+  window.removeEventListener('keydown', onModalKey)
+})
 watch([showArchived, showDoneDocs], refresh)
 
 async function openPicker(docId: string) {
@@ -421,16 +539,14 @@ async function uploadDpsXml(job: ScanJob, event: Event) {
   await runScanAction(job.id, async () => {
     // Pass the row's id so the import lands on this scan rather than beside it.
     const result = await api.fiscalQueue.importResponseFile(file, job.id)
-    if (result?.receipt_id) noteRow(job.id, result.duplicate
-      ? `Це дубль — наявний чек доповнено даними з ${file.name}.`
-      : `Чек із ${file.name} збережено.`)
+    if (result?.receipt_id) noteRow(job.id, `${file.name}: ${result.message}`)
     else noteRow(job.id, `${file.name} прийнято, але чек не створено.`, true)
   }, 'Читаю XML…')
   // Clear it so picking the same file again still fires a change event.
   input.value = ''
 }
 
-function rescan(job: ScanJob, ai: boolean) {
+function rescan(job: ScanJob, ai: boolean, escalate = false) {
   // Rerunning a scan that already produced a receipt rewrites saved data, so it
   // is never done on a single click.
   const replace = !!job.receipt_id
@@ -439,12 +555,14 @@ function rescan(job: ScanJob, ai: boolean) {
   )) return
 
   return runScanAction(job.id, async () => {
-    const r = await api.inbox.rescan(job.id, ai, replace)
+    const r = await api.inbox.rescan(job.id, ai, replace, escalate)
     if (r.replaced_receipt_id) noteRow(job.id, '♻️ Попередній чек замінено новим результатом.')
     else if (r.kept_receipt_id) noteRow(job.id,
       'Пересканування не дало кращого результату — збережений чек залишено без змін.', true)
     else noteRow(job.id, resultText(r), !r.receipt_id)
-  }, ai ? 'Розпізнаю через AI…' : 'Пересканую…')
+  }, escalate
+    ? `Пробую ${job.next_ai?.label} / ${job.next_ai?.model}…`
+    : ai ? 'Розпізнаю через AI…' : 'Пересканую…')
 }
 
 interface DraftItem {
@@ -523,6 +641,72 @@ async function goToScan(jobId: string) {
   highlightTimer = window.setTimeout(() => { highlightedScan.value = null }, 2200)
 }
 
+/**
+ * Everything that happened to this scan, oldest first: pipeline stages and the
+ * user's own actions. Rows recorded before the history existed still carry the
+ * last run's stages under `trace`, so those are shown rather than nothing.
+ */
+function traceOf(job: ScanJob): ScanEvent[] {
+  const events = job.raw_ocr?.events
+  if (Array.isArray(events) && events.length) return events as ScanEvent[]
+  // Rows scanned before the history existed kept only the last run's stages,
+  // under `stage` and with no timestamp. Shown as what they are.
+  const trace = job.raw_ocr?.trace
+  if (!Array.isArray(trace)) return []
+  return (trace as ScanStage[]).map((step) => ({
+    ts: '', actor: 'auto' as const, kind: step.stage, outcome: step.outcome,
+    detail: step.detail, ms: step.ms,
+    tokens_in: step.tokens_in, tokens_out: step.tokens_out,
+  }))
+}
+
+const STAGE_NAMES: Record<string, string> = {
+  qr: 'QR-код',
+  tax_cabinet: 'Кабінет ДПС',
+  ocr: 'Локальний OCR',
+  template: 'Шаблони',
+  generic: 'Текстовий розбір',
+  ai: 'AI',
+  // Manual actions
+  upload: 'Завантаження',
+  rescan: 'Пересканування',
+  import: 'Імпорт XML ДПС',
+  dps: 'Запит до ДПС',
+  draft: 'Чернетка',
+  archive: 'Архів',
+  series: 'Серія кадрів',
+  receipt: 'Чек',
+}
+
+function stageName(stage: string): string {
+  if (stage.startsWith('template:')) return `Шаблон ${stage.slice('template:'.length)}`
+  return STAGE_NAMES[stage] ?? stage
+}
+
+const OUTCOME_MARK: Record<string, string> = {
+  ok: '✅', draft: '🔶', none: '➖', skip: '⏭', fail: '❌',
+}
+
+function eventMark(step: ScanEvent): string {
+  // A user action has no outcome of its own — it is the thing that caused the
+  // stages under it, so it is marked by who did it, not by how it went.
+  if (step.actor === 'user' && !step.outcome) return '👤'
+  return OUTCOME_MARK[step.outcome] ?? '·'
+}
+
+function eventTime(step: ScanEvent): string {
+  return step.ts ? fmtDateTime(step.ts) : '—'
+}
+
+/** Everything this receipt has cost so far, re-runs included. */
+function traceTotalMs(job: ScanJob): number {
+  return traceOf(job).reduce((sum, step) => sum + (step.ms || 0), 0)
+}
+
+function traceTokens(job: ScanJob): number {
+  return traceOf(job).reduce((sum, step) => sum + (step.tokens_in || 0) + (step.tokens_out || 0), 0)
+}
+
 function qrText(job: ScanJob): string {
   if (job.raw_ocr?.fiscal_url) return 'QR ✅ фіскальний'
   switch (job.raw_ocr?.qr_state) {
@@ -586,6 +770,15 @@ async function runBulk(
   bulkNote.value = ''
   try {
     const out = await api.inbox.bulkScans(ids, action, withReceipt)
+    if (out.queued) {
+      bulkNote.value = `${label}: запущено у фоні. Результати з’являться в журналі сканувань.`
+      selected.value = new Set(ids)
+      ;[scans.value, stats.value] = await Promise.all([
+        api.inbox.scans(showArchived.value),
+        api.inbox.scanStats(),
+      ])
+      return
+    }
     const failed = out.results.filter((r) => !r.ok)
     bulkNote.value = failed.length
       ? `${label}: ${out.done} з ${ids.length}. Не вдалося: ` +
@@ -701,7 +894,15 @@ function showAttention() {
     >
       🎙 Голосових: {{ pendingVoices }}
     </button>
-    <span v-if="!attentionCount && !pendingDocs && !pendingVoices" class="chip chip-ok">
+    <button
+      v-if="fiscalJobs.length"
+      class="chip chip-warn"
+      title="Чеки, які ДПС ще не віддала"
+      @click="scrollTo('fiscal-queue')"
+    >
+      🧾 Чеків ДПС у черзі: {{ fiscalJobs.length }}
+    </button>
+    <span v-if="!attentionCount && !pendingDocs && !pendingVoices && !fiscalJobs.length" class="chip chip-ok">
       ✅ Черга порожня — усе розібрано
     </span>
     <span class="attention-drive muted">
@@ -761,8 +962,19 @@ function showAttention() {
   </div>
 
   <!-- Voice ----------------------------------------------------------------->
-  <div v-if="voices.length" id="voice-queue" class="card section">
-    <h3 class="section-title">🎙 Голосові повідомлення ({{ voices.length }})</h3>
+  <div v-if="voices.length || showArchived" id="voice-queue" class="card section">
+    <div class="section-head">
+      <h3 class="section-title">
+        🎙 {{ showArchived ? 'Голосові повідомлення' : 'Голосові в черзі' }} ({{ voices.length }})
+      </h3>
+      <span v-if="pendingVoices" class="muted">Не розібрано: {{ pendingVoices }}</span>
+      <!-- Same switch as the scan journal (one page-wide "show archive"), but
+           repeated here so it is reachable from this section too. -->
+      <label class="switch">
+        <input v-model="showArchived" type="checkbox" />
+        Показати архів
+      </label>
+    </div>
     <p class="muted">
       Запис зберігається завжди — навіть коли розпізнавання вимкнене. Його можна
       прослухати й розпізнати пізніше
@@ -789,9 +1001,16 @@ function showAttention() {
             Розпізнати заново
           </button>
         </template>
+        <button class="secondary" :disabled="voiceBusy === v.id" @click="archiveVoice(v)">
+          {{ v.archived_at ? 'З архіву' : 'В архів' }}
+        </button>
         <button class="secondary" :disabled="voiceBusy === v.id" @click="removeVoice(v)">Видалити</button>
       </div>
       <audio :src="api.voice.audioUrl(v.id)" controls preload="none" style="width: 100%; margin-top: 8px" />
+      <p v-if="v.sender_display_name || v.sender_username" class="muted" style="margin: 6px 0 0">
+        👤 {{ v.sender_display_name || 'Telegram' }}
+        <span v-if="v.sender_username"> · @{{ v.sender_username }}</span>
+      </p>
       <p v-if="v.transcript" style="margin: 8px 0 0">
         🗣 {{ v.transcript }}
         <span v-if="v.language" class="muted">({{ languageLabel(v) }})</span>
@@ -812,10 +1031,73 @@ function showAttention() {
         </button>
       </div>
       <p v-if="v.applied" class="muted" style="margin: 4px 0 0">→ {{ v.applied }}</p>
+      <p v-if="v.archived_at" class="muted" style="margin: 4px 0 0">в архіві · {{ fmtDateTime(v.archived_at) }}</p>
       <p v-if="v.error" class="error" style="margin: 4px 0 0">{{ v.error }}</p>
       <p v-else-if="!v.stt_ready && !v.transcript" class="muted" style="margin: 4px 0 0">
         Розпізнавання не налаштоване — запис збережено, спробуйте після налаштування моделі STT.
       </p>
+    </div>
+  </div>
+
+  <!-- ДПС queue ------------------------------------------------------------->
+  <div id="fiscal-queue" class="card section">
+    <div class="section-head">
+      <h3 class="section-title">🧾 Чеки ДПС ({{ fiscalJobs.length }})</h3>
+    </div>
+    <p class="muted">
+      Тут лишаються тільки ті фіскальні QR, чека за якими ще немає в базі. Щойно
+      чек з'являється — з API ДПС, з фото, від AI чи з XML нижче — рядок зникає
+      сам. Капчу проходять у
+      <RouterLink to="/settings/scanner">Налаштуваннях → Сканування</RouterLink>.
+    </p>
+    <p v-if="fiscalNote" class="muted" style="color: var(--success)">{{ fiscalNote }}</p>
+
+    <p v-if="!fiscalJobs.length" class="empty">Черга порожня — усі фіскальні чеки вже в базі.</p>
+    <div v-for="j in fiscalJobs" :key="j.id" class="card" style="margin-bottom: 10px">
+      <div class="toolbar">
+        <span class="muted" style="flex: 1">
+          {{ fmtDateTime(j.created_at) }} · {{ j.status }}
+          <template v-if="j.attempts"> · спроб: {{ j.attempts }}</template>
+        </span>
+        <a :href="j.url" target="_blank" rel="noopener">Відкрити в ДПС</a>
+        <button :disabled="fiscalBusy === j.id" @click="retryFiscal(j)">
+          {{ fiscalBusy === j.id ? 'Запит…' : 'Запросити з API ДПС' }}
+        </button>
+        <label class="btn secondary file-button" :class="{ disabled: fiscalBusy === j.id }">
+          <span>📄 Обрати XML-файл</span>
+          <input type="file" accept=".xml,.txt" hidden :disabled="fiscalBusy === j.id"
+                 @change="importFiscalFile($event, j)" />
+        </label>
+      </div>
+      <p v-if="j.error" class="muted" style="margin: 4px 0 0">{{ j.error }}</p>
+    </div>
+
+    <!-- Works with or without a queue row: an XML saved from the cabinet is a
+         complete receipt on its own. -->
+    <div class="fiscal-import">
+      <strong>Імпорт XML-відповіді ДПС</strong>
+      <p class="muted" style="margin: 2px 0 6px; font-size: 12px">
+        Відкрийте чек у кабінеті ДПС, збережіть відповідь (XML) або скопіюйте її
+        вміст — і завантажте сюди. Підійде й одноразове посилання
+        <code>chkAllWeb</code>, доки воно дійсне.
+      </p>
+      <div class="toolbar">
+        <label class="btn file-button" :class="{ disabled: fiscalBusy === 'import' }">
+          <span>📄 Обрати XML-файл</span>
+          <input type="file" accept=".xml,.txt" hidden :disabled="fiscalBusy === 'import'"
+                 @change="importFiscalFile($event)" />
+        </label>
+        <input
+          v-model="fiscalPaste"
+          type="text"
+          placeholder="або вставте XML / посилання chkAllWeb…"
+          style="flex: 1; min-width: 220px"
+          @keydown.enter.prevent="importFiscalPaste"
+        />
+        <button class="secondary" :disabled="fiscalBusy === 'import' || !fiscalPaste.trim()" @click="importFiscalPaste">
+          {{ fiscalBusy === 'import' ? 'Імпорт…' : 'Імпортувати' }}
+        </button>
+      </div>
     </div>
   </div>
 
@@ -939,7 +1221,46 @@ function showAttention() {
       </p>
       <p v-if="stats" class="muted" style="margin: 8px 0 0">
         Усього сканувань: {{ stats.total }} · через AI: {{ (stats.ai_share * 100).toFixed(0) }}% ·
+        збережено автоматично: {{ (stats.saved_share * 100).toFixed(0) }}% ·
         за методом: <span v-for="(n, m) in stats.by_method" :key="m">{{ m }}={{ n }} </span>
+      </p>
+    </details>
+
+    <!-- Efficiency, not volume: every scan the free local ladder settles is a
+         model call not made, and the ladder is only worth its rungs if real
+         receipts decode on them. -->
+    <details v-if="stats && stats.traced" class="hint">
+      <summary>Ефективність розпізнавання ({{ stats.traced }} сканів із журналом етапів)</summary>
+      <p class="muted" style="margin: 8px 0 0">
+        QR прочитано локально: <strong>{{ (stats.qr_decoded_share * 100).toFixed(0) }}%</strong>
+        (у середньому {{ stats.qr_avg_ms }} мс) ·
+        <span v-for="(n, state) in stats.qr_states" :key="state">{{ state }}={{ n }} </span>
+      </p>
+      <p v-if="Object.keys(stats.qr_variants).length" class="muted" style="margin: 6px 0 0">
+        Що саме спрацювало: <span v-for="(n, v) in stats.qr_variants" :key="v">{{ v }}={{ n }} </span>
+      </p>
+      <p class="muted" style="margin: 6px 0 0">
+        Викликів AI: {{ stats.ai_calls }}<template v-if="stats.ai_escalated">,
+        з них із переходом на сильнішу модель: {{ stats.ai_escalated }}</template>
+      </p>
+      <table v-if="Object.keys(stats.ai_models).length" class="trace-steps" style="margin-top: 8px">
+        <tr>
+          <th>Модель</th><th class="num">Викликів</th><th class="num">Вдалих</th>
+          <th class="num">Сер. час</th><th class="num">Токенів</th>
+        </tr>
+        <tr v-for="(row, name) in stats.ai_models" :key="name">
+          <td>{{ name }}</td>
+          <td class="num">{{ row.calls }}</td>
+          <td class="num">{{ row.ok }}</td>
+          <td class="num">{{ row.avg_ms }} мс</td>
+          <td class="num">{{ row.tokens_in + row.tokens_out }}</td>
+        </tr>
+      </table>
+      <p class="muted" style="margin: 6px 0 0">
+        Час за етапами:
+        <span v-for="(ms, stage) in stats.stage_ms" :key="stage">
+          {{ stageName(stage) }}={{ (ms / 1000).toFixed(1) }} с
+        </span>
       </p>
     </details>
 
@@ -1037,20 +1358,23 @@ function showAttention() {
             <br /><small class="muted">{{ qrText(j) }}</small>
             <template v-if="fiscalUrl(j)">
               <br /><small><a :href="fiscalUrl(j)" target="_blank">Посилання ДПС</a></small>
-              <div class="dps-actions">
-                <button class="secondary" :disabled="busyScan === j.id"
-                        title="Через відкритий API ДПС за токеном — без браузера й CAPTCHA"
-                        @click="requestFromDps(j)">
-                  Запросити з API ДПС
-                </button>
-                <label class="btn secondary file-button" :class="{ disabled: busyScan === j.id }"
-                       title="XML з кабінету ДПС: файл чека (CHECK), фіскальний документ (RQ) або відповідь API (Chk)">
-                  <span>📄 Завантажити XML</span>
-                  <input type="file" accept=".xml,.txt" :disabled="busyScan === j.id"
-                         @change="uploadDpsXml(j, $event)" />
-                </label>
-              </div>
             </template>
+            <!-- The XML upload is offered on every row, not only on the ones
+                 whose QR was decoded: a row the scanner could not read is
+                 exactly the one the user saves the file for. -->
+            <div class="dps-actions">
+              <button v-if="fiscalUrl(j)" class="secondary" :disabled="busyScan === j.id"
+                      title="Через відкритий API ДПС за токеном — без браузера й CAPTCHA"
+                      @click="requestFromDps(j)">
+                Запросити з API ДПС
+              </button>
+              <label class="btn secondary file-button" :class="{ disabled: busyScan === j.id }"
+                     title="XML з кабінету ДПС: файл чека (CHECK), фіскальний документ (RQ) або відповідь API (Chk)">
+                <span>📄 Обрати XML-файл</span>
+                <input type="file" accept=".xml,.txt" :disabled="busyScan === j.id"
+                       @change="uploadDpsXml(j, $event)" />
+              </label>
+            </div>
           </td>
           <td data-label="Магазин">{{ j.shop_name || '—' }}</td>
           <td data-label="Дата чека">{{ j.purchased_at ? fmtDateTime(j.purchased_at) : '—' }}</td>
@@ -1077,8 +1401,24 @@ function showAttention() {
               <p v-else class="muted" style="margin: 4px 0 0">Позиції сходяться із сумою.</p>
             </details>
             <span v-else>—</span>
+            <!-- Per-receipt recognition log. A button rather than an inline
+                 disclosure: the table has its own columns and would wreck this
+                 one, and the log is read when a particular receipt came out
+                 wrong or expensive — not while scanning the journal. -->
+            <button
+              v-if="traceOf(j).length"
+              class="secondary trace-open"
+              @click="traceJob = j"
+            >
+              🔍 Журнал розпізнавання ({{ traceOf(j).length }})
+            </button>
           </td>
-          <td data-label="Метод">{{ j.method || '—' }}</td>
+          <td data-label="Метод">
+            {{ j.method || '—' }}
+            <!-- Which engine actually read it: a ДПС document and a model's
+                 reading of the paper are worth very different amounts of trust. -->
+            <small v-if="j.recognised_by" class="recognised muted">Розпізнано: {{ j.recognised_by }}</small>
+          </td>
           <td data-label="Статус">
             <RouterLink v-if="j.receipt_id" :to="`/receipts/${j.receipt_id}`" class="status-link">
               <span class="badge" :class="`badge-scan-${statusInfo(j).cls}`">{{ statusInfo(j).text }}</span>
@@ -1142,6 +1482,17 @@ function showAttention() {
               <button class="secondary" :disabled="busyScan === j.id" @click="rescan(j, true)">
                 Через AI
               </button>
+              <!-- Only once a model has already read this photo: before that
+                   "Через AI" is the same first step of the route. "Сильніша" is
+                   the wording — the order is the one set in Налаштування → AI. -->
+              <button
+                v-if="j.next_ai && j.raw_ocr?.ai"
+                class="secondary"
+                :disabled="busyScan === j.id"
+                @click="rescan(j, true, true)"
+              >
+                Сильніша AI → {{ j.next_ai.label }} / {{ j.next_ai.model }}
+              </button>
               <button class="secondary" :disabled="busyScan === j.id" @click="archiveScan(j)">
                 {{ j.archived_at ? 'З архіву' : 'В архів' }}
               </button>
@@ -1160,6 +1511,49 @@ function showAttention() {
         </tr>
       </tbody>
     </table>
+  </div>
+
+  <div v-if="traceJob" class="modal-backdrop" @click.self="traceJob = null">
+    <section class="trace-modal">
+      <div class="trace-head">
+        <div>
+          <h3>Як розпізнано</h3>
+          <p class="muted">
+            {{ traceJob.shop_name || traceJob.source_filename || 'Без назви' }}
+            <template v-if="traceJob.recognised_by"> · {{ traceJob.recognised_by }}</template>
+            <template v-if="traceJob.method"> · метод {{ traceJob.method }}</template>
+          </p>
+        </div>
+        <button class="secondary" @click="traceJob = null">Закрити</button>
+      </div>
+
+      <table class="trace-steps">
+        <tr>
+          <th>Коли</th><th>Подія</th><th>Що вийшло</th>
+          <th class="num">Час</th><th class="num">Токени</th>
+        </tr>
+        <tr v-for="(step, idx) in traceOf(traceJob)" :key="idx"
+            :class="{ 'trace-user': step.actor === 'user' }">
+          <td class="muted nowrap">{{ eventTime(step) }}</td>
+          <td>{{ eventMark(step) }} {{ stageName(step.kind) }}</td>
+          <td class="muted">{{ step.detail || '—' }}</td>
+          <td class="num">{{ step.ms ? `${step.ms} мс` : '—' }}</td>
+          <td class="num">
+            {{ step.tokens_in || step.tokens_out ? `${step.tokens_in}+${step.tokens_out}` : '—' }}
+          </td>
+        </tr>
+      </table>
+
+      <p class="muted trace-total">
+        Разом витрачено на цей чек: {{ (traceTotalMs(traceJob) / 1000).toFixed(1) }} с<template
+          v-if="traceTokens(traceJob)"> · {{ traceTokens(traceJob) }} токенів</template>
+      </p>
+      <p class="muted">
+        👤 — ваші дії, решта — етапи конвеєра. Кожен наступний етап запускається лише тоді,
+        коли попередній не дав результату, тому короткий журнал — це добре: чек розпізнано
+        найдешевшим способом.
+      </p>
+    </section>
   </div>
 </template>
 
@@ -1186,6 +1580,73 @@ function showAttention() {
 .scan-frames .muted {
   font-size: 11px;
   flex-basis: 100%;
+}
+/* Which engine read the photo, under the method code it belongs to */
+.recognised {
+  display: block;
+  font-size: 11px;
+}
+/* The per-receipt recognition log */
+.trace-open {
+  margin-top: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(2, 6, 23, 0.72);
+}
+.trace-modal {
+  width: min(760px, 100%);
+  max-height: min(720px, calc(100vh - 40px));
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #151b2e;
+  padding: 18px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+}
+.trace-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.trace-head h3 {
+  margin: 0 0 4px;
+}
+.trace-total {
+  margin: 10px 0 4px;
+}
+.trace-steps .nowrap {
+  white-space: nowrap;
+}
+/* The user's own actions anchor the machine's stages under them */
+.trace-steps tr.trace-user td {
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.trace-steps {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 4px;
+  font-size: 12px;
+}
+.trace-steps td,
+.trace-steps th {
+  padding: 2px 6px 2px 0;
+  vertical-align: top;
+  text-align: left;
+}
+.trace-steps .num {
+  text-align: right;
+  white-space: nowrap;
 }
 /* Group actions over the journal */
 .bulk-bar {
@@ -1220,6 +1681,11 @@ function showAttention() {
 }
 .section-title {
   margin: 0;
+}
+.fiscal-import {
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding-top: 12px;
 }
 .section-head {
   display: flex;

@@ -15,7 +15,8 @@ from pathlib import Path
 from urllib.parse import quote, urljoin
 
 from app.adapters.base import (AdapterError, AuthResult, BaseAdapter,
-    CatalogProduct, LoyaltyBalance, NormalizedItem, NormalizedReceipt)
+    CatalogProduct, LoyaltyBalance, NormalizedItem, NormalizedReceipt,
+    NormalizedReceiptComponent)
 from app.core.http import AsyncClient
 from app.core.time import store_local_to_utc
 from app.core.config import BASE_DIR
@@ -241,6 +242,30 @@ class FoxtrotAdapter(BaseAdapter):
                 discount = _label_amount(detail, "Знижка")
                 earned_bonuses = _label_amount(detail, "Нараховано бонусів")
                 used_bonuses = _label_amount(detail, "Використано бонусів")
+                delivery = _label_amount(detail, "Доставка")
+                components = []
+                if delivery:
+                    components.append(NormalizedReceiptComponent(
+                        kind="delivery", amount=delivery, code="delivery", label="Доставка",
+                        source="foxtrot.order_totals", raw={"delivery": delivery},
+                    ))
+                if used_bonuses:
+                    components.append(NormalizedReceiptComponent(
+                        kind="discount", amount=-abs(used_bonuses), code="bonuses_used",
+                        label="Використані бонуси", source="foxtrot.order_totals",
+                        raw={"used_bonuses": used_bonuses},
+                    ))
+                residual = round(total_amount - sum(item.total_price for item in items)
+                                 - sum(component.amount for component in components), 2)
+                if abs(residual) >= 0.01:
+                    components.append(NormalizedReceiptComponent(
+                        kind="discount" if residual < 0 else "other",
+                        amount=residual, code="order_residual",
+                        label="Різниця підсумку замовлення",
+                        source="foxtrot.order_totals",
+                        raw={"total": total_amount, "items_total": sum(item.total_price for item in items),
+                             "delivery": delivery, "used_bonuses": used_bonuses},
+                    ))
                 warranty_expires_at = _warranty_expiry(purchased, warranty_text)
                 if items and product_url:
                     # The first product link in Foxtrot's order detail belongs
@@ -258,6 +283,7 @@ class FoxtrotAdapter(BaseAdapter):
                     shop_name="Фокстрот",
                     channel="online" if order_type == "WEB" else "offline",
                     items=items,
+                    components=components,
                     total_discount=discount,
                     bonuses=earned_bonuses,
                     bonuses_used=abs(used_bonuses) if used_bonuses is not None else None,

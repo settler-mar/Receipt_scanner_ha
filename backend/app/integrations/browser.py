@@ -21,7 +21,9 @@ class BrowserSessionConfig:
   locale: str = "en-US"
   viewport_width: int = 1400
   viewport_height: int = 1000
-  headless: bool = False
+  # Collection runs must work inside Docker without a display server. Any
+  # interactive login flow uses its own browser launcher and can stay headed.
+  headless: bool = True
   block_heavy_assets: bool = False
   user_agent: str = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -181,11 +183,15 @@ class PaginatedRecordCollector:
       record_key: Callable[[dict], str | None],
       page_info: Callable[[Any], PageInfo | None],
       max_pages: int = 100,
+      click_timeout_ms: int = 10_000,
+      response_wait_attempts: int = 40,
   ):
     self.record_groups = record_groups
     self.record_key = record_key
     self.page_info = page_info
     self.max_pages = max_pages
+    self.click_timeout_ms = click_timeout_ms
+    self.response_wait_attempts = response_wait_attempts
 
   async def collect(
       self,
@@ -232,7 +238,7 @@ class PaginatedRecordCollector:
       if not await more.count() or not await more.first.is_visible():
         return result
       await more.first.scroll_into_view_if_needed()
-      await more.first.click(timeout=10_000)
-      if not await capture.wait_for_new(before, page):
+      await more.first.click(timeout=self.click_timeout_ms)
+      if not await capture.wait_for_new(before, page, attempts=self.response_wait_attempts):
         return result
     return result

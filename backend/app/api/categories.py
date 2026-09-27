@@ -8,31 +8,34 @@ from __future__ import annotations
 
 import datetime as dt
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models.models import Category, ProductCategory, ReceiptItem
+from app.models.models import Category, ProductCategory, Receipt, ReceiptItem
 from app.schemas.schemas import (
     BackfillResult,
     CategoryCreate,
+    CategoryItemsOut,
+    CategoryItemsReassign,
+    CategoryItemsReassignResult,
     CategoryOut,
     CategoryStat,
     CategoryStatsOut,
     CategoryUpdate,
 )
-from app.services import ai
+from app.services import ai, categorize as categorize_svc
 from app.services.categorize import (
     apply_guesses,
-    backfill_all,
     parse_classification_result,
     pending_names,
+    record_user_choice,
     reset_all_classifications,
     taxonomy_paths,
 )
-from app.services.text import slugify
+from app.services.text import normalize_name, slugify
 
 router = APIRouter(prefix="/api/categories", tags=["categories"])
 
@@ -120,6 +123,117 @@ def category_stats(db: Session = Depends(get_db)):
     )
 
 
+@router.get("/{category_id}/items", response_model=CategoryItemsOut)
+def category_items(
+    category_id: str,
+    include_descendants: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    """Distinct product names currently sitting in this category — the "what's
+    actually in here" view for a catch-all bucket (e.g. "Інше") the user wants
+    to split further. Grouped by normalized name so near-duplicate raw spellings
+    (case, punctuation) collapse into one reassignable row."""
+    cat = _get_or_404(db, category_id)
+    ids = [cat.id] + [d.id for d in _descendants(db, cat)] if include_descendants else [cat.id]
+
+    rows = db.execute(
+        select(ReceiptItem, Receipt.purchased_at)
+        .join(Receipt, Receipt.id == ReceiptItem.receipt_id)
+        .where(ReceiptItem.category_id.in_(ids))
+        .order_by(Receipt.purchased_at.desc())
+    ).all()
+
+    grouped: dict[str, dict] = {}
+    for item, purchased_at in rows:
+        norm = normalize_name(item.name)
+        if not norm:
+            continue
+        g = grouped.setdefault(norm, {
+            "raw_counts": {}, "count": 0, "category_id": item.category_id,
+            # Rows arrive purchased_at-desc, so the first one seen per name is
+            # already the most recent — nothing to compare on later hits.
+            "example_receipt_id": item.receipt_id,
+            "example_item_id": item.id,
+            "example_image_url": item.product_image_url,
+        })
+        g["raw_counts"][item.name] = g["raw_counts"].get(item.name, 0) + 1
+        g["count"] += 1
+        # Prefer an example that actually has a photo, even if it's not the
+        # most recent purchase of this name.
+        if not g["example_image_url"] and item.product_image_url:
+            g["example_receipt_id"] = item.receipt_id
+            g["example_item_id"] = item.id
+            g["example_image_url"] = item.product_image_url
+
+    sources = dict(
+        db.execute(
+            select(ProductCategory.normalized_name, ProductCategory.source).where(
+                ProductCategory.normalized_name.in_(grouped)
+            )
+        ).all()
+    )
+
+    names = [
+        {
+            "normalized_name": norm,
+            "display_name": max(g["raw_counts"], key=g["raw_counts"].get),
+            "count": g["count"],
+            "source": sources.get(norm).value if sources.get(norm) else None,
+            "example_category_id": g["category_id"],
+            "example_receipt_id": g["example_receipt_id"],
+            "example_item_id": g["example_item_id"],
+            "example_image_url": g["example_image_url"],
+        }
+        for norm, g in grouped.items()
+    ]
+    names.sort(key=lambda n: n["count"], reverse=True)
+
+    return {
+        "category_id": cat.id,
+        "total_names": len(names),
+        "total_items": sum(n["count"] for n in names),
+        "names": names,
+    }
+
+
+@router.post("/items/reassign", response_model=CategoryItemsReassignResult)
+def reassign_category_items(payload: CategoryItemsReassign, db: Session = Depends(get_db)):
+    """Move the given normalized names out of `category_id` (the bucket the
+    user was browsing) into `target_category_id` — the counterpart action to
+    GET /{category_id}/items. Scoped to items presently under the source node
+    (plus its descendants when asked) so this never reaches into unrelated
+    categories that happen to share a product name.
+
+    Each name also becomes a sticky `source="user"` alias (record_user_choice),
+    same as a manual per-item edit, so future purchases file there too."""
+    source = _get_or_404(db, payload.category_id)
+    target = _get_or_404(db, payload.target_category_id)
+    if not payload.normalized_names:
+        return {"names": 0, "items_moved": 0}
+
+    ids = (
+        [source.id] + [d.id for d in _descendants(db, source)]
+        if payload.include_descendants
+        else [source.id]
+    )
+    wanted = set(payload.normalized_names)
+
+    items = db.execute(
+        select(ReceiptItem).where(ReceiptItem.category_id.in_(ids))
+    ).scalars().all()
+    moved = 0
+    for item in items:
+        if normalize_name(item.name) in wanted:
+            item.category_id = target.id
+            moved += 1
+
+    for norm in wanted:
+        record_user_choice(db, norm, target.id)
+
+    db.commit()
+    return {"names": len(wanted), "items_moved": moved}
+
+
 @router.post("", response_model=CategoryOut, status_code=201)
 def create_category(payload: CategoryCreate, db: Session = Depends(get_db)):
     name = payload.name.strip()
@@ -199,9 +313,14 @@ def delete_category(category_id: str, db: Session = Depends(get_db)):
 
 @router.post("/backfill", response_model=BackfillResult)
 async def backfill_categories(
+    background: BackgroundTasks,
     force: bool = Query(
         default=False,
         description="Wipe all AI classifications (keeping manual ones) and re-split the whole history",
+    ),
+    include_other: bool = Query(
+        default=False,
+        description='Also re-queue names currently filed under the catch-all "Інше"',
     ),
     db: Session = Depends(get_db),
 ):
@@ -209,11 +328,22 @@ async def backfill_categories(
     (ROADMAP.md "Разовий бекфіл усієї історії").
 
     * default — only the "Без категорії" queue (unknown names);
+    * `include_other=true` — the catch-all "Інше" is folded into that same queue;
     * `force=true` — drop every AI-made category first, then re-classify
-      everything from scratch (manual choices stay).
+      everything from scratch (manual choices stay, except ones parked in
+      "Інше" when `include_other` is also set — see categorize.apply_guesses).
 
     Returns `{names_classified: 0}` when no AI backend is set up."""
-    return await backfill_all(db, force=force)
+    try:
+        categorize_svc.reserve_backfill()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    background.add_task(
+        categorize_svc.run_backfill_in_background,
+        force=force,
+        include_other=include_other,
+    )
+    return BackfillResult(names_classified=0, batches=0, queued=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -239,6 +369,10 @@ class ManualPromptOut(BaseModel):
 class ManualApplyIn(BaseModel):
     result: str                       # whatever the user pasted back
     names: list[str] | None = None    # the `names` list from /manual-prompt
+    # Must match the /manual-prompt call this answer was generated from — lets
+    # a name currently parked in "Інше" be overwritten the same as an
+    # unclassified one (see categorize.apply_guesses).
+    include_other: bool = False
 
 
 @router.get("/manual-prompt", response_model=ManualPromptOut)
@@ -247,6 +381,10 @@ def manual_prompt(
     batch_size: int = Query(
         default=40, ge=1, le=300,
         description="Chunk size for the per-file `batches` split",
+    ),
+    include_other: bool = Query(
+        default=False,
+        description='Also include names currently filed under the catch-all "Інше"',
     ),
     db: Session = Depends(get_db),
 ):
@@ -263,7 +401,7 @@ def manual_prompt(
     taxonomy = taxonomy_paths(db)
     if not taxonomy:
         raise HTTPException(status_code=400, detail="Дерево категорій порожнє")
-    names = pending_names(db, limit)
+    names = pending_names(db, limit, include_other=include_other)
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M")
 
     batches: list[ManualBatch] = []
@@ -278,10 +416,11 @@ def manual_prompt(
         start += len(chunk)
 
     return ManualPromptOut(
-        count=len(names), names=names, system=ai._JSON_SYSTEM,
-        prompt=ai.build_manual_prompt(names, taxonomy),
+        count=len(names), names=names,
+        system=ai.build_manual_prompt(names, taxonomy, db=db).split("\n\n", 1)[0],
+        prompt=ai.build_manual_prompt(names, taxonomy, db=db),
         filename=f"category-classify-{ts}.txt",
-        preamble=ai.build_classify_preamble(taxonomy),
+        preamble=ai.build_classify_preamble(taxonomy, db=db),
         batches=batches,
     )
 
@@ -305,4 +444,4 @@ def manual_apply(payload: ManualApplyIn, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Не вдалося розібрати відповідь: {exc}") from exc
     if not guesses:
         raise HTTPException(status_code=400, detail="У відповіді немає жодного товару")
-    return apply_guesses(db, dict(guesses), backend="manual")
+    return apply_guesses(db, dict(guesses), backend="manual", include_other=payload.include_other)

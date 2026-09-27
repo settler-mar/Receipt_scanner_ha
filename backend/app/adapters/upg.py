@@ -216,8 +216,10 @@ def _normalize(row: dict) -> NormalizedReceipt:
         items=items,
         raw=row,
         total_discount=_float(row.get("TotalDiscount")),
-        bonuses=_float(row.get("AccruedBonus")) or None,
-        bonuses_used=_float(row.get("WithdrawBonus")) or None,
+        # AccruedBonus/WithdrawBonus are бонуси (hundredths of a hryvnia); the
+        # balance endpoint exposes the money value separately as BonusesByMoney.
+        bonuses=_float(row.get("AccruedBonus")) / 100 or None,
+        bonuses_used=_float(row.get("WithdrawBonus")) / 100 or None,
     )
 
 

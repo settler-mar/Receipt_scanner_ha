@@ -145,11 +145,11 @@ def test_add_to_shopping_list_empty(db):
         mcp_server.add_to_shopping_list("   ")
 
 
-def test_add_to_shopping_list_auto_matched_from_receipt(db):
-    # "Хліб" is on the seeded receipt (3 days ago) -> rescan flips it to bought.
+def test_add_to_shopping_list_does_not_match_receipt_before_list_entry(db):
+    # A list entry created after the receipt must not be retroactively marked as
+    # bought; the added_at <= purchased_at rule prevents that false match.
     res = mcp_server.add_to_shopping_list("Хліб")
-    assert res["status"] == "bought"
-    assert res["auto_matched"] is True
+    assert res["status"] == "pending"
 
 
 def test_suggest_store_enabled_empty_list(db):

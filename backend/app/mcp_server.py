@@ -19,7 +19,9 @@ Tools mirror ROADMAP.md Крок 4:
     * suggest_store()                   — best chain for the current shopping list
 
   write:
-    * add_to_shopping_list(text, qty?, unit?)  — one shopping-list item
+    * add_to_shopping_list(text, qty?, unit?, store?, category?, tag?) — shopping-list items
+    * list_shopping_items / update_shopping_item / bulk_update_shopping_items
+    * categorize_shopping_list / shopping_archive / create_shopping_trip
     * add_receipt(total, items?, ...)          — a purchase/receipt into the DB
 
 Which tools are actually reachable is decided at request time by
@@ -244,7 +246,7 @@ def add_receipt(
 
     * `purchased_at` — ISO-8601; defaults to now (UTC).
     * `items` — optional list of `{name, total_price, quantity?, unit?,
-      unit_price?, barcode?, discount?, category?}`. A line may give
+      unit_price?, barcode?, product_code?, discount?, category?}`. A line may give
       `unit_price` + `quantity` instead of `total_price` ("0.7 кг по 50") — the
       product is computed here. A receipt with just a total and no items is allowed.
     * `total_amount` — optional when there are items: it then defaults to their
@@ -271,6 +273,7 @@ def add_receipt(
             unit=raw.get("unit"),
             unit_price=float(raw["unit_price"]) if raw.get("unit_price") is not None else None,
             barcode=raw.get("barcode"),
+            product_code=raw.get("product_code") or raw.get("barcode"),
             category=raw.get("category"),
             discount=float(raw.get("discount", 0) or 0),
         ))
@@ -353,6 +356,9 @@ def add_to_shopping_list(
     qty: float = 1,
     unit: str | None = None,
     note: str | None = None,
+    target_store_code: str | None = None,
+    category_id: str | None = None,
+    tag: str | None = None,
     items: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Add items to the shopping list. `text` is a free phrase ("молоко 2.5%");
@@ -361,13 +367,16 @@ def add_to_shopping_list(
 
     One spoken list usually holds several things ("яйця, морква, молоко для
     Мілани"), so `items` takes them in one call: a list of
-    `{text, qty?, unit?, note?}`. `text` and `items` may be combined.
+    `{text, qty?, unit?, note?, target_store_code?, category_id?, tag?}`.
+    `text` and `items` may be combined. A store/category/tag supplied here is
+    explicit metadata, not a recommendation.
 
     Delegates to the same `POST /api/shopping-list` handler the UI uses, so
     behaviour stays in sync with Крок 2."""
     requests: list[dict[str, Any]] = []
     if text and text.strip():
-        requests.append({"text": text.strip(), "qty": qty, "unit": unit, "note": note})
+        requests.append({"text": text.strip(), "qty": qty, "unit": unit, "note": note,
+                         "target_store_code": target_store_code, "category_id": category_id, "tag": tag})
     for raw in items or []:
         entry = str(raw.get("text") or "").strip()
         if not entry:
@@ -375,6 +384,8 @@ def add_to_shopping_list(
         requests.append({
             "text": entry, "qty": float(raw.get("qty", 1) or 1),
             "unit": raw.get("unit"), "note": raw.get("note"),
+            "target_store_code": raw.get("target_store_code"),
+            "category_id": raw.get("category_id"), "tag": raw.get("tag"),
         })
     if not requests:
         raise ValueError("порожній текст")
@@ -387,10 +398,12 @@ def add_to_shopping_list(
     with SessionLocal() as db:
         rows = [
             create_item(ShoppingItemCreate(raw_text=r["text"], qty=r["qty"],
-                                           unit=r["unit"], note=r["note"]), db=db)
+                                           unit=r["unit"], note=r["note"],
+                                           target_store_code=r["target_store_code"],
+                                           category_id=r["category_id"], tag=r["tag"]), db=db)
             for r in requests
         ]
-        out = [_shopping_row(row) for row in rows]
+        out = [_shopping_row(db, row) for row in rows]
         # A single-item call keeps its old flat shape; callers that only ever add
         # one thing should not have to learn a list.
         return {"enabled": True, "items": out, **out[0]} if len(out) == 1 else {
@@ -398,17 +411,133 @@ def add_to_shopping_list(
         }
 
 
-def _shopping_row(row) -> dict[str, Any]:
-    return {
-        "id": row.id,
-        "raw_text": row.raw_text,
-        "normalized_name": row.normalized_name,
-        "qty": float(row.qty) if row.qty is not None else None,
-        "unit": row.unit,
-        "status": row.status.value if hasattr(row.status, "value") else str(row.status),
-        "category_id": row.category_id,
-        "auto_matched": row.auto_matched,
-    }
+def _jsonable(value):
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat()
+    return value
+
+
+def _shopping_row(db, row) -> dict[str, Any]:
+    from app.api.shopping_list import _item_out
+    return _jsonable(_item_out(db, row))
+
+
+@mcp.tool()
+def list_shopping_items(status: str = "pending") -> list[dict[str, Any]]:
+    """List shopping rows with category, explicit store, tag and purchase data.
+
+    `status` is `pending`, `bought`, `cancelled` or `all`.
+    """
+    if not _shopping_enabled():
+        return []
+    from app.models.shopping import ShoppingListItem, ShoppingListStatus
+    with SessionLocal() as db:
+        stmt = select(ShoppingListItem)
+        if status != "all":
+            try:
+                stmt = stmt.where(ShoppingListItem.status == ShoppingListStatus(status))
+            except ValueError as exc:
+                raise ValueError("status має бути pending | bought | cancelled | all") from exc
+        rows = db.execute(stmt.order_by(ShoppingListItem.added_at.desc())).scalars().all()
+        return [_shopping_row(db, row) for row in rows]
+
+
+@mcp.tool()
+def update_shopping_item(
+    item_id: str,
+    raw_text: str | None = None,
+    qty: float | None = None,
+    note: str | None = None,
+    category_id: str | None = None,
+    target_store_code: str | None = None,
+    tag: str | None = None,
+    status: str | None = None,
+    clear_category: bool = False,
+    clear_store: bool = False,
+    clear_tag: bool = False,
+) -> dict[str, Any]:
+    """Edit one shopping row, including its category, explicit store and tag."""
+    from app.api.shopping_list import update_item
+    from app.schemas.shopping import ShoppingItemUpdate
+    data = {}
+    if raw_text is not None: data["raw_text"] = raw_text
+    if qty is not None: data["qty"] = qty
+    if note is not None: data["note"] = note
+    if category_id is not None: data["category_id"] = category_id
+    if target_store_code is not None: data["target_store_code"] = target_store_code
+    if tag is not None: data["tag"] = tag
+    if status is not None: data["status"] = status
+    if clear_category: data["category_id"] = None
+    if clear_store: data["target_store_code"] = None
+    if clear_tag: data["tag"] = None
+    payload = ShoppingItemUpdate.model_validate(data)
+    with SessionLocal() as db:
+        try:
+            return _jsonable(update_item(item_id, payload, db))
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
+
+
+@mcp.tool()
+def bulk_update_shopping_items(
+    item_ids: list[str],
+    status: str | None = None,
+    category_id: str | None = None,
+    target_store_code: str | None = None,
+    tag: str | None = None,
+    clear_category: bool = False,
+    clear_store: bool = False,
+    clear_tag: bool = False,
+) -> dict[str, Any]:
+    """Apply the same status/category/store/tag operation to selected rows."""
+    if not item_ids:
+        raise ValueError("item_ids не може бути порожнім")
+    results = []
+    from app.api.shopping_list import update_item
+    from app.schemas.shopping import ShoppingItemUpdate
+    with SessionLocal() as db:
+        for item_id in item_ids:
+            data = {}
+            if status is not None: data["status"] = status
+            if category_id is not None: data["category_id"] = category_id
+            if target_store_code is not None: data["target_store_code"] = target_store_code
+            if tag is not None: data["tag"] = tag
+            if clear_category: data["category_id"] = None
+            if clear_store: data["target_store_code"] = None
+            if clear_tag: data["tag"] = None
+            results.append(_jsonable(update_item(item_id, ShoppingItemUpdate.model_validate(data), db)))
+    return {"updated": len(results), "items": results}
+
+
+@mcp.tool()
+async def categorize_shopping_list() -> dict[str, Any]:
+    """Categorize pending rows: local dictionaries first, then AI for the rest."""
+    if not _shopping_enabled():
+        return {"checked": 0, "categorized": 0}
+    from app.services import shopping_list as svc
+    with SessionLocal() as db:
+        return await svc.categorize_pending(db)
+
+
+@mcp.tool()
+def shopping_archive() -> list[dict[str, Any]]:
+    """Return receipt-backed completed shopping rows grouped by receipt."""
+    from app.api.shopping_list import archive
+    with SessionLocal() as db:
+        return _jsonable(archive(db))
+
+
+@mcp.tool()
+def create_shopping_trip(store_code: str | None = None) -> dict[str, Any]:
+    """Create a checklist snapshot for a selected store or all stores."""
+    from app.api.shopping_list import _trip_payload
+    from app.services import shopping_list as svc
+    with SessionLocal() as db:
+        return _jsonable(_trip_payload(db, svc.create_trip(db, store_code=store_code)))
 
 
 @mcp.tool()
@@ -449,9 +578,9 @@ async def capture_text(text: str) -> dict[str, Any]:
             if not _shopping_enabled():
                 return {"intent": "shopping", "enabled": False,
                         "message": "Список покупок ще не увімкнено (ROADMAP Крок 2)."}
-            rows = capture.add_shopping_items(db, draft)
+            rows = capture.add_shopping_items(db, draft, added_method="mcp", added_by="MCP")
             return {"intent": "shopping", "enabled": True,
-                    "items": [_shopping_row(row) for row in rows]}
+                    "items": [_shopping_row(db, row) for row in rows]}
         return {"intent": "unknown",
                 "message": "Не схоже ні на чек, ні на список покупок."}
 

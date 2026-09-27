@@ -8,11 +8,14 @@ the user's browser (the same "Власний Рахунок" flow the app itself
 AuthType.oauth_browser: see app/api/oauth.py for the redirect dance; this adapter's
 oauth_authorize_url/oauth_exchange plug into it instead of start_login/confirm_login.
 
-CLIENT_ID below was obtained once via Dynamic Client Registration (POST /register,
+CLIENT_ID below was obtained via Dynamic Client Registration (POST /register,
 a public/no-secret client — token_endpoint_auth_method "none") with redirect_uri
 hardcoded to this deployment's own callback (settings.base_url +
 "/api/oauth/silpo/callback"). Re-register (see RESEARCH.md) if that base_url ever
-changes — the provider checks it exactly.
+changes — the provider checks it exactly. Re-registered 2026-09-25 after the
+previous client_id started bouncing every /authorize attempt back to itself
+(its redirect_uri no longer matched what we send — root cause never confirmed,
+DCR has no read/update endpoint to compare, only re-register).
 
 Receipts come from two MCP tools (run `tools/list` after auth for the live schema):
   silpo_get_my_offline_orders — in-store purchases. Its schema *requires*
@@ -28,6 +31,7 @@ Receipts come from two MCP tools (run `tools/list` after auth for the live schem
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import logging
@@ -36,6 +40,7 @@ import urllib.parse
 from app.core.time import store_local_to_utc
 
 import httpx
+from exceptiongroup import BaseExceptionGroup
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -48,11 +53,12 @@ from app.adapters.base import (
     LoyaltyCode,
     NormalizedItem,
     NormalizedReceipt,
+    NormalizedReceiptComponent,
 )
 
 logger = logging.getLogger(__name__)
 
-CLIENT_ID = "iE8_0Z6ELO6PWRJq"
+CLIENT_ID = "Tu-0lnMryiNB3e4_"
 AUTHORIZE_ENDPOINT = "https://mcp.silpo.ua/authorize"
 TOKEN_ENDPOINT = "https://mcp.silpo.ua/token"
 MCP_URL = "https://mcp.silpo.ua/mcp"
@@ -65,6 +71,30 @@ _DUMMY_TIMESLOT_START = "2000-01-01T00:00:00Z"
 _DUMMY_TIMESLOT_END = "2000-01-01T01:00:00Z"
 
 _EARLIEST = "2000-01-01T00:00:00Z"
+
+
+def _unwrap_exception_group(exc: BaseExceptionGroup) -> BaseException:
+    """mcp's streamablehttp_client/ClientSession run their read/write loops in an
+    anyio task group; any failure there (expired token, dropped connection,
+    timeout) surfaces as an opaque "unhandled errors in a TaskGroup" instead of
+    the actual cause. Unwrap to the first leaf exception so callers (collector's
+    error_message, is_auth_failure) see the real error."""
+    inner: BaseException = exc
+    while isinstance(inner, BaseExceptionGroup) and inner.exceptions:
+        inner = inner.exceptions[0]
+    return inner
+
+
+@contextlib.asynccontextmanager
+async def _mcp_session(access_token: str):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        async with streamablehttp_client(MCP_URL, headers=headers) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+    except BaseExceptionGroup as eg:
+        raise _unwrap_exception_group(eg) from eg
 
 
 class SilpoAdapter(BaseAdapter):
@@ -129,34 +159,25 @@ class SilpoAdapter(BaseAdapter):
         self, access_token: str, extra: dict, since: dt.datetime | None = None
     ) -> list[NormalizedReceipt]:
         date_start = since.astimezone(dt.timezone.utc).isoformat() if since else _EARLIEST
-        headers = {"Authorization": f"Bearer {access_token}"}
         receipts: list[NormalizedReceipt] = []
 
-        async with streamablehttp_client(MCP_URL, headers=headers) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                receipts += await self._fetch_offline(session, date_start)
-                receipts += await self._fetch_online(session, since)
+        async with _mcp_session(access_token) as session:
+            receipts += await self._fetch_offline(session, date_start)
+            receipts += await self._fetch_online(session, since)
 
         return receipts
 
     async def get_loyalty_code(self, access_token: str, extra: dict) -> LoyaltyCode:
-        headers = {"Authorization": f"Bearer {access_token}"}
-        async with streamablehttp_client(MCP_URL, headers=headers) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                data = await self._call(session, "silpo_get_loyalty_info", {})
+        async with _mcp_session(access_token) as session:
+            data = await self._call(session, "silpo_get_loyalty_info", {})
         barcode = ((data.get("loyalty") or {}).get("card") or {}).get("barcode")
         if not barcode:
             raise AdapterError("Сільпо: код картки відсутній у відповіді")
         return LoyaltyCode(value=barcode, display="qr")
 
     async def get_balance(self, access_token: str, extra: dict) -> LoyaltyBalance:
-        headers = {"Authorization": f"Bearer {access_token}"}
-        async with streamablehttp_client(MCP_URL, headers=headers) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                data = await self._call(session, "silpo_get_loyalty_info", {})
+        async with _mcp_session(access_token) as session:
+            data = await self._call(session, "silpo_get_loyalty_info", {})
         balance = (data.get("loyalty") or {}).get("balance") or {}
         if "total" not in balance:
             raise AdapterError("Сільпо: баланс відсутній у відповіді")
@@ -174,34 +195,31 @@ class SilpoAdapter(BaseAdapter):
         in the response, so product_url stays unset — same as Fora/Fozzy."""
         if not access_token:
             raise AdapterError("Сільпо: пошук по каталогу потребує токена")
-        headers = {"Authorization": f"Bearer {access_token}"}
-        async with streamablehttp_client(MCP_URL, headers=headers) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                cart_ref = await self._call(session, "silpo_get_my_shopping_cart", {})
-                cart_id = cart_ref.get("shoppingCartId")
-                if not cart_id:
-                    raise AdapterError("Сільпо: не вдалось отримати кошик для пошуку")
-                cart = (
-                    await self._call(session, "silpo_get_shopping_cart_by_id", {"shoppingCartId": cart_id})
-                ).get("cart") or {}
-                shipments = cart.get("shipments") or []
-                branch_id = shipments[0].get("branchId") if shipments else None
-                timeslot = cart.get("timeslot") or {}
-                if not branch_id or not timeslot.get("start") or not timeslot.get("end"):
-                    raise AdapterError("Сільпо: кошик не має налаштованої доставки/філії — пошук недоступний")
-                data = await self._call(
-                    session,
-                    "silpo_find_products_batch",
-                    {
-                        "branchId": branch_id,
-                        "deliveryType": cart.get("deliveryType") or "DeliveryHome",
-                        "timeslotStart": timeslot["start"],
-                        "timeslotEnd": timeslot["end"],
-                        "products": [query],
-                        "limit": 20,
-                    },
-                )
+        async with _mcp_session(access_token) as session:
+            cart_ref = await self._call(session, "silpo_get_my_shopping_cart", {})
+            cart_id = cart_ref.get("shoppingCartId")
+            if not cart_id:
+                raise AdapterError("Сільпо: не вдалось отримати кошик для пошуку")
+            cart = (
+                await self._call(session, "silpo_get_shopping_cart_by_id", {"shoppingCartId": cart_id})
+            ).get("cart") or {}
+            shipments = cart.get("shipments") or []
+            branch_id = shipments[0].get("branchId") if shipments else None
+            timeslot = cart.get("timeslot") or {}
+            if not branch_id or not timeslot.get("start") or not timeslot.get("end"):
+                raise AdapterError("Сільпо: кошик не має налаштованої доставки/філії — пошук недоступний")
+            data = await self._call(
+                session,
+                "silpo_find_products_batch",
+                {
+                    "branchId": branch_id,
+                    "deliveryType": cart.get("deliveryType") or "DeliveryHome",
+                    "timeslotStart": timeslot["start"],
+                    "timeslotEnd": timeslot["end"],
+                    "products": [query],
+                    "limit": 20,
+                },
+            )
         products: list[CatalogProduct] = []
         for q in data.get("queries") or []:
             for item in q.get("products") or []:
@@ -347,6 +365,13 @@ def _normalize_offline(entry: dict) -> NormalizedReceipt:
         for r in (entry.get("rewards") or [])
         if r.get("rewardGroupCodeName") == "CN_REWARD_VOUCHERS"
     ) or None
+    components = []
+    if bonuses_used:
+        components.append(NormalizedReceiptComponent(
+            kind="discount", code="bonuses_used", label="Використані балобонуси",
+            amount=round(-bonuses_used, 2), currency="UAH", source="silpo.rewards",
+            raw={"rewards": [r for r in (entry.get("rewards") or []) if r.get("rewardGroupCodeName") == "CN_REWARD_VOUCHERS"]},
+        ))
 
     return NormalizedReceipt(
         external_id=external_id,
@@ -356,6 +381,7 @@ def _normalize_offline(entry: dict) -> NormalizedReceipt:
         shop_address=shop_address,
         channel="offline",
         items=items,
+        components=components,
         raw=entry,
         total_discount=_to_float(entry.get("sumDiscount")),
         bonuses=_to_float(entry.get("accruedBalaBonusesSum")),
@@ -393,12 +419,26 @@ def _normalize_online(entry: dict) -> NormalizedReceipt:
             )
         )
 
+    bonuses_used = sum(
+        r.get("applyRewardAmount") or 0
+        for r in (entry.get("rewards") or [])
+        if r.get("rewardGroupCodeName") == "CN_REWARD_VOUCHERS"
+    ) or None
+    components = []
+    if bonuses_used:
+        components.append(NormalizedReceiptComponent(
+            kind="discount", code="bonuses_used", label="Використані балобонуси",
+            amount=round(-bonuses_used, 2), currency="UAH", source="silpo.rewards",
+            raw={"rewards": [r for r in (entry.get("rewards") or []) if r.get("rewardGroupCodeName") == "CN_REWARD_VOUCHERS"]},
+        ))
+
     return NormalizedReceipt(
         external_id=str(order_id),
         purchased_at=_parse_dt(created),
         total_amount=_to_float(total) or 0,
         channel="online",
         items=items,
+        components=components,
         raw=entry,
         total_discount=_to_float(discount),
     )

@@ -19,6 +19,10 @@ python-dotenv>=1.0
 # FastMCP sub-app at /mcp — ROADMAP Крок 4). Pinned: 2.x renamed/moved
 # streamablehttp_client used by silpo.py — revisit that import before bumping.
 mcp==1.29.0
+# exceptiongroup: mcp's anyio task groups can raise BaseExceptionGroup on py3.10
+# (no builtin ExceptionGroup there); silpo.py and collector.py unwrap it to the
+# real sub-exception instead of the opaque "unhandled errors in a TaskGroup".
+exceptiongroup>=1.2
 patchright==1.62.2
 pypdf>=6.0  # extracts warranty-expiry text from Дніпро-М's warranty-card PDF, see api/receipts.py
 # Receipt scanner pipeline (ROADMAP Крок 3, app/scanner/):

@@ -7,17 +7,19 @@ import datetime as dt
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base, get_db
 from app.main import app
 from app.models import models  # noqa: F401 — registers receipts/stores tables
 from app.models import shopping  # noqa: F401 — registers shopping tables
-from app.models.models import Account, Receipt, ReceiptItem, Store
-from app.models.shopping import ShoppingListItem, ShoppingListStatus
+from app.models.models import Account, Category, Receipt, ReceiptItem, Store
+from app.models.shopping import ShoppingListItem, ShoppingListStatus, ShoppingTripItem
+from app.models.shopping import ShoppingTrip, ShoppingTripItemStatus, ShoppingTripStatus
 from app.services import shopping_list as svc
 from app.services.text import normalize_name
+from app.api.shopping_list import archive
 
 
 @pytest.fixture()
@@ -93,6 +95,7 @@ def _run(coro):
 
 
 def _add(db, text, **kw):
+    kw.setdefault("added_at", dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc))
     row = ShoppingListItem(raw_text=text, normalized_name=normalize_name(text), **kw)
     db.add(row)
     db.commit()
@@ -110,8 +113,24 @@ def test_normalized_name_match_flips_to_candidate(db):
     assert [m.id for m in matched] == [milk.id]
     db.refresh(milk)
     assert milk.status == ShoppingListStatus.bought
-    assert milk.auto_matched is True
+    assert milk.auto_matched is False
     assert milk.bought_receipt_item_id is not None
+
+
+def test_names_match_russian_and_ukrainian_spellings():
+    assert svc.names_match("нагетсы", "mc нагетси курячі 1кг")
+    assert svc.names_match("сыр", "spomlek сир salami 45% кг")
+
+
+def test_names_match_catalogue_punctuation_and_ukrainian_construction_terms():
+    assert svc.names_match(
+        normalize_name("WD 40"),
+        normalize_name("Мастило універсальне WD-40 200 мл"),
+    )
+    assert svc.names_match(
+        normalize_name("алюминевая пластина шириной 20мм"),
+        normalize_name("Смуга алюмінієва 20x2 мм 1000 мм анодоване срібло"),
+    )
 
 
 def test_barcode_match_wins_even_without_name_match(db):
@@ -153,6 +172,121 @@ def test_no_match_leaves_pending(db):
     assert bananas.status == ShoppingListStatus.pending
 
 
+def test_archive_groups_completed_list_items_by_receipt(db):
+    acc = _store(db)
+    first = _add(db, "молоко", status=ShoppingListStatus.bought)
+    second = _add(db, "хлеб", status=ShoppingListStatus.bought)
+    receipt = _receipt(db, acc, items=[
+        ("Молоко 2,5%", 42.0),
+        ("Хліб", 25.0),
+    ])
+    db.refresh(receipt)
+    first.bought_receipt_item_id = receipt.items[0].id
+    second.bought_receipt_item_id = receipt.items[1].id
+    first.bought_at = receipt.purchased_at
+    second.bought_at = receipt.purchased_at
+    db.commit()
+
+    groups = archive(db)
+
+    assert len(groups) == 1
+    assert groups[0]["receipt_id"] == receipt.id
+    assert [item["receipt_item_name"] for item in groups[0]["items"]] == [
+        "Молоко 2,5%", "Хліб"
+    ]
+
+
+def test_trip_keeps_items_unassigned_to_a_store(db):
+    _store(db, "atb", "АТБ")
+    _store(db, "fozzy", "Фоззі")
+    _add(db, "молоко", target_store_code="atb")
+    _add(db, "лампа", target_store_code="fozzy")
+
+    trip = svc.create_trip(db, store_code="atb")
+    rows = db.execute(select(ShoppingTripItem).where(ShoppingTripItem.trip_id == trip.id)).scalars().all()
+
+    assert [row.raw_text for row in rows] == ["молоко", "лампа"]
+
+
+def test_explicit_all_stores_resets_previous_store_and_syncs_pending(db):
+    _store(db, "eva", "EVA")
+    _add(db, "молоко")
+    _add(db, "сахар")
+
+    trip = svc.create_trip(db, store_code="eva")
+    assert trip.store_code == "eva"
+    all_stores = svc.create_trip(db, store_code="")
+
+    rows = db.execute(select(ShoppingTripItem).where(
+        ShoppingTripItem.trip_id == all_stores.id
+    )).scalars().all()
+    assert all_stores.store_code is None
+    assert {row.raw_text for row in rows} == {"молоко", "сахар"}
+
+
+def test_active_trip_endpoint_syncs_shared_checklist(db, client):
+    _add(db, "молоко")
+    created = client.post("/api/shopping-list/trips", json={"store_code": None, "owner_name": "Максим"})
+    assert created.status_code == 201
+    trip_id = created.json()["id"]
+
+    _add(db, "сахар")
+    active = client.get("/api/shopping-list/trips/active")
+
+    assert active.status_code == 200
+    payload = active.json()
+    trip = next(row for row in payload if row["id"] == trip_id)
+    assert trip["owner_name"] == "Максим"
+    assert {row["raw_text"] for row in trip["items"]} == {"молоко", "сахар"}
+
+
+def test_trips_can_be_opened_by_multiple_participants(db, client):
+    _add(db, "молоко")
+    first = client.post("/api/shopping-list/trips", json={"owner_name": "Максим"}).json()
+    second = client.post("/api/shopping-list/trips", json={"owner_name": "Настя"}).json()
+
+    active = client.get("/api/shopping-list/trips/active").json()
+
+    assert {row["id"] for row in active} == {first["id"], second["id"]}
+    assert {row["owner_name"] for row in active} == {"Максим", "Настя"}
+
+
+def test_idle_trip_is_completed_and_checkbox_activity_keeps_it_alive(db, client):
+    _add(db, "молоко")
+    trip = client.post("/api/shopping-list/trips", json={"owner_name": "Максим"}).json()
+    trip_row = db.get(ShoppingTrip, trip["id"])
+    trip_row.last_activity_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3, minutes=1)
+    db.commit()
+
+    assert client.get("/api/shopping-list/trips/active").json() == []
+    db.refresh(trip_row)
+    assert trip_row.status == ShoppingTripStatus.completed
+
+    fresh = client.post("/api/shopping-list/trips", json={"owner_name": "Настя"}).json()
+    item = fresh["items"][0]
+    response = client.patch(
+        f"/api/shopping-list/trips/{fresh['id']}/items/{item['id']}",
+        json={"status": "bought"},
+    )
+    assert response.status_code == 200
+    db.refresh(db.get(ShoppingTrip, fresh["id"]))
+    assert db.get(ShoppingTrip, fresh["id"]).last_activity_at > trip_row.last_activity_at
+
+
+def test_one_receipt_line_cannot_match_two_list_rows(db):
+    acc = _store(db)
+    first = _add(db, "молоко")
+    second = _add(db, "молоко")
+    _receipt(db, acc, items=[("Молоко Яготинське 2,6%", 42.90)])
+
+    matched = svc.rescan_pending(db)
+
+    assert len(matched) == 1
+    db.refresh(first)
+    db.refresh(second)
+    assert {first.status, second.status} == {ShoppingListStatus.pending, ShoppingListStatus.bought}
+
+
 def test_suggest_stores_ranks_by_coverage_then_basket(db):
     atb = _store(db, "atb", "АТБ")
     silpo = _store(db, "silpo", "Сільпо")
@@ -192,11 +326,15 @@ def test_api_crud_and_confirm_reject_flow(client, db):
 
     assert [i["raw_text"] for i in client.get("/api/shopping-list").json()] == ["молоко"]
 
-    _receipt(db, acc, items=[("Молоко Яготинське 2,6% 900г", 42.90)])
+    # The matcher only links receipts purchased *after* the row was added, so
+    # this receipt has to be "now" rather than the fixture's fixed past date.
+    _receipt(db, acc, when=dt.datetime.now(dt.timezone.utc),
+             items=[("Молоко Яготинське 2,6% 900г", 42.90)])
     assert client.post("/api/shopping-list/rescan").json()["matched"][0]["id"] == item_id
 
-    got = client.get("/api/shopping-list").json()[0]
-    assert got["status"] == "bought" and got["auto_matched"] is True
+    assert client.get("/api/shopping-list").json() == []
+    got = client.get("/api/shopping-list?status=all").json()[0]
+    assert got["status"] == "bought" and got["auto_matched"] is False
 
     # reject -> back to pending, and not re-proposed from the same line
     assert client.post(f"/api/shopping-list/{item_id}/reject").json()["status"] == "pending"
@@ -243,3 +381,172 @@ def test_api_suggest_store(client, db):
     _receipt(db, atb, store_code="atb", items=[("Молоко 2,6%", 40.0)])
     out = client.get("/api/shopping-list/suggest-store").json()
     assert out[0]["store_code"] == "atb" and out[0]["covered_items"] == 1
+
+
+def test_trip_snapshots_pending_items_and_returns_skipped_rows(db):
+    first = _add(db, "молоко")
+    second = _add(db, "хлеб")
+
+    trip = svc.create_trip(db, store_code="atb")
+    trip_items = db.query(svc.ShoppingTripItem).filter(svc.ShoppingTripItem.trip_id == trip.id).all()
+    assert trip.status == ShoppingTripStatus.active
+    assert {item.raw_text for item in trip_items} == {"молоко", "хлеб"}
+
+    milk_trip_item = next(item for item in trip_items if item.raw_text == "молоко")
+    svc.update_trip_item(db, milk_trip_item, ShoppingTripItemStatus.bought)
+    completed = svc.complete_trip(db, trip)
+    assert completed.status == ShoppingTripStatus.completed
+
+    db.refresh(first)
+    db.refresh(second)
+    assert first.status == ShoppingListStatus.pending
+    assert second.status == ShoppingListStatus.pending
+
+
+def test_routine_suggestion_uses_purchase_intervals_and_can_be_postponed(db):
+    acc = _store(db)
+    list_row = _add(db, "Кава")
+    list_row.status = ShoppingListStatus.cancelled
+    db.commit()
+    _receipt(db, acc, when=dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc), items=[("Кава", 100)])
+    _receipt(db, acc, when=dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc), items=[("Кава", 100)])
+    _receipt(db, acc, when=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc), items=[("Кава", 100)])
+
+    rows = svc.routine_suggestions(db)
+
+    assert rows and rows[0]["display_name"] == "Кава"
+    assert rows[0]["interval_days"] == pytest.approx(30.5)
+    svc.routine_action(db, rows[0]["normalized_name"], "postpone", postpone_days=30)
+    assert svc.routine_suggestions(db) == []
+
+
+# --------------------------------------------------------------------------- #
+# Categorization (dictionaries first, AI for what is left)
+# --------------------------------------------------------------------------- #
+def test_categorize_pending_falls_back_to_ai(db, monkeypatch):
+    from app.services import ai, categorize
+
+    root = Category(name="Продукты", slug="produkty", path="produkty")
+    leaf = Category(name="Молоко и сливки", slug="moloko-ta-vershky", path="produkty/moloko-ta-vershky")
+    db.add_all([root, leaf])
+    db.add(ShoppingListItem(raw_text="вершки 10%", normalized_name=normalize_name("вершки 10%")))
+    db.commit()
+
+    async def _fake_classify(_db, names, taxonomy, contexts=None):
+        # pass 1 sees the roots only, pass 2 the branch — answer both.
+        path = "produkty" if taxonomy == ["produkty"] else "produkty/moloko-ta-vershky"
+        return {n: ai.CategoryGuess(category_path=path, confidence=0.9) for n in names}
+
+    monkeypatch.setattr(ai, "classify_products", _fake_classify)
+    result = asyncio.run(svc.categorize_pending(db))
+
+    assert result["checked"] == 1 and result["by_dictionary"] == 0
+    assert result["by_ai"] == 1 and result["ai_error"] is None
+    row = db.execute(select(ShoppingListItem)).scalars().one()
+    assert row.category_id == leaf.id
+    assert svc.category_name_ru(leaf) == "Молоко и сливки"
+    assert svc.category_group_name(db, leaf) == "Продукты"
+
+
+def test_categorize_pending_reports_ai_failure(db, monkeypatch):
+    from app.services import ai
+
+    db.add(Category(name="Продукты", slug="produkty", path="produkty"))
+    db.add(Category(name="Молоко и сливки", slug="moloko-ta-vershky", path="produkty/moloko-ta-vershky"))
+    db.add(ShoppingListItem(raw_text="щось невідоме", normalized_name=normalize_name("щось невідоме")))
+    db.commit()
+
+    async def _boom(*_a, **_kw):
+        raise RuntimeError("AI не налаштовано")
+
+    monkeypatch.setattr(ai, "classify_products", _boom)
+    result = asyncio.run(svc.categorize_pending(db))
+
+    assert result["categorized"] == 0 and "AI не налаштовано" in result["ai_error"]
+
+
+# --------------------------------------------------------------------------- #
+# Store classes (продуктовый / аптека / строительный / …)
+# --------------------------------------------------------------------------- #
+def test_store_class_prefers_pinned_store_over_category(db, client):
+    from app.api.shopping_list import _store_class
+    from app.models.models import Category
+    from app.services import store_classes
+
+    acc = _store(db, code="epicentrk", name="Епіцентр К")
+    store = db.get(Store, acc.store_id)
+    food = Category(name="Продукти", slug="produkty", path="produkty")
+
+    # A DIY chain is seeded as network_type "home"; the per-code map wins.
+    assert _store_class(store, food)["store_class"] == "diy"
+    # No store pinned — the category's top level decides.
+    assert _store_class(None, food)["store_class"] == "grocery"
+    assert _store_class(None, None)["store_class"] == store_classes.UNKNOWN
+
+    codes = [row["code"] for row in client.get("/api/stores/classes").json()]
+    assert codes[0] == "grocery" and "pharmacy" in codes
+
+
+# --------------------------------------------------------------------------- #
+# Automatic categorization on a schedule + the journal entry it leaves
+# --------------------------------------------------------------------------- #
+def _taxonomy(db):
+    from app.models.models import Category
+    db.add(Category(name="Продукти", slug="produkty", path="produkty"))
+    db.add(Category(name="Молоко и сливки", slug="moloko-ta-vershky",
+                    path="produkty/moloko-ta-vershky"))
+    db.commit()
+
+
+def _fake_ai(monkeypatch):
+    from app.services import ai
+
+    async def _classify(_db, names, taxonomy, contexts=None):
+        path = "produkty" if taxonomy == ["produkty"] else "produkty/moloko-ta-vershky"
+        return {n: ai.CategoryGuess(category_path=path, confidence=0.9) for n in names}
+
+    monkeypatch.setattr(ai, "classify_products", _classify)
+
+
+def test_auto_categorize_waits_for_the_quiet_period(db, monkeypatch):
+    from app.models.models import AppEvent
+    from app.services import shopping_settings
+
+    _taxonomy(db)
+    _fake_ai(monkeypatch)
+    now = dt.datetime.now(dt.timezone.utc)
+    db.add(ShoppingListItem(raw_text="вершки", normalized_name=normalize_name("вершки"),
+                            added_at=now - dt.timedelta(minutes=3)))
+    db.commit()
+
+    # Default delay is 10 minutes: a list that was touched 3 minutes ago waits.
+    assert asyncio.run(svc.run_auto_categorize(db)) is None
+    assert db.execute(select(ShoppingListItem)).scalars().one().category_id is None
+
+    shopping_settings.save(db, {"auto_categorize_delay_minutes": 2})
+    result = asyncio.run(svc.run_auto_categorize(db))
+    assert result and result["categorized"] == 1
+    assert db.execute(select(ShoppingListItem)).scalars().one().category_id is not None
+
+    # The run is journalled once, and an unchanged list is not re-run.
+    events = db.execute(select(AppEvent)).scalars().all()
+    assert len(events) == 1 and events[0].source == "shopping"
+    assert "розкладено 1" in events[0].message
+    assert asyncio.run(svc.run_auto_categorize(db)) is None
+
+
+def test_auto_categorize_can_be_switched_off(db, monkeypatch, client):
+    from app.services import shopping_settings
+
+    _taxonomy(db)
+    _fake_ai(monkeypatch)
+    db.add(ShoppingListItem(raw_text="вершки", normalized_name=normalize_name("вершки"),
+                            added_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)))
+    db.commit()
+
+    saved = client.put("/api/shopping-list/settings",
+                       json={"auto_categorize": False}).json()
+    assert saved == {"auto_categorize": False, "auto_categorize_delay_minutes": 10}
+    assert shopping_settings.load(db)["auto_categorize"] is False
+    assert asyncio.run(svc.run_auto_categorize(db)) is None
+    assert db.execute(select(ShoppingListItem)).scalars().one().category_id is None

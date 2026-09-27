@@ -14,7 +14,10 @@ from app.adapters.fozzy import (
     _local_phone,
     _oauth_url,
     _pkce_pair,
+    _normalize_offline,
+    _normalize_online,
 )
+import datetime as dt
 
 
 class OAuthHelpersTests(unittest.TestCase):
@@ -37,6 +40,25 @@ class OAuthHelpersTests(unittest.TestCase):
         self.assertEqual(query["state"], ["state-1"])
         self.assertEqual(query["code_challenge_method"], ["S256"])
         self.assertIn("offline_access", query["scope"][0])
+
+    def test_offline_order_discount_is_receipt_component(self):
+        receipt = _normalize_offline(
+            {"chequeId": "F-1", "created": "2026-08-20T12:00:00Z", "sumReg": 100},
+            {"chequeLines": [{"lagerInfo": {"name": "Товар"}, "amount": 1, "sumReg": 110}],
+             "sumReg": 100, "sumDiscount": 10},
+            dt.datetime(2026, 8, 20, tzinfo=dt.timezone.utc),
+        )
+        self.assertEqual(receipt.components[0].amount, -10)
+        self.assertIsNone(receipt.total_adjustment)
+
+    def test_online_delivery_and_order_discount_are_separate_components(self):
+        receipt = _normalize_online(
+            {"id": "O-1", "createdDate": "2026-08-20T12:00:00Z", "sumActual": 159},
+            {"items": [{"name": "Товар", "countActual": 1, "sumActual": 150, "lineStateId": 2}],
+             "sumActualGoods": 150, "sumActualDelivery": 9, "sumActualDiscount": -10},
+            dt.datetime(2026, 8, 20, tzinfo=dt.timezone.utc),
+        )
+        self.assertEqual([(x.kind, x.amount) for x in receipt.components], [("delivery", 9)])
 
 
 class RefreshTests(unittest.IsolatedAsyncioTestCase):

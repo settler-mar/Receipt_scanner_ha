@@ -62,7 +62,8 @@ class UpgAdapterTests(unittest.TestCase):
         self.assertEqual(receipt.purchased_at, dt.datetime(2026, 8, 15, 12, 58, tzinfo=dt.timezone.utc))
         self.assertEqual(receipt.total_amount, 1228.66)
         self.assertEqual(receipt.total_discount, 10)
-        self.assertEqual(receipt.bonuses, 2864)
+        # AccruedBonus comes in бонусах (hundredths of a hryvnia) — stored as money.
+        self.assertEqual(receipt.bonuses, 28.64)
         self.assertEqual(receipt.items[0].name, "Газ")
         self.assertAlmostEqual(receipt.items[0].total_price, 1228.66)
 

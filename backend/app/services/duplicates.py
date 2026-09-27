@@ -3,17 +3,20 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import re
+import shutil
 import threading
 import unicodedata
 from collections import defaultdict
 from decimal import Decimal
 from difflib import SequenceMatcher
+from itertools import combinations
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.time import as_utc
+from app.core.config import BASE_DIR
 from app.models.models import (
     DuplicateCandidate,
     DuplicateGroup,
@@ -26,6 +29,7 @@ from app.models.models import (
 )
 
 _LOCK = threading.Lock()
+PHOTO_DIR = BASE_DIR / "data" / "photos"
 _CONFUSABLES = str.maketrans({
     "A": "А", "a": "а",
     "B": "В", "b": "в",
@@ -160,6 +164,26 @@ def _receipt_evidence(receipt: Receipt) -> dict[str, Any]:
     }
 
 
+def _is_pharmacy_preorder(receipt: Receipt) -> bool:
+    """Site reservation whose real purchase is later represented by a fiscal
+    receipt from the pharmacy till.
+
+    Keep the fallback for rows saved before the explicit source marker was
+    added: Liki online orders have numeric order IDs and are never fiscal IDs.
+    """
+    raw = receipt.raw or {}
+    if raw.get("source") == "pharmacy_preorder":
+        return True
+    if receipt.store_code in {"liki", "tabletki"} and raw.get("reservation_type"):
+        return True
+    return (
+        receipt.store_code == "liki"
+        and receipt.channel == "online"
+        and bool(receipt.external_id)
+        and not receipt.external_id.startswith("fiscal:")
+    )
+
+
 def _item_similarity(a: Receipt, b: Receipt) -> float:
     names_a = [_norm(i.name) for i in a.items if _norm(i.name)]
     names_b = [_norm(i.name) for i in b.items if _norm(i.name)]
@@ -168,7 +192,52 @@ def _item_similarity(a: Receipt, b: Receipt) -> float:
     set_a, set_b = set(names_a), set(names_b)
     overlap = len(set_a & set_b) / max(len(set_a | set_b), 1)
     text_ratio = SequenceMatcher(None, " ".join(sorted(set_a)), " ".join(sorted(set_b))).ratio()
-    return max(overlap, text_ratio * 0.8)
+    similarity = max(overlap, text_ratio * 0.8)
+
+    # Adapter and fiscal OCR names often abbreviate the same product
+    # differently ("сусп."/"суспензія", "фл."/"флакон"). Matching the
+    # line price first gives the name comparison the right pair to compare and
+    # avoids treating a reordered basket as unrelated.
+    used_b: set[int] = set()
+    price_matched: list[float] = []
+    for item_a in [i for i in a.items if _norm(i.name)]:
+        choices = [
+            (idx, item_b) for idx, item_b in enumerate(b.items)
+            if idx not in used_b
+            and _norm(item_b.name)
+            and abs(float(item_a.total_price) - float(item_b.total_price)) <= 0.01
+            and abs(float(item_a.quantity or 1) - float(item_b.quantity or 1)) <= 0.01
+        ]
+        if not choices:
+            continue
+        idx, item_b = max(
+            choices,
+            key=lambda pair: SequenceMatcher(
+                None, _norm(item_a.name), _norm(pair[1].name)
+            ).ratio(),
+        )
+        used_b.add(idx)
+        price_matched.append(SequenceMatcher(
+            None, _norm(item_a.name), _norm(item_b.name)
+        ).ratio())
+    common_words = 0
+    for item_a in [i for i in a.items if _norm(i.name)]:
+        choices = [
+            item_b for item_b in b.items
+            if abs(float(item_a.total_price) - float(item_b.total_price)) <= 0.01
+            and abs(float(item_a.quantity or 1) - float(item_b.quantity or 1)) <= 0.01
+        ]
+        if not choices:
+            continue
+        item_b = max(choices, key=lambda item: SequenceMatcher(
+            None, _norm(item_a.name), _norm(item.name)
+        ).ratio())
+        words_a = {word for word in re.findall(r"\w+", _norm(item_a.name)) if len(word) >= 4 and not word.isdigit()}
+        words_b = {word for word in re.findall(r"\w+", _norm(item_b.name)) if len(word) >= 4 and not word.isdigit()}
+        common_words += len(words_a & words_b)
+    if price_matched and len(price_matched) == min(len(names_a), len(names_b)) and common_words >= 3:
+        similarity = max(similarity, sum(price_matched) / len(price_matched))
+    return similarity
 
 
 def _score_pair(a: Receipt, b: Receipt) -> tuple[int, list[str], str, dict[str, Any]]:
@@ -233,6 +302,9 @@ def _score_pair(a: Receipt, b: Receipt) -> tuple[int, list[str], str, dict[str, 
         status = "pending"
     elif score >= 60 and exact_amount and minutes <= 10:
         status = "needs_review"
+    elif (score >= 50 and exact_amount and minutes <= 48 * 60
+          and item_ratio >= 0.65):
+        status = "needs_review"
     else:
         status = "rejected"
     return min(score, 100), reasons, status, {"a": ea, "b": eb, "minutes": minutes, "item_similarity": item_ratio}
@@ -246,32 +318,61 @@ def _candidate_window(db: Session) -> list[Receipt]:
     ).scalars().all()
 
 
-def run_duplicate_search(db: Session, *, trigger: str = "manual") -> DuplicateRun:
+def start_duplicate_search(db: Session, *, trigger: str = "manual") -> DuplicateRun:
     if not _LOCK.acquire(blocking=False):
         raise DuplicateRunAlreadyRunning("Duplicate search is already running")
     run = DuplicateRun(trigger=trigger, status=DuplicateRunStatus.running)
     db.add(run)
     db.commit()
     db.refresh(run)
+    return run
+
+
+def _execute_duplicate_search(db: Session, run: DuplicateRun) -> DuplicateRun:
     try:
         receipts = [r for r in _candidate_window(db) if not (r.raw or {}).get("merged_into_receipt_id")]
         run.scanned_receipts = len(receipts)
         found = 0
         new = 0
-        for idx, a in enumerate(receipts):
-            for b in receipts[idx + 1:]:
-                if a.id == b.id or a.store_code == b.store_code or a.currency != b.currency:
+        # Amount and currency are mandatory duplicate signals below.  Bucket
+        # first so the common case does not compare every receipt with every
+        # other receipt (the old implementation was O(n²) over the whole DB).
+        buckets: dict[tuple[str, Decimal], list[Receipt]] = defaultdict(list)
+        for receipt in receipts:
+            buckets[(receipt.currency or "UAH", _amount_cents(receipt.total_amount))].append(receipt)
+        # Keep the identity lookups in memory for this run.  The old loop did
+        # two SELECTs for every qualifying pair, which made a duplicate scan
+        # increasingly database-bound after the amount bucketing above.
+        group_by_fingerprint = {
+            row.fingerprint: row
+            for row in db.execute(select(DuplicateGroup)).scalars()
+        }
+        candidate_by_fingerprint = {
+            row.fingerprint: row
+            for row in db.execute(select(DuplicateCandidate)).scalars()
+        }
+        for bucket in buckets.values():
+            for a, b in combinations(bucket, 2):
+                if a.id == b.id or a.store_code == b.store_code:
                     continue
                 if _amount_cents(a.total_amount) != _amount_cents(b.total_amount):
                     continue
-                if abs((as_utc(a.purchased_at) - as_utc(b.purchased_at)).total_seconds()) > 10 * 60:
+                minutes_apart = abs((as_utc(a.purchased_at) - as_utc(b.purchased_at)).total_seconds()) / 60
+                # Pharmacy websites record the reservation time, while the
+                # fiscal scan records collection/payment time. Only this
+                # explicitly identified preorder-vs-receipt pair gets the
+                # pharmacy's 48-hour reconciliation window.
+                preorder_pair = _is_pharmacy_preorder(a) != _is_pharmacy_preorder(b)
+                if minutes_apart > 10 and (not preorder_pair or minutes_apart > 48 * 60):
+                    continue
+                if minutes_apart > 10 and _item_similarity(a, b) < 0.65:
                     continue
                 score, reasons, status, evidence = _score_pair(a, b)
                 if status == "rejected" and score < 60:
                     continue
                 found += 1
                 fp = _fingerprint([a.id, b.id])
-                group = db.execute(select(DuplicateGroup).where(DuplicateGroup.fingerprint == fp)).scalar_one_or_none()
+                group = group_by_fingerprint.get(fp)
                 if group is None:
                     group = DuplicateGroup(
                         fingerprint=fp,
@@ -284,6 +385,7 @@ def run_duplicate_search(db: Session, *, trigger: str = "manual") -> DuplicateRu
                     )
                     db.add(group)
                     db.flush()
+                    group_by_fingerprint[fp] = group
                     new += 1
                 elif group.status in {DuplicateStatus.pending, DuplicateStatus.needs_review}:
                     group.status = DuplicateStatus(status)
@@ -291,9 +393,7 @@ def run_duplicate_search(db: Session, *, trigger: str = "manual") -> DuplicateRu
                     group.reasons = reasons
                     group.last_seen_run_id = run.id
                     group.last_seen_at = _now()
-                candidate = db.execute(
-                    select(DuplicateCandidate).where(DuplicateCandidate.fingerprint == fp)
-                ).scalar_one_or_none()
+                candidate = candidate_by_fingerprint.get(fp)
                 if candidate is None:
                     candidate = DuplicateCandidate(
                         group_id=group.id,
@@ -307,6 +407,7 @@ def run_duplicate_search(db: Session, *, trigger: str = "manual") -> DuplicateRu
                         last_seen_run_id=run.id,
                     )
                     db.add(candidate)
+                    candidate_by_fingerprint[fp] = candidate
                 elif candidate.status in {DuplicateStatus.pending, DuplicateStatus.needs_review}:
                     candidate.status = DuplicateStatus(status)
                     candidate.score = score
@@ -328,6 +429,32 @@ def run_duplicate_search(db: Session, *, trigger: str = "manual") -> DuplicateRu
         db.refresh(run)
         _LOCK.release()
     return run
+
+
+def run_duplicate_search(db: Session, *, trigger: str = "manual") -> DuplicateRun:
+    """Run synchronously for the scheduler and existing service callers."""
+    run = start_duplicate_search(db, trigger=trigger)
+    return _execute_duplicate_search(db, run)
+
+
+def finish_duplicate_search(run_id: str) -> None:
+    """Finish a previously created run in an isolated worker/session."""
+    from app.db import SessionLocal
+
+    try:
+        with SessionLocal() as db:
+            run = db.get(DuplicateRun, run_id)
+            if run is not None and run.status == DuplicateRunStatus.running:
+                _execute_duplicate_search(db, run)
+            else:
+                if _LOCK.locked():
+                    _LOCK.release()
+    except Exception:
+        # _execute_duplicate_search records normal failures on the run.  This
+        # guard is for failures before a usable session/run could be loaded.
+        if _LOCK.locked():
+            _LOCK.release()
+        raise
 
 
 def canonical_receipt(receipts: list[Receipt]) -> Receipt:
@@ -368,6 +495,7 @@ def _receipt_snapshot(receipt: Receipt) -> dict[str, Any]:
             {
                 "name": i.name,
                 "barcode": i.barcode,
+                "product_code": i.product_code,
                 "category_raw": i.category_raw,
                 "category_id": i.category_id,
                 "quantity": float(i.quantity),
@@ -395,6 +523,7 @@ def _clone_item(item: ReceiptItem) -> ReceiptItem:
     return ReceiptItem(
         name=item.name,
         barcode=item.barcode,
+        product_code=item.product_code,
         category_raw=item.category_raw,
         category_id=item.category_id,
         quantity=item.quantity,
@@ -432,6 +561,7 @@ def _item_summary(item: ReceiptItem, receipt: Receipt | None = None) -> dict[str
         "total_price": float(item.total_price),
         "discount": float(item.discount or 0),
         "barcode": item.barcode,
+        "product_code": item.product_code,
         "category_id": item.category_id,
         "product_url": item.product_url,
         "product_image_url": item.product_image_url,
@@ -453,6 +583,26 @@ def _receipt_field_source(receipt: Receipt, field: str) -> dict[str, Any]:
         "store_code": receipt.store_code,
         "value": _json_value(getattr(receipt, field)),
     }
+
+
+def _materialize_canonical_photo(receipt: Receipt) -> None:
+    """Give the merged receipt its own stable photo file.
+
+    A source photo is normally named after the source receipt ID. Keeping that
+    filename happened to work until the source row/file was cleaned up, after
+    which the visible canonical receipt had a dangling image reference.
+    """
+    if not receipt.photo_filename:
+        return
+    source = PHOTO_DIR / receipt.photo_filename
+    if not source.is_file():
+        return
+    suffix = source.suffix.lower() or ".jpg"
+    target = PHOTO_DIR / f"{receipt.id}{suffix}"
+    if source != target and not target.exists():
+        PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    receipt.photo_filename = target.name
 
 
 def _field_differs(sources: list[dict[str, Any]]) -> bool:
@@ -524,6 +674,7 @@ def _merge_item_fields(target: ReceiptItem, source: ReceiptItem, *, include_mone
     changed: list[str] = []
     fields = [
         "barcode",
+        "product_code",
         "category_raw",
         "category_id",
         "unit",
@@ -611,6 +762,7 @@ def _apply_item_merge(
 
     target.name = name_item.name.strip().rstrip(" .,;:")
     target.barcode = barcode_item.barcode
+    target.product_code = identity_item.product_code or barcode_item.product_code
     target.category_raw = identity_item.category_raw
     target.category_id = identity_item.category_id
     target.product_url = identity_item.product_url
@@ -638,6 +790,7 @@ def _apply_item_merge(
         "total_price",
         "discount",
         "barcode",
+        "product_code",
         "category_id",
         "product_url",
         "product_image_url",
@@ -825,6 +978,7 @@ def merge_group(db: Session, group_id: str, *, choices: dict[str, Any] | None = 
             "store_code": receipt.store_code,
             "external_id": receipt.external_id,
             "receipt_url": receipt.receipt_url,
+            "photo_filename": receipt.photo_filename,
         })
         raw_sources[receipt.id] = receipt.raw or {}
         if receipt.id != canonical.id:
@@ -842,6 +996,7 @@ def merge_group(db: Session, group_id: str, *, choices: dict[str, Any] | None = 
         "field_provenance": provenance,
         "merge_plan": build_merge_plan(db, group),
     }
+    _materialize_canonical_photo(canonical)
     group.status = DuplicateStatus.auto_merged
     group.canonical_receipt_id = canonical.id
     group.merged_at = _now()
@@ -891,6 +1046,7 @@ def rollback_group(db: Session, group_id: str) -> DuplicateGroup:
             ReceiptItem(
                 name=i["name"],
                 barcode=i["barcode"],
+                product_code=i.get("product_code"),
                 category_raw=i["category_raw"],
                 category_id=i["category_id"],
                 quantity=Decimal(str(i["quantity"])),

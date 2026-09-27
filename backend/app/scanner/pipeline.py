@@ -8,11 +8,13 @@ the thin layer that supplies the AI callable and persists the outcome.
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import datetime as dt
 import hashlib
 import re
 import logging
+import time
 from typing import Awaitable, Callable
 
 from app.adapters.base import NormalizedItem, NormalizedReceipt
@@ -26,7 +28,42 @@ from app.scanner.templates import identify_template, parse_with_template
 
 logger = logging.getLogger(__name__)
 
-AiOcr = Callable[[], Awaitable[dict | None]]
+
+@dataclasses.dataclass
+class AiReading:
+    """A vision stage result plus which AI step produced it.
+
+    The stage is passed in as a coroutine factory, so this is how the model's
+    identity reaches the scan journal without the pipeline importing
+    app.services.ai. A stage that returns a bare dict (a test, or a caller that
+    does not care) is accepted too.
+    """
+    data: dict | None
+    service: str = ""
+    model: str = ""
+    steps: list[str] = dataclasses.field(default_factory=list)
+    #: One row per route step spent — see app.services.ai.AiAnswer.attempts.
+    attempts: list[dict] = dataclasses.field(default_factory=list)
+
+
+AiOcr = Callable[[], Awaitable["AiReading | dict | None"]]
+
+
+@dataclasses.dataclass
+class StageRun:
+    """What one stage of the pipeline did, and what it cost.
+
+    Kept per scan so a single receipt can be read back as "the QR was found in
+    the blue channel of frame 2 in 0.4s, the templates matched nothing, and
+    Gemini then read it for 1.2k tokens" — which is the only way to tell whether
+    a photo was expensive because of the photo or because of the route.
+    """
+    stage: str                 # qr | tax_cabinet | ocr | template:<code> | generic | ai
+    outcome: str               # ok | draft | none | skip | fail
+    detail: str = ""           # human-readable, shown as-is in both UIs
+    ms: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
 
 Method = str  # "qr" | "tax_cabinet" | "template:<code>" | "generic" | "ai" | "none"
 
@@ -42,6 +79,15 @@ class ScanOutcome:
     reconciliation: Reconciliation | None = None
     fiscal: FiscalQr | None = None
     ocr_available: bool = False
+    # Which AI step read the photo, when one did: "Розпізнано AI: <service> /
+    # <model>" in both UIs, and the anchor the "stronger AI" action escalates
+    # from. Empty for every non-AI method.
+    ai_service: str = ""
+    ai_model: str = ""
+    # Every route step this run spent, the successful one last.
+    ai_steps: list[str] = dataclasses.field(default_factory=list)
+    # Stage-by-stage record of this run (see StageRun).
+    trace: list[StageRun] = dataclasses.field(default_factory=list)
     # fiscal_qr.QR_NONE | QR_UNREADABLE | QR_DECODED — what the photo's QR did.
     qr_state: str = fiscal_qr_module.QR_NONE
     # Set when the QR named a ДПС document that is already on file: the run
@@ -144,6 +190,7 @@ async def scan_receipt_bytes(
     fiscal_override: FiscalQr | None = None,
     ai_first: bool = False,
     known_receipt: "Callable[[FiscalQr], str | None] | None" = None,
+    qr_scan: "object | None" = None,
 ) -> ScanOutcome:
     outcome = ScanOutcome()
     low_candidate: tuple[Method, NormalizedReceipt, Reconciliation] | None = None
@@ -152,7 +199,20 @@ async def scan_receipt_bytes(
     # Always read the image's own QR first, even when the caller supplies one:
     # the QR is the authoritative source, so every run gets a fresh chance at it
     # and `qr_state` keeps describing this image rather than the caller's hint.
-    qr = scan_qr(image)
+    # The exception is a caller replaying a finished scan (the user asking for a
+    # stronger model): the ladder already ran over these exact bytes, and
+    # running it again would cost seconds to reach the same verdict.
+    if qr_scan is not None:
+        qr = qr_scan
+        outcome.trace.append(StageRun("qr", _qr_outcome(qr), "вердикт попереднього проходу"))
+    else:
+        started = time.monotonic()
+        # QR decoding performs image transforms synchronously.  This pipeline is
+        # called from an async upload endpoint, so keep the CPU-bound ladder off
+        # the event-loop thread.
+        qr = await asyncio.to_thread(scan_qr, image)
+        outcome.trace.append(StageRun("qr", _qr_outcome(qr), _qr_detail(qr),
+                                      ms=int((time.monotonic() - started) * 1000)))
     fiscal, outcome.qr_state = qr.fiscal, qr.state
     if qr.channel:
         # Worth saying: the code was only readable once the photo was split into
@@ -179,7 +239,12 @@ async def scan_receipt_bytes(
             outcome.notes.append(f"already filed as receipt {already}")
             return outcome
         if enable_tax_cabinet:
+            started = time.monotonic()
             enriched = await tax_cabinet.fetch_structured(fiscal, api_token=tax_cabinet_token)
+            outcome.trace.append(StageRun(
+                "tax_cabinet", "ok" if enriched is not None else "none",
+                "документ ДПС отримано" if enriched is not None else "ДПС не віддала документ",
+                ms=int((time.monotonic() - started) * 1000)))
             if enriched is not None:
                 enriched = _finalize(enriched, fiscal, image)
                 rec = reconcile(enriched)
@@ -198,12 +263,21 @@ async def scan_receipt_bytes(
     net = None
     if ai_first:
         outcome.notes.append("ai_first: local OCR/templates skipped")
+        outcome.trace.append(StageRun("ocr", "skip", "на вимогу користувача — одразу AI"))
     else:
+        started = time.monotonic()
         try:
-            ocr_text = run_ocr(image).text
+            # Local OCR may invoke a native OCR engine and can take seconds on a
+            # large receipt.  Do not let it stall unrelated HTTP requests.
+            ocr_text = (await asyncio.to_thread(run_ocr, image)).text
             outcome.ocr_available = True
+            outcome.trace.append(StageRun(
+                "ocr", "ok" if ocr_text.strip() else "none",
+                f"{len(ocr_text.split())} слів" if ocr_text.strip() else "порожній текст",
+                ms=int((time.monotonic() - started) * 1000)))
         except OcrUnavailable as exc:
             outcome.notes.append(f"local OCR unavailable: {exc}")
+            outcome.trace.append(StageRun("ocr", "skip", f"локальний OCR недоступний: {exc}"))
 
         net = networks.identify(ocr_text) if ocr_text else None
         if net is not None:
@@ -214,21 +288,31 @@ async def scan_receipt_bytes(
         if collapsed_view:
             outcome.notes.append("receipt view is collapsed and hides item lines")
         spec = identify_template(ocr_text)
+        if spec is None:
+            outcome.trace.append(StageRun("template", "none", "жоден шаблон не підійшов"))
         if spec is not None:
             outcome.notes.append(f"matched template {spec.code}")
             parsed = parse_with_template(spec, ocr_text)
             parsed = _finalize(parsed, fiscal, image)
             rec = reconcile(parsed)
+            outcome.trace.append(StageRun(
+                f"template:{spec.code}", "ok" if rec.ok and not collapsed_view else "draft",
+                f"{len(parsed.items)} позицій, {rec.reason or 'сходиться'}"))
             if rec.ok and not collapsed_view:
                 return _done(outcome, f"template:{spec.code}", "high",
                              parsed, rec)
             low_candidate = _better(low_candidate, (f"template:{spec.code}", parsed, rec))
 
         drafted = generic.parse_generic(ocr_text)
+        if drafted is None:
+            outcome.trace.append(StageRun("generic", "none", "текст не розібрано"))
         if drafted is not None:
             _stamp_network(drafted, net)
             drafted = _finalize(drafted, fiscal, image)
             rec = reconcile(drafted)
+            outcome.trace.append(StageRun(
+                "generic", "ok" if rec.ok and not collapsed_view else "draft",
+                f"{len(drafted.items)} позицій, {rec.reason or 'сходиться'}"))
             if rec.ok and not collapsed_view:
                 return _done(outcome, "generic", "high",
                              drafted, rec)
@@ -237,10 +321,36 @@ async def scan_receipt_bytes(
     # --- Stage 4: AI vision (last resort) --------------------------------
     if ai_ocr is not None:
         try:
-            data = await ai_ocr()
+            reading = await ai_ocr()
         except Exception as exc:  # noqa: BLE001
             outcome.notes.append(f"AI OCR failed: {exc}")
-            data = None
+            reading = None
+        if isinstance(reading, dict) or reading is None:
+            reading = AiReading(reading)
+        data = reading.data
+        outcome.ai_service, outcome.ai_model = reading.service, reading.model
+        outcome.ai_steps = list(reading.steps)
+        for attempt in reading.attempts:
+            outcome.trace.append(StageRun(
+                "ai", "ok" if attempt.get("ok") else "fail",
+                f"{attempt.get('service', '')} / {attempt.get('model', '')}"
+                + (f" — {attempt['error']}" if attempt.get("error") else ""),
+                ms=int(attempt.get("ms") or 0),
+                tokens_in=int(attempt.get("tokens_in") or 0),
+                tokens_out=int(attempt.get("tokens_out") or 0)))
+        if not reading.attempts:
+            # A stage that reports no per-step metrics (a bare dict, or a route
+            # that never got to call anything) still has to appear in the trace,
+            # or the record reads as if AI was never tried at all.
+            outcome.trace.append(StageRun(
+                "ai", "ok" if data else "fail",
+                f"{reading.service} / {reading.model}".strip(" /")
+                or "жоден маршрут AI не відпрацював"))
+        if len(reading.steps) > 1:
+            # Say so: a second model was paid for because the first came back
+            # with something objectively broken, and that is worth reading in
+            # the journal when tuning the route.
+            outcome.notes.append("AI route: " + " → ".join(reading.steps))
         ai_receipt = _receipt_from_ai(data) if data else None
         if ai_receipt is not None:
             _stamp_network(ai_receipt, net)
@@ -268,6 +378,28 @@ async def scan_receipt_bytes(
         _stamp_network(receipt, net)
         return _done(outcome, method, "low", _finalize(receipt, fiscal, image), rec)
     return outcome
+
+
+def _qr_outcome(qr) -> str:
+    return {fiscal_qr_module.QR_DECODED: "ok",
+            fiscal_qr_module.QR_UNREADABLE: "draft"}.get(qr.state, "none")
+
+
+def _qr_detail(qr) -> str:
+    """"zxing · roi_max_rgb · кадр 2" — which rung of the ladder paid off.
+
+    The point of recording it per receipt is that the ladder is ordered by
+    expected value, and only real receipts can say whether that order is right.
+    """
+    if qr.state != fiscal_qr_module.QR_DECODED:
+        return ("код видно, але не читається" if qr.state == fiscal_qr_module.QR_UNREADABLE
+                else "коду не знайдено")
+    parts = [qr.decoder or "?", qr.variant or "original"]
+    if qr.image_index:
+        parts.append(f"кадр {qr.image_index + 1}")
+    if qr.channel:
+        parts.append(f"{qr.channel} канал")
+    return " · ".join(parts)
 
 
 def _vision_doubts(receipt: NormalizedReceipt, rec, ocr_text: str | None) -> list[str]:

@@ -114,7 +114,7 @@ def rectify(arr, quad, size: int = ROI_SIZE, margin: float = ROI_MARGIN):
     return cv2.copyMakeBorder(warped, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
 
 
-def _renderings(arr, prefix: str, channel: str = "") -> Iterator[Variant]:
+def _renderings(arr, prefix: str, channel: str = "", brief: bool = False) -> Iterator[Variant]:
     """The contrast ladder for one crop, cheapest first.
 
     Thermal paper under room light gives a washed-out low-contrast code (CLAHE,
@@ -132,8 +132,12 @@ def _renderings(arr, prefix: str, channel: str = "") -> Iterator[Variant]:
     yield Variant(f"{prefix}_clahe", equalized, channel)
     yield Variant(f"{prefix}_otsu", _otsu(arr), channel)
     yield Variant(f"{prefix}_clahe_otsu", _otsu(equalized), channel)
+    yield Variant(f"{prefix}_adaptive_gauss_31", cv2.adaptiveThreshold(
+        arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10), channel)
+    if brief:
+        return
     yield Variant(f"{prefix}_unsharp", _unsharp(arr), channel)
-    for block, const in ((31, 10), (15, 5)):
+    for block, const in ((15, 5),):
         yield Variant(f"{prefix}_adaptive_gauss_{block}", cv2.adaptiveThreshold(
             arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, const), channel)
     yield Variant(f"{prefix}_adaptive_mean_31", cv2.adaptiveThreshold(
@@ -313,6 +317,26 @@ class Photo:
             return None
         return np.max(colour, axis=2)
 
+    def is_coloured(self) -> bool:
+        """Whether splitting this frame by colour can tell us anything new.
+
+        A grayscale scan, a black-and-white screenshot or a photo of plain
+        thermal paper has three identical channels, so the whole colour stage
+        would redo the grayscale one six times over.
+
+        Measured on a *patch* of the frame, not its average: a stamp covers a
+        few percent of a receipt, and any average over all that white paper
+        would call the photo neutral and skip the one stage that reads it.
+        """
+        import numpy as np
+
+        colour = self.colour
+        if colour is None or colour.ndim != 3:
+            return False
+        sample = colour[::4, ::4].astype(np.int16)
+        spread = sample.max(axis=2) - sample.min(axis=2)
+        return float((spread > 25).mean()) >= 0.002
+
     def located(self) -> bool:
         """QR present in this frame, on evidence strong enough to tell the user
         to re-shoot it rather than to say there is no code here (§9)."""
@@ -356,7 +380,9 @@ class Photo:
 
         # Nothing located, or located and still unread: the whole frame, re-lit.
         arr = self.gray
-        yield from _renderings(_clahe(arr), "full_clahe")
+        # Whole-frame work stays brief: at 12 MP each adaptive threshold costs
+        # more than the entire crop ladder, and the crop is where codes are won.
+        yield from _renderings(_clahe(arr), "full_clahe", brief=True)
         height = arr.shape[0]
         footer = arr[height // 2:, :]
         if footer.size:
@@ -397,31 +423,32 @@ class Photo:
     def _channel_variants(self) -> Iterator[Variant]:
         """The photo split by colour, for a code with a stamp across it.
 
-        On the crop when the code was located, on the full frame otherwise —
-        the same ladder either way, since the ink is what is being worked
-        around, not the framing.
+        Each plane is tried whole and then again as a crop — and the crop is
+        located *on that plane*, not on the grayscale quad, because ink that
+        blinds the decoder blinds the detector with it: on a stamped receipt
+        grayscale often yields no quad at all, or one off to the side.
         """
         import cv2
 
         colour = self.colour
-        if colour is None or colour.ndim != 3:
+        if colour is None or colour.ndim != 3 or not self.is_coloured():
             return
-        renderings: list[tuple[str, str, Any]] = [
+        planes: list[tuple[str, str, Any]] = [
             (name, name, colour[:, :, index]) for index, name in enumerate(_CHANNELS)
         ]
         lightest = self.max_rgb()
         if lightest is not None:
-            renderings.append(("max_rgb", MAX_RGB, lightest))
-        renderings.append(("hsv_v", LUMA, cv2.cvtColor(colour, cv2.COLOR_BGR2HSV)[:, :, 2]))
-        renderings.append(("lab_l", LUMA, cv2.cvtColor(colour, cv2.COLOR_BGR2LAB)[:, :, 0]))
+            planes.append(("max_rgb", MAX_RGB, lightest))
+        planes.append(("hsv_v", LUMA, cv2.cvtColor(colour, cv2.COLOR_BGR2HSV)[:, :, 2]))
+        planes.append(("lab_l", LUMA, cv2.cvtColor(colour, cv2.COLOR_BGR2LAB)[:, :, 0]))
 
-        quad = self.quads[0] if self.quads else None
-        for label, channel, plane in renderings:
+        fallback = self.quads[0] if self.quads else None
+        for label, channel, plane in planes:
+            equalized = _clahe(plane)
+            yield Variant(label, plane, channel)
+            yield Variant(f"{label}_clahe", equalized, channel)
+            yield Variant(f"{label}_clahe_otsu", _otsu(equalized), channel)
+            quad = next(iter(decoders.locate(equalized)), fallback)
             if quad is not None:
-                roi = rectify(plane, quad)
-                yield from _renderings(roi, f"roi_{label}", channel)
-            else:
-                yield Variant(label, plane, channel)
-                equalized = _clahe(plane)
-                yield Variant(f"{label}_clahe", equalized, channel)
-                yield Variant(f"{label}_clahe_otsu", _otsu(equalized), channel)
+                yield from _renderings(rectify(plane, quad), f"roi_{label}", channel,
+                                       brief=True)

@@ -15,7 +15,9 @@ const router = createRouter({
       props: true,
     },
     { path: '/receipts', name: 'receipts', component: () => import('@/views/ReceiptsView.vue') },
-    { path: '/products', name: 'products', component: () => import('@/views/ProductsView.vue') },
+    { path: '/products', redirect: '/products/live' },
+    { path: '/products/live', name: 'products-live', component: () => import('@/views/ProductsView.vue') },
+    { path: '/products/history', name: 'products-history', component: () => import('@/views/ProductsView.vue') },
     { path: '/shopping-list', name: 'shopping-list', component: () => import('@/views/ShoppingListView.vue') },
     { path: '/categories', name: 'categories', component: () => import('@/views/CategoriesView.vue') },
     {
@@ -24,8 +26,20 @@ const router = createRouter({
       component: () => import('@/views/StoreCategoryView.vue'),
     },
     { path: '/warranties', name: 'warranties', component: () => import('@/views/WarrantiesView.vue') },
+    {
+      path: '/bank-transactions',
+      name: 'bank-transactions',
+      component: () => import('@/views/BankTransactionsView.vue'),
+    },
+    {
+      path: '/bank-transactions/rules',
+      name: 'bank-transaction-rules',
+      component: () => import('@/views/BankTransactionRulesView.vue'),
+    },
     { path: '/inbox', name: 'inbox', component: () => import('@/views/InboxView.vue') },
     { path: '/duplicates', name: 'duplicates', component: () => import('@/views/DuplicatesView.vue') },
+    { path: '/logs', name: 'logs', component: () => import('@/views/LogsView.vue') },
+    { path: '/raw-responses', name: 'raw-responses', component: () => import('@/views/RawResponsesView.vue') },
     // Settings is one page per sidebar entry: `group` decides which sections
     // render, and the page's own tree navigates inside that group.
     { path: '/settings', redirect: '/settings/ai-providers' },

@@ -198,3 +198,128 @@ def test_reset_endpoint_clears_everything(client):
     assert r.status_code == 200, r.text
     assert r.json() == {"aliases_cleared": 1, "items_cleared": 1}
     assert client.get("/api/categories/stats").json()["classified_names"] == 0
+
+
+def test_browse_category_items_groups_by_normalized_name(client):
+    other = _mk(client, "Інше")
+
+    db = client._session()
+    store = models.Store(code="s1", name="S1", auth_type=models.AuthType.manual)
+    acc = models.Account(store=store, label="A")
+    rec = models.Receipt(account=acc, store_code="s1", external_id="e1",
+                         purchased_at=dt.datetime(2026, 9, 1), total_amount=1)
+    rec.items = [
+        models.ReceiptItem(name="Корм Felix 1кг", total_price=1, category_id=other["id"]),
+        # Same product, different casing/spacing — must collapse into one row.
+        models.ReceiptItem(name="корм  felix 1кг", total_price=1, category_id=other["id"],
+                           product_image_url="/api/product-images/felix.jpg"),
+        models.ReceiptItem(name="Сигарети XYZ", total_price=1, category_id=other["id"]),
+    ]
+    db.add_all([store, acc, rec])
+    db.add(models.ProductCategory(normalized_name="сигарети xyz", category_id=other["id"],
+                                  source=models.ProductCategorySource.user, confidence=1.0))
+    db.commit()
+    rec_id = rec.id
+    db.close()
+
+    r = client.get(f"/api/categories/{other['id']}/items")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_items"] == 3
+    assert body["total_names"] == 2
+    by_norm = {n["normalized_name"]: n for n in body["names"]}
+    from app.services.text import normalize_name
+    felix_norm = normalize_name("Корм Felix 1кг")
+    cig_norm = normalize_name("Сигарети XYZ")
+    assert by_norm[felix_norm]["count"] == 2
+    assert by_norm[felix_norm]["display_name"] in ("Корм Felix 1кг", "корм  felix 1кг")
+    # Two occurrences share this normalized name — the one with a photo wins
+    # as the example, even though it isn't the only match.
+    assert by_norm[felix_norm]["example_image_url"] == "/api/product-images/felix.jpg"
+    assert by_norm[felix_norm]["example_receipt_id"] == rec_id
+    assert by_norm[cig_norm]["example_image_url"] is None
+    assert by_norm[cig_norm]["example_receipt_id"] == rec_id
+    assert by_norm[cig_norm]["source"] == "user"
+
+
+def test_reassign_category_items_moves_items_and_creates_sticky_alias(client):
+    other = _mk(client, "Інше")
+    pets = _mk(client, "Товари для тварин")
+
+    db = client._session()
+    store = models.Store(code="s1", name="S1", auth_type=models.AuthType.manual)
+    acc = models.Account(store=store, label="A")
+    rec = models.Receipt(account=acc, store_code="s1", external_id="e1",
+                         purchased_at=dt.datetime(2026, 9, 1), total_amount=1)
+    rec.items = [
+        models.ReceiptItem(name="Корм Felix 1кг", total_price=1, category_id=other["id"]),
+        models.ReceiptItem(name="Корм Felix 1кг", total_price=1, category_id=other["id"]),
+        models.ReceiptItem(name="Сигарети XYZ", total_price=1, category_id=other["id"]),
+    ]
+    db.add_all([store, acc, rec])
+    db.commit()
+    db.close()
+
+    from app.services.text import normalize_name
+    felix_norm = normalize_name("Корм Felix 1кг")
+    r = client.post("/api/categories/items/reassign", json={
+        "category_id": other["id"],
+        "normalized_names": [felix_norm],
+        "target_category_id": pets["id"],
+    })
+    assert r.status_code == 200, r.text
+    assert r.json() == {"names": 1, "items_moved": 2}
+
+    # Moved out of "Інше" ...
+    left = client.get(f"/api/categories/{other['id']}/items").json()
+    assert left["total_items"] == 1
+    assert left["names"][0]["normalized_name"] == normalize_name("Сигарети XYZ")
+
+    # ... and into "Товари для тварин", as a sticky user alias.
+    arrived = client.get(f"/api/categories/{pets['id']}/items").json()
+    assert arrived["total_items"] == 2
+    assert arrived["names"][0]["source"] == "user"
+
+    db = client._session()
+    alias = db.get(models.ProductCategory, felix_norm)
+    assert alias.category_id == pets["id"]
+    assert alias.source == models.ProductCategorySource.user
+    db.close()
+
+
+def test_manual_prompt_and_apply_include_other_catch_all(client):
+    """The include_other flag round-trips through the query param and the
+    apply payload: a name parked in "Інше" is invisible by default, appears
+    once include_other is asked for, and its sticky "Інше" pick is overridden
+    on apply — same guarantees as categorize.apply_guesses's own tests."""
+    food = _mk(client, "Продукти")
+    other = _mk(client, "Інше")
+    _seed_uncategorised(client, "Дивний товар")
+
+    db = client._session()
+    item = db.query(models.ReceiptItem).filter_by(name="Дивний товар").one()
+    item.category_id = other["id"]
+    db.add(models.ProductCategory(normalized_name="дивний товар", category_id=other["id"],
+                                  source=models.ProductCategorySource.user, confidence=1.0))
+    db.commit()
+    db.close()
+
+    default = client.get("/api/categories/manual-prompt").json()
+    assert default["names"] == []
+
+    prompt = client.get("/api/categories/manual-prompt", params={"include_other": True}).json()
+    assert prompt["names"] == ["дивний товар"]
+
+    r = client.post("/api/categories/manual-apply", json={
+        "result": '{"1": {"category_path": "produkty", "confidence": 0.9}}',
+        "names": prompt["names"],
+        "include_other": True,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json() == {"names": 1, "mapped": 1, "unknown_path": 0, "low_confidence": 0,
+                        "no_guess": 0, "skipped_manual": 0, "items_tagged": 1}
+
+    db = client._session()
+    item = db.query(models.ReceiptItem).filter_by(name="Дивний товар").one()
+    assert item.category_id == food["id"]
+    db.close()

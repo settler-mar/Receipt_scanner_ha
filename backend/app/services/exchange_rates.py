@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
 from decimal import Decimal
 from dataclasses import dataclass
 from typing import Protocol
@@ -61,6 +62,7 @@ class NbuExchangeRateProvider:
 
 
 default_provider = NbuExchangeRateProvider()
+_BACKFILL_LOCK = threading.Lock()
 
 
 def rate_to_uah(currency: str, at: dt.datetime, *, provider: ExchangeRateProvider | None = None) -> Decimal | None:
@@ -94,8 +96,15 @@ def backfill_missing_rates(
         stmt = stmt.limit(limit)
     rows = db.execute(stmt).scalars().all()
     result = ExchangeRateBackfillResult(checked=len(rows))
+    rates: dict[tuple[str, str], Decimal | None] = {}
     for receipt in rows:
-        rate = rate_to_uah(receipt.currency, receipt.purchased_at, provider=provider)
+        # Several receipts commonly share the same currency/date. Resolve each
+        # remote rate once per backfill instead of reopening the HTTP client for
+        # every row (custom providers may not have their own cache).
+        key = ((receipt.currency or "").upper(), as_utc(receipt.purchased_at).strftime("%Y%m%d"))
+        if key not in rates:
+            rates[key] = rate_to_uah(receipt.currency, receipt.purchased_at, provider=provider)
+        rate = rates[key]
         if rate is None:
             result.missing += 1
             continue
@@ -103,3 +112,18 @@ def backfill_missing_rates(
         result.updated += 1
     db.commit()
     return result
+
+
+def reserve_backfill() -> None:
+    if not _BACKFILL_LOCK.acquire(blocking=False):
+        raise RuntimeError("Оновлення курсів уже виконується")
+
+
+def run_backfill_in_background(limit: int | None = None) -> None:
+    from app.db import SessionLocal
+
+    try:
+        with SessionLocal() as db:
+            backfill_missing_rates(db, limit=limit)
+    finally:
+        _BACKFILL_LOCK.release()

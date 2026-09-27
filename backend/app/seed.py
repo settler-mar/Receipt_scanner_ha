@@ -23,9 +23,14 @@ STORES = [
     ("klo", "KLO", AuthType.phone_otp, "azs"),
     ("vencon", "ВЕНКОН", AuthType.phone_password, "tech"),
     ("prom", "Prom.ua", AuthType.phone_password, "other"),
+    ("rozetka", "Rozetka.ua", AuthType.phone_password, "other"),
     ("aliexpress", "AliExpress", AuthType.phone_password, "other"),
     ("brain", "Brain", AuthType.phone_password, "tech"),
     ("eva", "ЄВА", AuthType.phone_otp, "beauty"),
+    ("liki", "Liki.ua", AuthType.phone_password, "pharmacy"),
+    ("tabletki", "Tabletki.ua", AuthType.phone_password, "pharmacy"),
+    ("olx", "OLX", AuthType.phone_password, "other"),
+    ("monobank", "Monobank", AuthType.api_token, "bank"),
 ]
 
 # Starter taxonomy — "Класифікація покупок та витрат". One-off seed; the user
@@ -120,6 +125,7 @@ CATEGORY_TREE: list = [
         "Жіноча гігієна",
         "Декоративна косметика",
         "Парфумерія",
+        "Товари для дорослих",
         "Інші засоби особистої гігієни",
     ]),
     ("Дім та кухня", [
@@ -262,7 +268,23 @@ CATEGORY_TREE: list = [
         "Мережеве обладнання",
     ]),
     ("Здоров'я та аптека", [
-        "Ліки",
+        ("Ліки", [
+            "Застуда, грип та ГРВІ",
+            "Противірусні та імуностимулятори",
+            "Знеболювальні та жарознижувальні",
+            "Кашель та дихальні шляхи",
+            "Ніс, горло та вуха",
+            "Очі",
+            "Травлення та печінка",
+            "Антибіотики та протимікробні",
+            "Серце, судини та тиск",
+            "Алергія та шкіра",
+            "Нервова система та сон",
+            "Суглоби, м'язи та спина",
+            "Нирки та сечостатева система",
+            "Ендокринологія та цукровий діабет",
+            "Жіноче та чоловіче здоров'я",
+        ]),
         "Вітаміни та добавки",
         "Перша допомога",
         "Медичні прилади",

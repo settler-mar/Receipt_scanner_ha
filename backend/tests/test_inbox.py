@@ -130,16 +130,25 @@ def test_scan_is_deleted_together_with_its_stored_image(client, tmp_path):
     assert client.delete(f"/api/inbox/scans/{job_id}").status_code == 404
 
 
-def test_rescan_replaces_the_old_job_instead_of_piling_up(client):
+def test_rescan_keeps_the_same_journal_row(client):
+    """One photo is one row, whatever it took to read it.
+
+    Minting a new id per attempt also broke the Telegram buttons: they carry the
+    id of the row they were sent for, so the second press on «Розпізнати AI»
+    answered "Сканування не знайдено" — the row it named had just been deleted
+    by the first press.
+    """
     job_id = _scan_job(client)
 
     r = client.post(f"/api/inbox/scans/{job_id}/rescan")
     assert r.status_code == 200, r.text
-    new_id = r.json()["scan_job_id"]
-    assert new_id != job_id
+    assert r.json()["scan_job_id"] == job_id
 
     scans = client.get("/api/inbox/scans").json()
-    assert [j["id"] for j in scans] == [new_id]
+    assert [j["id"] for j in scans] == [job_id]
+
+    # And the second press still lands on a row that exists.
+    assert client.post(f"/api/inbox/scans/{job_id}/rescan?ai=true").status_code == 200
 
 
 def test_rescan_carries_forward_a_qr_an_earlier_pass_decoded(client):
@@ -681,3 +690,116 @@ def test_stored_scan_frames_live_on_the_data_volume(tmp_path, monkeypatch):
     assert (tmp_path / "data" / "scan_inputs" / "job-1").read_bytes() == b"frame"
     # Idempotent: nothing left to move on the next start.
     assert inbox.migrate_legacy_scan_inputs() == 0
+
+
+def test_a_scan_records_stage_by_stage_what_it_cost(client, monkeypatch):
+    """Per receipt: which rung of the QR ladder paid off, which local stages ran
+    and what the model spent — the only way to tell an expensive photo from an
+    expensive route."""
+    from app.scanner.fiscal_qr import QR_DECODED, QrScan
+    from app.services import ai
+
+    url = ("https://cabinet.tax.gov.ua/cashregs/check?"
+           "id=55&fn=4001118996&date=20260912&time=101010&sm=42.00")
+    monkeypatch.setattr(
+        "app.scanner.pipeline.scan_qr",
+        lambda _image: QrScan(QR_DECODED, [url], channel="синьому", decoder="zxing",
+                              variant="roi_max_rgb", image_index=1),
+    )
+
+    async def no_cabinet(*_a, **_k):
+        return None
+
+    monkeypatch.setattr("app.scanner.tax_cabinet.fetch_structured", no_cabinet)
+
+    async def fake_ocr(_db, _image, _media="image/jpeg", **_kw):
+        return ai.ReceiptOcr(
+            {"total_amount": 42.0, "items": [{"name": "Кава", "total_price": 42.0}]},
+            service="google", model="gemini-a",
+            attempts=[{"service": "google", "model": "gemini-nano", "ok": False,
+                       "ms": 300, "tokens_in": 100, "tokens_out": 0,
+                       "error": "модель не повернула жодного товару"},
+                      {"service": "google", "model": "gemini-a", "ok": True,
+                       "ms": 900, "tokens_in": 1200, "tokens_out": 80, "error": ""}],
+            steps=["google/gemini-nano", "google/gemini-a"])
+
+    monkeypatch.setattr(ai, "ocr_receipt", fake_ocr)
+
+    response = client.post("/api/inbox/upload", files={
+        "file": ("receipt.png", _png(400, 1400), "image/png")})
+    assert response.status_code == 200
+
+    job = client.get("/api/inbox/scans").json()[0]
+    trace = job["raw_ocr"]["trace"]
+    stages = {step["stage"]: step for step in trace}
+
+    assert stages["qr"]["outcome"] == "ok"
+    # The rung that decoded it, so the ladder can later be reordered by fact.
+    assert "zxing" in stages["qr"]["detail"] and "roi_max_rgb" in stages["qr"]["detail"]
+    assert "кадр 2" in stages["qr"]["detail"]
+    assert stages["tax_cabinet"]["outcome"] == "none"
+
+    ai_steps = [step for step in trace if step["stage"] == "ai"]
+    assert [step["outcome"] for step in ai_steps] == ["fail", "ok"]
+    assert ai_steps[0]["detail"].startswith("google / gemini-nano")
+    assert "не повернула жодного товару" in ai_steps[0]["detail"]
+    assert ai_steps[1]["tokens_in"] == 1200 and ai_steps[1]["ms"] == 900
+
+
+def test_statistics_aggregate_the_traces_into_what_is_worth_tuning(client, monkeypatch):
+    """The numbers that change decisions: how often the free local ladder wins,
+    which rendering wins it, and what each model costs per receipt."""
+    test_a_scan_records_stage_by_stage_what_it_cost(client, monkeypatch)
+
+    stats = client.get("/api/inbox/scans/stats").json()
+
+    assert stats["traced"] >= 1
+    assert stats["qr_states"]["decoded"] >= 1
+    assert stats["qr_variants"]["roi_max_rgb"] >= 1
+    # A run that needed a second model is counted as an escalation, and both
+    # calls are billed to their own model.
+    assert stats["ai_escalated"] >= 1
+    assert stats["ai_models"]["google / gemini-a"]["tokens_in"] >= 1200
+    assert stats["ai_models"]["google / gemini-nano"]["ok"] == 0
+
+
+def test_the_history_records_manual_actions_with_their_time(client, tmp_path):
+    """The user's question is "what happened to my receipt", not "what did the
+    pipeline do" — so an imported XML, a re-scan and an accepted draft are in
+    the same journal as the stages, each with the time it happened."""
+    job_id = _scan_job(client)
+
+    events = client.get("/api/inbox/scans").json()[0]["raw_ocr"]["events"]
+    kinds = [e["kind"] for e in events]
+    assert kinds[0] == "upload" and events[0]["actor"] == "user"
+    assert all(e["ts"] for e in events), "every entry is timed"
+    # The stages of the run that followed are in the same list, as the machine's.
+    assert "qr" in kinds and events[kinds.index("qr")]["actor"] == "auto"
+
+    # A re-scan appends to the same row rather than starting a new one.
+    assert client.post(f"/api/inbox/scans/{job_id}/rescan?ai=true").status_code == 200
+    after = client.get("/api/inbox/scans").json()[0]["raw_ocr"]["events"]
+    rescans = [e for e in after if e["kind"] == "rescan"]
+    assert len(rescans) == 1 and rescans[0]["detail"] == "через AI"
+    assert len(after) > len(events), "the history accumulates, it does not restart"
+
+
+def test_an_imported_xml_is_visible_in_the_receipts_own_history(client):
+    """An import creates the receipt outside the scan pipeline, so without this
+    the journal showed the photo and said nothing about the file that actually
+    produced the receipt."""
+    job_id = _scan_job(client)
+
+    # A file that cannot be read is still something the user did, and the
+    # journal has to say so — that is exactly when it gets looked at.
+    response = client.post(
+        "/api/fiscal-queue/import-response-file",
+        files={"file": ("check.xml", b"<nonsense/>", "text/xml")},
+        data={"scan_job_id": job_id},
+    )
+    assert response.status_code == 400
+
+    events = client.get("/api/inbox/scans").json()[0]["raw_ocr"]["events"]
+    imports = [e for e in events if e["kind"] == "import"]
+    assert any("check.xml" in e["detail"] for e in imports)
+    assert any(e["outcome"] == "fail" for e in imports)

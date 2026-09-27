@@ -79,13 +79,15 @@ async def _tick() -> None:
             if account is None:
                 continue
 
+            capabilities = get_adapter(account.store.code).capabilities
+
             # Manual-entry stores (scanner: receipts are pushed via photo
             # upload, never pulled) have no credential to collect with —
             # calling collect_for_account for them isn't "nothing to do", it's
             # an immediate AdapterError ("Немає токена") that wrongly flips
             # the account to needs_reauth on every single tick. Skip them —
             # there's genuinely nothing for the scheduler to fetch.
-            if not get_adapter(account.store.code).capabilities["receipts"]:
+            if not capabilities["receipts"] and not capabilities["transactions"]:
                 schedule.last_run_at = now
                 schedule.next_run_at = next_cron_run(schedule.cron_expression, now)
                 db.commit()
@@ -100,7 +102,16 @@ async def _tick() -> None:
                 continue
 
             logger.info("Scheduled collection for account %s", account.label)
-            await collect_for_account(db, account, trigger="schedule")
+            if capabilities["transactions"]:
+                from app.services.bank_transactions import collect_transactions_for_account
+
+                try:
+                    await collect_transactions_for_account(db, account, trigger="schedule")
+                except Exception:  # noqa: BLE001 — a bad bank poll must not break the tick loop
+                    db.rollback()
+                    logger.warning("Scheduled bank-transaction poll failed for %s", account.label, exc_info=True)
+            else:
+                await collect_for_account(db, account, trigger="schedule")
 
             schedule.last_run_at = now
             schedule.next_run_at = next_cron_run(schedule.cron_expression, now)
@@ -120,6 +131,55 @@ async def _classify_tick() -> None:
             logger.info("Classified %d new product name(s)", count)
     except Exception:  # noqa: BLE001 — never let this kill the scheduler
         logger.warning("Classification tick failed", exc_info=True)
+    finally:
+        db.close()
+
+
+async def _fiscal_cleanup_tick() -> None:
+    """Close ДПС queue rows whose receipt turned up another way.
+
+    A photo that the QR ladder or AI managed to read leaves its queue row
+    behind; the receipt is already saved, so the row is not something the user
+    can act on — it only inflated the inbox counter. Pure bookkeeping: no
+    request leaves the machine here.
+    """
+    from app.services import fiscal_queue as fiscal_queue_svc
+
+    db = SessionLocal()
+    try:
+        closed = fiscal_queue_svc.close_obsolete(db)
+        if closed:
+            logger.info("Closed %d fiscal queue job(s) already imported elsewhere", closed)
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.warning("Fiscal queue cleanup tick failed", exc_info=True)
+    finally:
+        db.close()
+
+
+async def _shopping_categorize_tick() -> None:
+    """Classify the shopping list automatically once it has been quiet for the
+    configured number of minutes (Settings → «Список покупок»). The service
+    decides whether anything is due; this only owns the schedule."""
+    from app.services.shopping_list import run_auto_categorize
+
+    db = SessionLocal()
+    try:
+        result = await run_auto_categorize(db)
+        if result:
+            logger.info(
+                "Shopping list auto-categorized: checked=%d categorized=%d (dict=%d, ai=%d)",
+                result["checked"], result["categorized"],
+                result["by_dictionary"], result["by_ai"],
+            )
+    except Exception:  # noqa: BLE001 — never let this kill the scheduler
+        db.rollback()
+        logger.warning("Shopping list auto-categorization tick failed", exc_info=True)
+        from app.services import event_log
+
+        event_log.record(db, source="shopping", level=event_log.ERROR,
+                         title="Автоматична класифікація списку покупок не виконалась",
+                         message="Дивись журнал сервера")
     finally:
         db.close()
 
@@ -270,6 +330,27 @@ def start_scheduler() -> None:
     scheduler.add_job(_tick, "interval", minutes=1, id="schedule_tick", replace_existing=True)
     scheduler.add_job(
         _classify_tick, "interval", minutes=10, id="classify_tick", replace_existing=True
+    )
+    scheduler.add_job(
+        _fiscal_cleanup_tick,
+        "interval",
+        minutes=10,
+        # Also right after startup: the queue should be tidy before the user
+        # looks at the inbox counter, not ten minutes later.
+        next_run_time=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=20),
+        id="fiscal_cleanup_tick",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        _shopping_categorize_tick,
+        "interval",
+        minutes=1,
+        id="shopping_categorize_tick",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         _duplicate_tick,

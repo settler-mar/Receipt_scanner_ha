@@ -3,6 +3,19 @@
 Follow `AGENTS.md` first. This file adds Claude-specific guidance for keeping
 sessions short and code changes easy to review.
 
+## Skills, Agents, Playbooks
+
+- Task recipes: `.agents/playbooks/` — the shared source of truth.
+- Skills (`.claude/skills/`) are thin wrappers over them; invoke the matching one
+  instead of improvising: `store-adapter`, `api-endpoint`, `db-change`,
+  `frontend-ui`, `scanner-pipeline`, `project-checks`, `collection-debug`.
+- Subagents (`.claude/agents/`) keep bulk output out of the main context:
+  - `repo-navigator` — "where is X" sweeps; returns file:line, not file dumps.
+  - `checks-runner` — runs pytest / vue-tsc / build, returns pass-fail + failures.
+  - `adapter-scout` — maps a provider payload onto `NormalizedReceipt`.
+  - `change-reviewer` — reviews the diff against `AGENTS.md` before handoff.
+- Edit the playbook when a convention changes; never fork the text into skills.
+
 ## Context Budget
 
 - Start by reading `README.md`, the specific files involved in the request, and

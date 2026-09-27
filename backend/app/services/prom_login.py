@@ -27,6 +27,10 @@ from app.adapters.base import AdapterError
 
 HOME_URL = "https://prom.ua/ua/"
 ORDERS_URL = "https://my.prom.ua/ua/cabinet/user/orders"
+ROZETKA_HOME_URL = "https://rozetka.com.ua/ua/"
+ROZETKA_ORDERS_URL = "https://rozetka.com.ua/ua/cabinet/orders/"
+OLX_HOME_URL = "https://www.olx.ua/uk/"
+OLX_ORDERS_URL = "https://www.olx.ua/uk/delivery/"
 LOGIN_TTL = 10 * 60
 VIEWPORT = {"width": 1400, "height": 1000}
 
@@ -40,6 +44,7 @@ class LoginSession:
     browser: Browser
     context: BrowserContext
     page: Page
+    site: str = "prom"
 
     async def close(self) -> None:
         for step in (self.context.close, self.browser.close, self.playwright.stop):
@@ -221,8 +226,12 @@ _OTP_STRONG_SELECTORS = [
     'input[name*="verification" i]',
     'input[name*="verificationCode" i]',
     'input[id*="otp" i]',
+    'input[name*="code" i]',
+    'input[id*="code" i]',
     'input[aria-label*="code" i]',
     'input[aria-label*="код" i]',
+    'input[placeholder*="код" i]',
+    'input[placeholder*="code" i]',
 ]
 # A row of single-character boxes only counts as an OTP field when there are
 # several of them together.
@@ -255,13 +264,13 @@ async def _otp_inputs(page: Page) -> list:
     return []
 
 
-async def _open_login_form(page: Page, session_id: str | None) -> object:
+async def _open_login_form(page: Page, session_id: str | None, home_url: str, site_name: str) -> object:
     """Land on the homepage and surface the phone field.
 
     The header "Кабінет" button opens a side panel with "Увійти або
     зареєструватись", which opens the Clerk/Rozetka modal. Some layouts open the
     modal straight away, so the field is probed between every step."""
-    await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=90_000)
+    await page.goto(home_url, wait_until="domcontentloaded", timeout=90_000)
     await page.wait_for_timeout(2_000)
     _raise_if_manual_requested(session_id)
 
@@ -269,7 +278,7 @@ async def _open_login_form(page: Page, session_id: str | None) -> object:
         phone = await _find_phone_input(page)
         if phone is not None:
             return phone
-        _set_progress(session_id or "", "opening_login", "Відкриваємо форму входу Prom.ua")
+        _set_progress(session_id or "", "opening_login", f"Відкриваємо форму входу {site_name}")
         await _click_named(page, r"Кабінет|Кабинет|Увійти|Войти")
         await page.wait_for_timeout(800)
         await _click_named(page, r"Увійти або зареєструватись|Войти или зарегистрироваться|Увійти|Войти")
@@ -307,11 +316,11 @@ async def _captcha(page: Page) -> bool:
     return False
 
 
-async def _is_logged_in(page: Page) -> bool:
+async def _is_logged_in(page: Page, orders_url: str, marker: str) -> bool:
     with contextlib.suppress(Exception):
-        await page.goto(ORDERS_URL, wait_until="domcontentloaded", timeout=60_000)
+        await page.goto(orders_url, wait_until="domcontentloaded", timeout=60_000)
         await page.wait_for_timeout(1_500)
-    return "/cabinet/user/orders" in page.url and "sign-in" not in page.url.lower()
+    return marker in page.url and "sign-in" not in page.url.lower()
 
 
 async def _state(context: BrowserContext) -> str:
@@ -364,13 +373,49 @@ async def _fill_otp(page: Page, code: str) -> bool:
     return True
 
 
+async def _submit_phone(page: Page, phone_input) -> bool:
+    """Submit the auth form that owns the phone input before using text fallbacks."""
+    with contextlib.suppress(Exception):
+        form = phone_input.locator("xpath=ancestor::form[1]")
+        submit = form.locator('button[type="submit"], input[type="submit"]')
+        if await submit.count() and await submit.first.is_visible():
+            await submit.first.click(timeout=8_000)
+            return True
+    for root in _page_roots(page):
+        with contextlib.suppress(Exception):
+            submit = root.locator('button[type="submit"], input[type="submit"]')
+            visible = [submit.nth(i) for i in range(await submit.count()) if await submit.nth(i).is_visible()]
+            if visible:
+                await visible[0].click(timeout=8_000)
+                return True
+    return False
+
+
+async def _submit_otp(page: Page) -> bool:
+    """Click the submit control associated with the currently visible OTP field."""
+    inputs = await _otp_inputs(page)
+    if not inputs:
+        return False
+    with contextlib.suppress(Exception):
+        form = inputs[0].locator("xpath=ancestor::form[1]")
+        submit = form.locator('button[type="submit"], input[type="submit"]')
+        if await submit.count() and await submit.first.is_visible():
+            await submit.first.click(timeout=8_000)
+            return True
+    return await _click_named(page, r"Підтвердити|Подтвердить|Продовжити|Продолжить|Увійти|Войти|Continue|Verify")
+
+
 # --------------------------------------------------------------------------- #
 # Public flow                                                                  #
 # --------------------------------------------------------------------------- #
-async def start_login(account_id: str, phone: str, session_id: str | None = None) -> dict:
+async def start_login(account_id: str, phone: str, session_id: str | None = None, *, site: str = "prom") -> dict:
     intl_phone = _to_intl_phone(phone)
     await _cleanup()
     session_id = session_id or secrets.token_urlsafe(24)
+    site_name = {"rozetka": "Rozetka.ua", "olx": "OLX", "prom": "Prom.ua"}.get(site, "Prom.ua")
+    home_url = {"rozetka": ROZETKA_HOME_URL, "olx": OLX_HOME_URL}.get(site, HOME_URL)
+    orders_url = {"rozetka": ROZETKA_ORDERS_URL, "olx": OLX_ORDERS_URL}.get(site, ORDERS_URL)
+    marker = {"rozetka": "/cabinet/orders", "olx": "/delivery/"}.get(site, "/cabinet/user/orders")
     _progress[session_id] = LoginProgress(
         account_id, "starting", "Запускаємо Chromium у контейнері", time.monotonic() + LOGIN_TTL,
     )
@@ -380,8 +425,8 @@ async def start_login(account_id: str, phone: str, session_id: str | None = None
     _progress[session_id].page = page
     saved = False
     try:
-        _set_progress(session_id, "opening_site", "Відкриваємо Prom.ua")
-        phone_input = await _open_login_form(page, session_id)
+        _set_progress(session_id, "opening_site", f"Відкриваємо {site_name}")
+        phone_input = await _open_login_form(page, session_id, home_url, site_name)
         _raise_if_manual_requested(session_id)
         if phone_input is None:
             if await _captcha(page):
@@ -393,7 +438,9 @@ async def start_login(account_id: str, phone: str, session_id: str | None = None
         _raise_if_manual_requested(session_id)
 
         _set_progress(session_id, "submitting_phone", "Натискаємо «Продовжити»")
-        if not await _click_named(page, r"Продовжити|Продолжить|Далі|Дальше|Продовжуй"):
+        if not await _submit_phone(page, phone_input) and not await _click_named(
+            page, r"Продовжити|Продолжить|Далі|Дальше|Продовжуй|Continue|Next"
+        ):
             await phone_input.press("Enter")
 
         # Two possible outcomes after "Продовжити":
@@ -410,13 +457,15 @@ async def start_login(account_id: str, phone: str, session_id: str | None = None
             otp = await _otp_inputs(page)
             if otp:
                 break
-            if "prom.ua" in page.url and "/cabinet/" in page.url and "sign-in" not in page.url.lower():
+            site_host = {"rozetka": "rozetka.com.ua", "olx": "olx.ua"}.get(site, "prom.ua")
+            cabinet_marker = "/delivery/" if site == "olx" else "/cabinet/"
+            if site_host in page.url and cabinet_marker in page.url and "sign-in" not in page.url.lower():
                 break
             await page.wait_for_timeout(700)
 
         if not otp:
             _set_progress(session_id, "checking_login", "Перевіряємо, чи вхід уже завершено")
-            if await _is_logged_in(page):
+            if await _is_logged_in(page, orders_url, marker):
                 state = await _state(context)
                 _set_progress(session_id, "saving_session", "Вхід завершено без SMS — зберігаємо сесію")
                 await context.close()
@@ -429,7 +478,7 @@ async def start_login(account_id: str, phone: str, session_id: str | None = None
             raise AdapterError("Prom.ua: після «Продовжити» не з'явилося ні поле SMS-коду, ні кабінет")
 
         session = LoginSession(
-            session_id, account_id, time.monotonic() + LOGIN_TTL, playwright, browser, context, page,
+            session_id, account_id, time.monotonic() + LOGIN_TTL, playwright, browser, context, page, site,
         )
         await _save_login_session(session)
         saved = True
@@ -440,7 +489,7 @@ async def start_login(account_id: str, phone: str, session_id: str | None = None
         }
     except ManualTakeover:
         session = LoginSession(
-            session_id, account_id, time.monotonic() + LOGIN_TTL, playwright, browser, context, page,
+            session_id, account_id, time.monotonic() + LOGIN_TTL, playwright, browser, context, page, site,
         )
         await _save_login_session(session)
         saved = True
@@ -453,7 +502,7 @@ async def start_login(account_id: str, phone: str, session_id: str | None = None
         _set_progress(session_id, "error", str(exc))
         raise
     except Exception as exc:
-        message = f"Prom.ua: помилка входу ({type(exc).__name__})"
+        message = f"{site_name}: помилка входу ({type(exc).__name__})"
         _set_progress(session_id, "error", message)
         raise AdapterError(message) from exc
     finally:
@@ -472,17 +521,21 @@ async def submit_otp(account_id: str, session_id: str, code: str) -> dict:
     session = await _get(account_id, session_id)
     _set_progress(session_id, "submitting_otp", "Надсилаємо SMS-код")
     if not await _fill_otp(session.page, code):
-        if await _is_logged_in(session.page):
+        orders_url = {"rozetka": ROZETKA_ORDERS_URL, "olx": OLX_ORDERS_URL}.get(session.site, ORDERS_URL)
+        marker = {"rozetka": "/cabinet/orders", "olx": "/delivery/"}.get(session.site, "/cabinet/user/orders")
+        if await _is_logged_in(session.page, orders_url, marker):
             state = await _state(session.context)
             await close_login(session_id, keep_progress=True)
             return {"session_id": session_id, "step": "done", "storage_state": state}
         raise AdapterError("Prom.ua: поле коду більше не доступне — почніть вхід знову")
 
-    await _click_named(session.page, r"Підтвердити|Подтвердить|Продовжити|Продолжить|Увійти|Войти")
+    await _submit_otp(session.page)
     await session.page.wait_for_timeout(3_000)
     if await _captcha(session.page):
         raise AdapterError("Prom.ua показав CAPTCHA. Автоматичний вхід зупинено.")
-    if not await _is_logged_in(session.page):
+    orders_url = {"rozetka": ROZETKA_ORDERS_URL, "olx": OLX_ORDERS_URL}.get(session.site, ORDERS_URL)
+    marker = {"rozetka": "/cabinet/orders", "olx": "/delivery/"}.get(session.site, "/cabinet/user/orders")
+    if not await _is_logged_in(session.page, orders_url, marker):
         raise AdapterError("Prom.ua: код не підтверджено або сесія не створена")
 
     state = await _state(session.context)
@@ -499,7 +552,9 @@ async def check_manual_login(account_id: str, session_id: str) -> dict:
             "session_id": session_id, "step": "manual",
             "message": "Завершіть перевірку у браузері та перевірте ще раз.",
         }
-    if not await _is_logged_in(session.page):
+    orders_url = {"rozetka": ROZETKA_ORDERS_URL, "olx": OLX_ORDERS_URL}.get(session.site, ORDERS_URL)
+    marker = {"rozetka": "/cabinet/orders", "olx": "/delivery/"}.get(session.site, "/cabinet/user/orders")
+    if not await _is_logged_in(session.page, orders_url, marker):
         _set_progress(session_id, "manual", "Вхід ще не підтверджено — продовжуйте у браузері")
         return {
             "session_id": session_id, "step": "manual",

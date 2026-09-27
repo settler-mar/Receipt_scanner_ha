@@ -1,0 +1,18 @@
+---
+description: Core rules for the Receipt Scanner repository
+alwaysApply: true
+---
+
+# Receipt Scanner
+
+- Read `PROJECT_STRUCTURE.md` first, then only the files relevant to the task.
+- Treat `AGENTS.md` as the shared source of truth. Read the matching recipe in
+  `.agents/playbooks/` before changing adapters, APIs, DB, frontend, scanner,
+  debugging, or checks.
+- Keep changes narrow: one feature or bug per patch; no drive-by formatting,
+  renames, or new dependencies.
+- Never expose secrets, cookies, phone numbers, credentials, or receipt data.
+- Never delete, recreate, or rewrite `backend/data` or its backups.
+- Prefer targeted searches and focused tests. Do not read large planning docs,
+  generated folders, APKs, caches, or virtual environments unless required.
+- Report changed files, validation, and blockers briefly; use `path:line`.

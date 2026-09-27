@@ -7,6 +7,7 @@ re-run or deleted from under the user.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 
@@ -19,6 +20,28 @@ logger = logging.getLogger(__name__)
 
 class ScanJobError(RuntimeError):
     """A rescan/delete the caller asked for cannot be carried out."""
+
+
+def run_rescan_batch(job_ids: list[str], *, ai_first: bool = False) -> None:
+    """Run a bulk rescan in a worker thread with an isolated DB session."""
+    from app.db import SessionLocal
+    from app.services import series_scan
+
+    async def _run() -> None:
+        with SessionLocal() as db:
+            for job_id in job_ids:
+                try:
+                    job = db.get(ScanJob, job_id)
+                    if job is None:
+                        continue
+                    if series_scan.is_series(job) and not job.receipt_id:
+                        await series_scan.rescan_series(db, job, ai_first=ai_first)
+                    else:
+                        await rescan_job(db, job_id, ai_first=ai_first)
+                except Exception:  # noqa: BLE001 — one row must not stop the batch
+                    logger.exception("bulk rescan failed for scan %s", job_id)
+
+    asyncio.run(_run())
 
 
 def get_job(db: Session, job_id: str) -> ScanJob:
@@ -121,6 +144,7 @@ def save_draft(db: Session, job_id: str):
     if not draft:
         raise ScanJobError("Для цього сканування немає чернетки")
 
+    record_event(db, job, "draft", detail="чернетку прийнято вручну")
     nr = normalized_from_draft(draft, job_id)
     account = _scanner_account(db)
     duplicate = db.execute(select(Receipt.id).where(
@@ -191,6 +215,8 @@ def attach_receipt(db: Session, job_id: str, receipt_id: str, *, method: str) ->
     if receipt is not None:
         enrich_receipt_from_scan(db, job, receipt)
     db.commit()
+    record_event(db, job, "receipt", outcome="ok", actor="user",
+                 detail=f"чек прикріплено ({method})")
     db.refresh(job)
     return job
 
@@ -204,6 +230,7 @@ def set_archived(db: Session, job_id: str, archived: bool) -> ScanJob:
     job = get_job(db, job_id)
     job.archived_at = dt.datetime.now(dt.timezone.utc) if archived else None
     db.commit()
+    record_event(db, job, "archive", detail="в архів" if archived else "з архіву")
     db.refresh(job)
     return job
 
@@ -232,16 +259,111 @@ def _known_fiscal(job: ScanJob):
     return parse_fiscal_url(str(url)) if url else None
 
 
+#: How many journal entries one scan keeps. A photo re-run a dozen times is
+#: still one receipt, and the oldest attempts stop being interesting once the
+#: newer ones exist.
+EVENT_CAP = 60
+
+
+def record_event(db: Session, job: "ScanJob | str | None", kind: str, *,
+                 detail: str = "", outcome: str = "", ms: int = 0,
+                 tokens_in: int = 0, tokens_out: int = 0, actor: str = "user") -> None:
+    """Append one line to a scan's own history, with the time it happened.
+
+    Everything that touched this receipt goes here, not just the pipeline:
+    pressing "recognise with AI", importing a ДПС XML by hand, accepting a
+    draft. Without the manual half the log answers "what did the machine do"
+    while the user's question is "what happened to my receipt" — and an import
+    that produced the receipt was invisible in it.
+
+    Never raises: a journal entry must not be able to fail an import.
+    """
+    if isinstance(job, str):
+        job = db.get(ScanJob, job)
+    if job is None:
+        return
+    entry = {
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "actor": actor, "kind": kind, "outcome": outcome,
+        "detail": detail[:300], "ms": int(ms),
+        "tokens_in": int(tokens_in), "tokens_out": int(tokens_out),
+    }
+    raw = dict(job.raw_ocr or {})
+    raw["events"] = [*(raw.get("events") or []), entry][-EVENT_CAP:]
+    job.raw_ocr = raw          # reassigned, not mutated: the column is plain JSON
+    try:
+        db.commit()
+    except Exception:  # noqa: BLE001 — logging must never break the action itself
+        logger.warning("could not record scan event %s for %s", kind, job.id, exc_info=True)
+        db.rollback()
+
+
+def recognised_by(job: ScanJob) -> str:
+    """Who read this photo, in the words the user is shown.
+
+    "QR" and "AI: Google Gemini / gemini-…" mean very different things for how
+    far a result can be trusted, so both UIs say which one it was instead of
+    showing the internal method code.
+    """
+    method = (job.method or "").split(" ")[0]
+    if method.startswith("series:"):
+        method = method.split("·", 1)[-1]
+    if method.startswith("template:"):
+        return f"шаблон {method.split(':', 1)[1]}"
+    if method == "ai":
+        step = used_ai_step(job)
+        return f"AI: {step[0]} / {step[1]}" if step else "AI"
+    return {"qr": "QR", "tax_cabinet": "ДПС кабінет",
+            "generic": "локальний розбір"}.get(method, "")
+
+
+def used_ai_step(job: ScanJob) -> tuple[str, str] | None:
+    """The (service, model) pair that last read this photo, if AI did.
+
+    What "спробувати сильнішу AI" escalates from: the next step is looked up by
+    this pair in the route as it stands now, so the user's own ordering decides
+    what "stronger" means.
+    """
+    ai = (job.raw_ocr or {}).get("ai") or {}
+    service, model = str(ai.get("service") or ""), str(ai.get("model") or "")
+    return (service, model) if service and model else None
+
+
+def _known_qr(job: ScanJob):
+    """The QR verdict an earlier pass reached on this exact image.
+
+    Handed back to the pipeline when the user asks for a stronger model: the
+    ladder already ran over these bytes and can only reach the same answer, at
+    the cost of seconds the user is sitting through.
+    """
+    from app.scanner.fiscal_qr import QR_DECODED, QrScan
+
+    raw = job.raw_ocr or {}
+    state = str(raw.get("qr_state") or "")
+    url = raw.get("fiscal_url")
+    if not state:
+        return None
+    return QrScan(state, [str(url)] if url and state == QR_DECODED else [])
+
+
 async def rescan_job(db: Session, job_id: str, *, ai_first: bool = False,
-                     replace: bool = False):
+                     replace: bool = False, escalate: bool = False):
     """Re-run the recognition pipeline over the job's stored image.
 
-    Returns the fresh `UploadResult`. The superseded job is deleted so the scan
-    journal keeps one row per receipt photo instead of growing a retry chain.
+    Returns the fresh `UploadResult`. The run reuses the same journal row: one
+    photo is one row whatever it took to read it, its event history accumulates
+    instead of restarting, and — the reason this changed — the action buttons
+    already sitting in a Telegram thread keep pointing at a row that exists. A
+    rescan that minted a new id left those buttons answering "Сканування не
+    знайдено" on the second press.
 
     The fiscal QR leads every run — it is stage 1 of the pipeline — and a URL an
     earlier pass already decoded is handed back in, so a rerun starts from the
     best QR result any attempt has produced rather than re-deriving it.
+
+    `escalate` is the user asking for the next AI step up: the route resumes
+    after the service+model already spent, and neither the QR ladder nor the
+    step already used is run again.
 
     A job that already produced a receipt needs `replace=True` — an accidental
     click must not silently rewrite saved data. Even then the old receipt is
@@ -258,11 +380,18 @@ async def rescan_job(db: Session, job_id: str, *, ai_first: bool = False,
     if not path.is_file():
         raise ScanJobError("Оригінал зображення не збережено — завантажте фото ще раз")
 
+    record_event(db, job, "rescan",
+                 detail="сильніша AI" if escalate else ("через AI" if ai_first else "повторно"))
     result = await _handle_receipt(
-        db, path.read_bytes(), job.source_filename, "image/jpeg", ai_first=ai_first,
+        db, path.read_bytes(), job.source_filename, "image/jpeg",
+        ai_first=ai_first or escalate,
         fiscal_override=_known_fiscal(job),
+        ai_after=used_ai_step(job) if escalate else None,
+        qr_scan=_known_qr(job) if escalate else None,
+        job=job,
     )
     if result.scan_job_id != job_id:
+        # Defensive: the run is handed this row, so it should come back on it.
         _delete_row(db, get_job(db, job_id))
         db.commit()
 

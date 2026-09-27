@@ -4,7 +4,7 @@ import { RouterLink, useRouter } from 'vue-router'
 import { api, BASE } from '@/lib/api'
 import { useShopSuggestions } from '@/composables/useShopSuggestions'
 import type { Category, Receipt, ReceiptItem } from '@/types/api'
-import { fmtDateTime, isoToKyivInput, kyivInputToISO } from '@/lib/datetime'
+import { fmtDateTime, fmtDate as fmtDateOnly, isoToKyivInput, kyivInputToISO } from '@/lib/datetime'
 import ZoomableImage from '@/components/ZoomableImage.vue'
 
 const props = defineProps<{ id: string }>()
@@ -30,6 +30,31 @@ const categoryOptions = computed(() =>
 )
 
 const loadError = ref('')
+
+const itemsTotal = computed(() =>
+  (receipt.value?.items ?? []).reduce((sum, item) => sum + Number(item.total_price || 0), 0),
+)
+const componentsTotal = computed(() =>
+  (receipt.value?.components ?? []).reduce((sum, component) => sum + Number(component.amount || 0), 0),
+)
+const totalDelta = computed(() => Number((
+  itemsTotal.value + componentsTotal.value + Number(receipt.value?.total_adjustment || 0) - Number(receipt.value?.total_amount || 0)
+).toFixed(2)))
+const hasTotalMismatch = computed(() => Math.abs(totalDelta.value) >= 0.01)
+const recalculatingTotal = ref(false)
+
+async function recalculateReceiptTotal() {
+  if (!receipt.value || recalculatingTotal.value) return
+  recalculatingTotal.value = true
+  try {
+    await api.receipts.update(props.id, { total_amount: Number((itemsTotal.value + componentsTotal.value).toFixed(2)) })
+    await load()
+  } catch (e) {
+    alert((e as Error).message)
+  } finally {
+    recalculatingTotal.value = false
+  }
+}
 
 async function load() {
   // A receipt can be deleted from another tab, or the id can simply be wrong.
@@ -158,6 +183,7 @@ const itemForm = ref({
   total_price: 0,
   discount: 0,
   barcode: '',
+  product_code: '',
   category_id: '' as string,
 })
 
@@ -171,6 +197,7 @@ function startEditItem(it: ReceiptItem) {
     total_price: it.total_price,
     discount: it.discount,
     barcode: it.barcode ?? '',
+    product_code: it.product_code ?? '',
     category_id: it.category_id ?? '',
   }
 }
@@ -187,6 +214,7 @@ async function saveItem() {
       total_price: Number(f.total_price),
       discount: Number(f.discount),
       barcode: f.barcode || null,
+      product_code: f.product_code || null,
       category_id: f.category_id || null,
     })
     editingItemId.value = null
@@ -202,11 +230,136 @@ async function removeItem(itemId: string) {
   await load()
 }
 
+// --- Per-item warranty (manual, no PDF) -------------------------------------
+// Most shops here hand out a stamped paper talon and nothing downloadable, so
+// the warranty on a line is typed in (term + expiry) and the talon itself is
+// attached as a photo — see POST /api/receipts/{id}/items/{id}/files.
+const warrantyItemId = ref<string | null>(null)
+const warrantyItem = computed(
+  () => receipt.value?.items.find((item) => item.id === warrantyItemId.value) ?? null,
+)
+const warrantyForm = ref({ has_warranty: false, warranty_text: '', expires_date: '' })
+const savingWarranty = ref(false)
+const uploadingItemFile = ref(false)
+const itemFileKind = ref<'warranty' | 'photo'>('warranty')
+
+function startWarranty(it: ReceiptItem) {
+  warrantyItemId.value = it.id
+  warrantyForm.value = {
+    has_warranty: it.has_warranty ?? false,
+    warranty_text: it.warranty_text ?? '',
+    expires_date: it.warranty_expires_at ? isoToKyivInput(it.warranty_expires_at).slice(0, 10) : '',
+  }
+}
+
+/** Shortcut buttons: purchase date + N months, the way a talon is usually worded. */
+function setWarrantyMonths(months: number) {
+  if (!receipt.value) return
+  const parts = isoToKyivInput(receipt.value.purchased_at).slice(0, 10).split('-')
+  const end = new Date(
+    Date.UTC(Number(parts[0]), Number(parts[1]) - 1 + months, Number(parts[2])),
+  )
+  warrantyForm.value.expires_date = end.toISOString().slice(0, 10)
+  warrantyForm.value.has_warranty = true
+  if (!warrantyForm.value.warranty_text) warrantyForm.value.warranty_text = `${months} міс.`
+}
+
+async function saveWarranty() {
+  if (!warrantyItemId.value || savingWarranty.value) return
+  savingWarranty.value = true
+  try {
+    const f = warrantyForm.value
+    await api.receipts.updateItem(props.id, warrantyItemId.value, {
+      has_warranty: f.has_warranty,
+      warranty_text: f.warranty_text.trim() || null,
+      // Noon Kyiv, not midnight — the stored instant is UTC and a date-only
+      // talon should read as the same day no matter the offset.
+      warranty_expires_at: f.expires_date ? kyivInputToISO(`${f.expires_date}T12:00`) : null,
+    })
+    await load()
+  } catch (e) {
+    alert((e as Error).message)
+  } finally {
+    savingWarranty.value = false
+  }
+}
+
+async function onItemFileChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file || !warrantyItemId.value) return
+  uploadingItemFile.value = true
+  try {
+    await api.receipts.uploadItemFile(props.id, warrantyItemId.value, file, itemFileKind.value)
+    await load()
+    if (warrantyItem.value) startWarranty(warrantyItem.value)
+  } catch (err) {
+    alert((err as Error).message)
+  } finally {
+    uploadingItemFile.value = false
+    input.value = ''
+  }
+}
+
+const itemFileUrl = ref('')
+
+async function addItemFileByUrl() {
+  const url = itemFileUrl.value.trim()
+  if (!url || !warrantyItemId.value || uploadingItemFile.value) return
+  uploadingItemFile.value = true
+  try {
+    // Бекенд качает картинку себе — ссылка это только способ ввода.
+    await api.receipts.linkItemFile(props.id, warrantyItemId.value, url, itemFileKind.value)
+    itemFileUrl.value = ''
+    await load()
+  } catch (err) {
+    alert((err as Error).message)
+  } finally {
+    uploadingItemFile.value = false
+  }
+}
+
+async function removeItemFile(fileId: string) {
+  if (!warrantyItemId.value || !confirm('Видалити це вкладення?')) return
+  await api.receipts.removeItemFile(props.id, warrantyItemId.value, fileId)
+  await load()
+}
+
+const clarifyingItemId = ref<string | null>(null)
+const clarification = ref('')
+const categorizingItem = ref(false)
+const clarifyingItem = computed(() =>
+  receipt.value?.items.find((item) => item.id === clarifyingItemId.value) ?? null,
+)
+
+function startClarifyItem(item: ReceiptItem) {
+  clarifyingItemId.value = item.id
+  clarification.value = ''
+}
+
+async function categorizeItem() {
+  if (!clarifyingItemId.value || !clarification.value.trim() || categorizingItem.value) return
+  categorizingItem.value = true
+  try {
+    receipt.value = await api.receipts.categorizeItem(
+      props.id,
+      clarifyingItemId.value,
+      clarification.value.trim(),
+    )
+    clarifyingItemId.value = null
+    clarification.value = ''
+  } catch (e) {
+    alert((e as Error).message)
+  } finally {
+    categorizingItem.value = false
+  }
+}
+
 const addingItem = ref(false)
-const newItemForm = ref({ name: '', quantity: 1, unit: '', unit_price: '' as number | '', total_price: 0, discount: 0 })
+const newItemForm = ref({ name: '', product_code: '', quantity: '' as number | '', unit: '', unit_price: '' as number | '', total_price: 0, discount: 0 })
 
 function startAddItem() {
-  newItemForm.value = { name: '', quantity: 1, unit: '', unit_price: '', total_price: 0, discount: 0 }
+  newItemForm.value = { name: '', product_code: '', quantity: '', unit: '', unit_price: '', total_price: 0, discount: 0 }
   addingItem.value = true
 }
 
@@ -216,6 +369,7 @@ async function saveNewItem() {
   try {
     await api.receipts.addItem(props.id, {
       name: f.name,
+      product_code: f.product_code || null,
       quantity: Number(f.quantity),
       unit: f.unit || null,
       unit_price: f.unit_price === '' ? null : Number(f.unit_price),
@@ -381,7 +535,21 @@ async function reparseReceipt() {
       </div>
       <div class="card">
         <div class="stat-label">Сума</div>
-        <div class="stat">{{ fmtMoney(receipt.total_amount, receipt.currency) }}</div>
+        <div class="stat" :class="{ 'receipt-total-warning': hasTotalMismatch }">
+          {{ fmtMoney(receipt.total_amount, receipt.currency) }}
+        </div>
+        <div v-if="hasTotalMismatch" class="receipt-total-warning" style="margin-top: 6px">
+          Позиції: {{ fmtMoney(itemsTotal, receipt.currency) }}
+          (різниця {{ fmtMoney(Math.abs(totalDelta), receipt.currency) }})
+          <button
+            class="secondary"
+            style="margin-top: 8px"
+            :disabled="recalculatingTotal"
+            @click="recalculateReceiptTotal"
+          >
+            {{ recalculatingTotal ? 'Оновлюємо…' : 'Оновити підсумок чека' }}
+          </button>
+        </div>
         <div v-if="fmtExchangeRate()" class="muted" style="margin-top: 4px">{{ fmtExchangeRate() }}</div>
         <div v-if="fmtTotalUah()" class="muted" style="margin-top: 2px">≈ {{ fmtTotalUah() }}</div>
       </div>
@@ -389,6 +557,26 @@ async function reparseReceipt() {
         <div class="stat-label">Знижка</div>
         <div class="stat" :style="receipt.total_discount ? 'color: var(--success)' : ''">
           {{ receipt.total_discount ? fmtMoney(receipt.total_discount, receipt.currency) : '—' }}
+        </div>
+      </div>
+      <div v-if="receipt.total_adjustment" class="card">
+        <div class="stat-label">Коригування чека</div>
+        <div class="stat receipt-total-warning">{{ fmtMoney(receipt.total_adjustment, receipt.currency) }}</div>
+        <div v-if="receipt.adjustment_reason" class="muted" style="margin-top: 4px">
+          {{ receipt.adjustment_reason }}
+        </div>
+      </div>
+      <div v-if="receipt.components?.length" class="card">
+        <div class="stat-label">Компоненти суми</div>
+        <div
+          v-for="component in receipt.components"
+          :key="component.id"
+          class="receipt-component-row"
+        >
+          <span>{{ component.label }}</span>
+          <span :class="component.amount < 0 ? 'receipt-component-discount' : ''">
+            {{ component.amount > 0 ? '+' : '' }}{{ fmtMoney(component.amount, component.currency) }}
+          </span>
         </div>
       </div>
       <div v-if="receipt.bonuses !== null" class="card">
@@ -406,6 +594,10 @@ async function reparseReceipt() {
       <div class="card">
         <div class="stat-label">Адреса</div>
         <div>{{ receipt.shop_address ?? '—' }}</div>
+      </div>
+      <div v-if="receipt.seller_phone" class="card">
+        <div class="stat-label">Телефон продавця</div>
+        <a :href="`tel:${receipt.seller_phone}`">{{ receipt.seller_phone }}</a>
       </div>
       <div class="card">
         <div class="stat-label">Номер чека</div>
@@ -541,10 +733,18 @@ async function reparseReceipt() {
       <h3 style="margin: 0; flex: 1">Товари ({{ receipt.items.length }})</h3>
       <button class="secondary" @click="startAddItem">+ Додати позицію</button>
     </div>
+    <div v-if="hasTotalMismatch" class="receipt-total-warning receipt-total-banner">
+      Сума позицій {{ fmtMoney(itemsTotal, receipt.currency) }} не дорівнює сумі чека
+      {{ fmtMoney(receipt.total_amount, receipt.currency) }}.
+      <button class="secondary" :disabled="recalculatingTotal" @click="recalculateReceiptTotal">
+        {{ recalculatingTotal ? 'Оновлюємо…' : 'Перерахувати суму чека' }}
+      </button>
+    </div>
     <table v-if="receipt.items.length || addingItem">
       <thead>
         <tr>
           <th>Назва</th>
+          <th>Код</th>
           <th>Категорія</th>
           <th>К-сть</th>
           <th>Ціна</th>
@@ -557,6 +757,7 @@ async function reparseReceipt() {
         <tr v-for="it in receipt.items" :key="it.id">
           <template v-if="editingItemId === it.id">
             <td><input v-model="itemForm.name" style="width: 100%" /></td>
+            <td><input v-model="itemForm.product_code" placeholder="код товару" style="width: 100px" /></td>
             <td>
               <select v-model="itemForm.category_id" style="max-width: 160px">
                 <option value="">— без категорії —</option>
@@ -588,9 +789,17 @@ async function reparseReceipt() {
                   <a v-if="it.product_url" :href="it.product_url" target="_blank" rel="noopener noreferrer">{{ it.name }}</a>
                   <span v-else>{{ it.name }}</span>
                   <div v-if="it.merchant_name" class="muted" style="font-size: 12px">{{ it.merchant_name }}</div>
+                  <div v-if="it.has_warranty || it.files?.length" class="muted" style="font-size: 12px; margin-top: 2px">
+                    <span v-if="it.has_warranty">
+                      🛡 {{ it.warranty_text || 'Гарантія' }}
+                      <template v-if="it.warranty_expires_at"> до {{ fmtDateOnly(it.warranty_expires_at) }}</template>
+                    </span>
+                    <span v-if="it.files?.length"> 📎 {{ it.files.length }}</span>
+                  </div>
                 </div>
               </div>
             </td>
+            <td class="muted" style="font-size: 12px; white-space: nowrap">{{ it.product_code ?? it.barcode ?? '—' }}</td>
             <td class="muted" style="font-size: 12px">{{ it.category_path ?? '—' }}</td>
             <td>{{ it.quantity }} {{ it.unit ?? '' }}</td>
             <td>
@@ -606,6 +815,8 @@ async function reparseReceipt() {
               <div v-if="fmtItemUah(it.total_price)" class="muted" style="font-size: 12px">≈ {{ fmtItemUah(it.total_price) }}</div>
             </td>
             <td style="display: flex; gap: 6px">
+              <button class="secondary" @click="startWarranty(it)">Гарантія / фото</button>
+              <button class="secondary" @click="startClarifyItem(it)">Уточнити AI</button>
               <button class="secondary" @click="startEditItem(it)">Редагувати</button>
               <button class="danger" @click="removeItem(it.id)">Видалити</button>
             </td>
@@ -613,7 +824,7 @@ async function reparseReceipt() {
         </tr>
         <tr v-if="addingItem">
           <td><input v-model="newItemForm.name" placeholder="Назва" style="width: 100%" /></td>
-          <td class="muted" style="font-size: 12px">авто</td>
+          <td><input v-model="newItemForm.product_code" placeholder="код" style="width: 100px" /></td>
           <td style="display: flex; gap: 4px">
             <input type="number" step="0.001" v-model.number="newItemForm.quantity" style="width: 70px" />
             <input v-model="newItemForm.unit" placeholder="од." style="width: 60px" />
@@ -627,8 +838,126 @@ async function reparseReceipt() {
           </td>
         </tr>
       </tbody>
+      <tfoot>
+        <tr>
+          <td colspan="6" style="text-align: right"><strong>Разом позицій:</strong></td>
+          <td :class="{ 'receipt-total-warning': hasTotalMismatch }">
+            <strong>{{ fmtMoney(itemsTotal, receipt.currency) }}</strong>
+          </td>
+          <td></td>
+        </tr>
+      </tfoot>
     </table>
     <p v-else class="muted">Товарні позиції для цього чеку відсутні в джерелі.</p>
+
+    <div v-if="warrantyItem" class="card" style="margin-top: 12px">
+      <h4 style="margin-top: 0; margin-bottom: 6px">Гарантія та фото — «{{ warrantyItem.name }}»</h4>
+      <p class="muted" style="margin-top: 0">
+        Для паперового талона PDF не потрібен: впишіть строк і додайте фото талона або товару.
+      </p>
+      <div class="form-row">
+        <label>
+          <input type="checkbox" v-model="warrantyForm.has_warranty" />
+          На гарантії
+        </label>
+      </div>
+      <div class="form-row">
+        <label>Умови (як у талоні)</label>
+        <input v-model="warrantyForm.warranty_text" placeholder="24 міс., сервіс-центр Fozzy" />
+      </div>
+      <div class="form-row">
+        <label>Діє до</label>
+        <input type="date" v-model="warrantyForm.expires_date" />
+      </div>
+      <div class="toolbar" style="margin-top: -4px">
+        <span class="muted">Від дати покупки:</span>
+        <button class="secondary" @click="setWarrantyMonths(12)">12 міс.</button>
+        <button class="secondary" @click="setWarrantyMonths(24)">24 міс.</button>
+        <button class="secondary" @click="setWarrantyMonths(36)">36 міс.</button>
+      </div>
+
+      <div v-if="warrantyItem.files?.length" class="toolbar" style="flex-wrap: wrap">
+        <div v-for="f in warrantyItem.files" :key="f.id" style="text-align: center">
+          <ZoomableImage
+            :src="`${BASE}${f.url}`"
+            :alt="f.kind === 'warranty' ? 'Гарантійний талон' : 'Фото товару'"
+            style="width: 90px; height: 90px; object-fit: cover; border-radius: 6px"
+          />
+          <div class="muted" style="font-size: 11px">
+            {{ f.kind === 'warranty' ? 'талон' : 'товар' }}
+            <a
+              v-if="f.source_url"
+              :href="f.source_url"
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Джерело, звідки завантажено"
+            >🔗</a>
+          </div>
+          <button class="danger" style="font-size: 11px; padding: 2px 6px" @click="removeItemFile(f.id)">
+            Видалити
+          </button>
+        </div>
+      </div>
+
+      <div class="toolbar" style="margin-bottom: 0">
+        <button :disabled="savingWarranty" @click="saveWarranty">
+          {{ savingWarranty ? 'Зберігаємо…' : 'Зберегти гарантію' }}
+        </button>
+        <select v-model="itemFileKind" style="max-width: 170px">
+          <option value="warranty">Фото талона</option>
+          <option value="photo">Фото товару</option>
+        </select>
+        <label class="btn secondary" style="cursor: pointer; display: inline-block">
+          {{ uploadingItemFile ? 'Завантажуємо…' : '+ Додати фото' }}
+          <input
+            type="file"
+            accept="image/*"
+            capture="environment"
+            style="display: none"
+            :disabled="uploadingItemFile"
+            @change="onItemFileChange"
+          />
+        </label>
+        <button class="secondary" @click="warrantyItemId = null">Закрити</button>
+      </div>
+      <div class="form-row" style="margin-top: 8px; margin-bottom: 0">
+        <label>Або посилання на зображення (завантажимо копію до себе)</label>
+        <div style="display: flex; gap: 8px">
+          <input
+            v-model="itemFileUrl"
+            placeholder="https://…/photo.jpg"
+            style="flex: 1"
+            @keydown.enter="addItemFileByUrl"
+          />
+          <button class="secondary" :disabled="!itemFileUrl.trim() || uploadingItemFile" @click="addItemFileByUrl">
+            {{ uploadingItemFile ? 'Завантажуємо…' : 'Додати за посиланням' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="clarifyingItem" class="card" style="margin-top: 12px">
+      <h4 style="margin-top: 0; margin-bottom: 6px">Уточнення для «{{ clarifyingItem.name }}»</h4>
+      <p class="muted" style="margin-top: 0">
+        Назва магазину буде додана автоматично. Опишіть, що це за товар або для чого він потрібен.
+      </p>
+      <textarea
+        v-model="clarification"
+        rows="3"
+        maxlength="1000"
+        placeholder="Наприклад: це автомобільна рідина для омивача скла"
+        style="width: 100%; resize: vertical"
+        @keydown.ctrl.enter="categorizeItem"
+      ></textarea>
+      <div class="toolbar" style="margin-top: 10px; margin-bottom: 0">
+        <button :disabled="!clarification.trim() || categorizingItem" @click="categorizeItem">
+          {{ categorizingItem ? 'Категоризуємо…' : 'Категоризувати' }}
+        </button>
+        <button class="secondary" :disabled="categorizingItem" @click="clarifyingItemId = null">
+          Скасувати
+        </button>
+      </div>
+    </div>
   </template>
   <div v-else class="card">
     <h2 style="margin-top: 0">Чек не знайдено</h2>
@@ -642,3 +971,21 @@ async function reparseReceipt() {
     </div>
   </div>
 </template>
+
+<style scoped>
+.receipt-total-warning {
+  color: var(--danger, #c0392b);
+}
+
+.receipt-total-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 8px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger, #c0392b) 35%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger, #c0392b) 8%, transparent);
+}
+</style>

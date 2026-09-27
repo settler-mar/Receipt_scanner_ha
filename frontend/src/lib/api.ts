@@ -8,6 +8,8 @@ import type {
   AiLogEntry,
   AiModelChoices,
   AiProviderModels,
+  AiPrompt,
+  AiPromptRevision,
   AiSettings,
   AppSetting,
   Category,
@@ -24,6 +26,7 @@ import type {
   DuplicateGroup,
   DuplicateMergeChoices,
   DuplicateRun,
+  Health,
   InboxConfig,
   InboxDocument,
   ScanJob,
@@ -43,13 +46,31 @@ import type {
   ReceiptItem,
   ReceiptItemInput,
   ReceiptList,
+  ReceiptProblemAction,
+  ReceiptProblemBulkResult,
+  RawResponseCleanupResult,
+  RawResponseSettings,
+  RawResponseSummary,
   ShopSuggestion,
+  BankTransaction,
+  BankTransactionSummaryRow,
+  TokenTestResult,
+  BankTransactionRule,
   TagSummary,
   TaxCabinetSettings,
   TelegramSettings,
   TelegramMessageLogList,
   Store,
+  StoreClass,
+  ShoppingSettings,
+  FiscalJob,
+  LogPage,
+  NavBadges,
+  Problems,
+  SavingsReceipt,
   StoreBreakdown,
+  CategoryItems,
+  CategoryItemsReassignResult,
   StoreCategoryItem,
   StoreCategoryMatrix,
   BulkScanOut,
@@ -59,6 +80,7 @@ import type {
   WarrantyProduct,
   WidgetMeta,
   WidgetSnapshot,
+  XmlImportResult,
 } from '@/types/api'
 
 // Keep browser requests on the same origin as the page. In development Vite
@@ -108,8 +130,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
+  health: {
+    get: () => request<Health>('/api/health'),
+  },
   stores: {
     list: () => request<Store[]>('/api/stores'),
+    classes: () => request<StoreClass[]>('/api/stores/classes'),
   },
   accounts: {
     list: () => request<Account[]>('/api/accounts'),
@@ -144,6 +170,7 @@ export const api = {
         body: JSON.stringify({ cart_barcode: cartBarcode, card_barcode: cardBarcode }),
       }),
     logout: (id: string) => request<Account>(`/api/accounts/${id}/logout`, { method: 'POST' }),
+    resetError: (id: string) => request<Account>(`/api/accounts/${id}/reset-error`, { method: 'POST' }),
     oauthStart: (id: string) =>
       request<{ authorize_url: string }>(`/api/accounts/${id}/oauth/start`),
     setToken: (id: string, payload: { access_token: string; extra?: Record<string, unknown> }) =>
@@ -162,9 +189,10 @@ export const api = {
       }),
     // Browser-driven interactive login (headed Chromium with screenshot
     // streaming + manual takeover). `seg` selects the store: 'aliexpress' or
-    // 'prom'. AliExpress passes a password on start; Prom is phone + SMS only.
+    // 'prom', 'rozetka' or 'olx'. AliExpress passes a password on start; marketplace
+    // buyer accounts use the shared RID phone + SMS flow.
     browserLoginStart: (
-      seg: 'aliexpress' | 'prom', id: string, opts: { password?: string; sessionId?: string } = {},
+      seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, opts: { password?: string; sessionId?: string } = {},
     ) =>
       request<AliLoginStep>(`/api/accounts/${id}/${seg}/login/start`, {
         method: 'POST',
@@ -174,39 +202,39 @@ export const api = {
             : { session_id: opts.sessionId },
         ),
       }),
-    browserLoginStatus: (seg: 'aliexpress' | 'prom', id: string, sessionId: string) =>
+    browserLoginStatus: (seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string) =>
       request<AliLoginStep>(`/api/accounts/${id}/${seg}/login/${sessionId}/status`),
-    browserLoginScreenshotUrl: (seg: 'aliexpress' | 'prom', id: string, sessionId: string) =>
+    browserLoginScreenshotUrl: (seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string) =>
       `${BASE}/api/accounts/${id}/${seg}/login/${sessionId}/screenshot`,
-    browserLoginClick: (seg: 'aliexpress' | 'prom', id: string, sessionId: string, x: number, y: number) =>
+    browserLoginClick: (seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string, x: number, y: number) =>
       request<void>(`/api/accounts/${id}/${seg}/login/${sessionId}/click`, {
         method: 'POST', body: JSON.stringify({ x, y }),
       }),
     browserLoginPointer: (
-      seg: 'aliexpress' | 'prom', id: string, sessionId: string,
+      seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string,
       action: 'down' | 'move' | 'up', x: number, y: number,
     ) => request<void>(`/api/accounts/${id}/${seg}/login/${sessionId}/pointer`, {
       method: 'POST', body: JSON.stringify({ action, x, y }),
     }),
-    browserLoginTakeover: (seg: 'aliexpress' | 'prom', id: string, sessionId: string) =>
+    browserLoginTakeover: (seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string) =>
       request<AliLoginStep>(`/api/accounts/${id}/${seg}/login/${sessionId}/takeover`, { method: 'POST' }),
     browserLoginKey: (
-      seg: 'aliexpress' | 'prom', id: string, sessionId: string,
+      seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string,
       payload: { key: string; alt: boolean; ctrl: boolean; meta: boolean; shift: boolean },
     ) => request<void>(`/api/accounts/${id}/${seg}/login/${sessionId}/key`, {
       method: 'POST', body: JSON.stringify(payload),
     }),
-    browserLoginText: (seg: 'aliexpress' | 'prom', id: string, sessionId: string, value: string) =>
+    browserLoginText: (seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string, value: string) =>
       request<void>(`/api/accounts/${id}/${seg}/login/${sessionId}/text`, {
         method: 'POST', body: JSON.stringify({ value }),
       }),
-    browserLoginCheck: (seg: 'aliexpress' | 'prom', id: string, sessionId: string) =>
+    browserLoginCheck: (seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string) =>
       request<AliLoginStep>(`/api/accounts/${id}/${seg}/login/${sessionId}/check`, { method: 'POST' }),
-    browserLoginOtp: (seg: 'aliexpress' | 'prom', id: string, sessionId: string, code: string) =>
+    browserLoginOtp: (seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string, code: string) =>
       request<AliLoginStep>(`/api/accounts/${id}/${seg}/login/otp`, {
         method: 'POST', body: JSON.stringify({ session_id: sessionId, code }),
       }),
-    browserLoginClose: (seg: 'aliexpress' | 'prom', id: string, sessionId: string) =>
+    browserLoginClose: (seg: 'aliexpress' | 'prom' | 'rozetka' | 'olx', id: string, sessionId: string) =>
       request<void>(`/api/accounts/${id}/${seg}/login/close`, {
         method: 'POST', body: JSON.stringify({ session_id: sessionId }),
       }),
@@ -228,6 +256,16 @@ export const api = {
     get: (id: string) => request<Receipt>(`/api/receipts/${id}`),
     update: (id: string, payload: Partial<Receipt>) =>
       request<Receipt>(`/api/receipts/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+    problemAction: (id: string, action: 'ignore' | 'unignore') =>
+      request<{ reconciliation_ignored_at: string | null }>(
+        `/api/receipts/${id}/problem?action=${action}`,
+        { method: 'POST' },
+      ),
+    bulkProblemAction: (receiptIds: string[], action: ReceiptProblemAction) =>
+      request<ReceiptProblemBulkResult>('/api/receipts/bulk/problem-actions', {
+        method: 'POST',
+        body: JSON.stringify({ receipt_ids: receiptIds, action }),
+      }),
     addItem: (receiptId: string, payload: ReceiptItemInput) =>
       request<ReceiptItem>(`/api/receipts/${receiptId}/items`, {
         method: 'POST',
@@ -237,6 +275,11 @@ export const api = {
       request<ReceiptItem>(`/api/receipts/${receiptId}/items/${itemId}`, {
         method: 'PATCH',
         body: JSON.stringify(payload),
+      }),
+    categorizeItem: (receiptId: string, itemId: string, clarification: string) =>
+      request<Receipt>(`/api/receipts/${receiptId}/items/${itemId}/categorize`, {
+        method: 'POST',
+        body: JSON.stringify({ clarification }),
       }),
     removeItem: (receiptId: string, itemId: string) =>
       request<void>(`/api/receipts/${receiptId}/items/${itemId}`, { method: 'DELETE' }),
@@ -287,6 +330,44 @@ export const api = {
       }
       return res.json() as Promise<Receipt>
     },
+    uploadItemFile: async (
+      receiptId: string,
+      itemId: string,
+      file: File,
+      kind: 'warranty' | 'photo' = 'warranty',
+    ) => {
+      const form = new FormData()
+      form.append('file', file)
+      // Not request() — same reason as uploadPhoto above.
+      const res = await fetch(
+        `${BASE}/api/receipts/${receiptId}/items/${itemId}/files?kind=${kind}`,
+        { method: 'POST', body: form },
+      )
+      if (!res.ok) {
+        let detail = res.statusText
+        try {
+          detail = (await res.json()).detail ?? detail
+        } catch {
+          /* ignore */
+        }
+        throw new Error(detail)
+      }
+      return res.json() as Promise<ReceiptItem>
+    },
+    linkItemFile: (
+      receiptId: string,
+      itemId: string,
+      url: string,
+      kind: 'warranty' | 'photo' = 'warranty',
+    ) =>
+      request<ReceiptItem>(`/api/receipts/${receiptId}/items/${itemId}/files/link`, {
+        method: 'POST',
+        body: JSON.stringify({ url, kind }),
+      }),
+    removeItemFile: (receiptId: string, itemId: string, fileId: string) =>
+      request<ReceiptItem>(`/api/receipts/${receiptId}/items/${itemId}/files/${fileId}`, {
+        method: 'DELETE',
+      }),
     removeWarranty: (id: string) => request<Receipt>(`/api/receipts/${id}/warranty`, { method: 'DELETE' }),
     shops: () => request<ShopSuggestion[]>('/api/receipts/shops'),
   },
@@ -299,6 +380,9 @@ export const api = {
       request<TimeseriesPoint[]>(`/api/dashboard/timeseries${qs(params)}`),
     byCategory: (params?: DashboardParams) =>
       request<CategorySpend[]>(`/api/dashboard/by-category${qs(params)}`),
+    savingsReceipts: (
+      params: DashboardParams & { store_code?: string; sort?: string; limit?: string },
+    ) => request<SavingsReceipt[]>(`/api/dashboard/savings/receipts${qs(params)}`),
     storeCategory: (params?: DashboardParams) =>
       request<StoreCategoryMatrix>(`/api/dashboard/store-category${qs(params)}`),
     storeCategoryItems: (params: DashboardParams & { store_code: string; category_id?: string }) =>
@@ -318,6 +402,36 @@ export const api = {
       request<AppSetting<T>>(`/api/settings/${key}`, {
         method: 'PUT',
         body: JSON.stringify({ value }),
+      }),
+  },
+  nav: {
+    badges: () => request<NavBadges>('/api/nav/badges'),
+  },
+  rawResponses: {
+    summary: () => request<RawResponseSummary>('/api/raw-responses/summary'),
+    settings: () => request<RawResponseSettings>('/api/raw-responses/settings'),
+    saveSettings: (payload: RawResponseSettings) =>
+      request<RawResponseSettings>('/api/raw-responses/settings', {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      }),
+    cleanup: (mode: 'all' | 'retention') =>
+      request<RawResponseCleanupResult>('/api/raw-responses/cleanup', {
+        method: 'POST',
+        body: JSON.stringify({ mode }),
+      }),
+  },
+  logs: {
+    list: (params: { source?: string; level?: string; q?: string; limit?: number; offset?: number }) =>
+      request<LogPage>(`/api/logs${qs(params)}`),
+    problems: () => request<Problems>('/api/logs/problems'),
+  },
+  shoppingSettings: {
+    get: () => request<ShoppingSettings>('/api/shopping-list/settings'),
+    save: (value: ShoppingSettings) =>
+      request<ShoppingSettings>('/api/shopping-list/settings', {
+        method: 'PUT',
+        body: JSON.stringify(value),
       }),
   },
   ai: {
@@ -353,6 +467,13 @@ export const api = {
     providerModels: (provider: string) =>
       request<AiProviderModels>(`/api/settings/ai/models/${encodeURIComponent(provider)}`),
     log: () => request<{ entries: AiLogEntry[] }>('/api/settings/ai/log'),
+    prompts: () => request<AiPrompt[]>('/api/settings/prompts'),
+    promptHistory: (key: string) =>
+      request<AiPromptRevision[]>(`/api/settings/prompts/${encodeURIComponent(key)}/history`),
+    savePrompt: (key: string, content: string, note?: string) =>
+      request<AiPrompt>(`/api/settings/prompts/${encodeURIComponent(key)}`, {
+        method: 'PUT', body: JSON.stringify({ content, note: note || null }),
+      }),
   },
   taxCabinet: {
     get: () => request<TaxCabinetSettings>('/api/settings/tax-cabinet'),
@@ -363,25 +484,32 @@ export const api = {
       }),
   },
   fiscalQueue: {
-    list: () => request<any[]>('/api/fiscal-queue'),
+    list: (openOnly = false) => request<FiscalJob[]>(`/api/fiscal-queue?open_only=${openOnly}`),
     add: (url: string) => request<any>('/api/fiscal-queue', { method: 'POST', body: JSON.stringify({ url }) }),
     resolve: (url: string, scanJobId?: string) =>
       request<any>('/api/fiscal-queue/resolve', {
         method: 'POST',
         body: JSON.stringify({ url, scan_job_id: scanJobId ?? null }),
       }),
-    importResponse: (value: string, scanJobId?: string) =>
-      request<any>('/api/fiscal-queue/import-response', {
+    // One entry point for any ДПС XML: with a row named it is checked against
+    // that row, without one it finds its own place (or gets a new inbox row).
+    importResponse: (value: string, scanJobId?: string, fiscalJobId?: string) =>
+      request<XmlImportResult>('/api/fiscal-queue/import-response', {
         method: 'POST',
-        body: JSON.stringify({ value, scan_job_id: scanJobId ?? null }),
+        body: JSON.stringify({
+          value,
+          scan_job_id: scanJobId ?? null,
+          fiscal_job_id: fiscalJobId ?? null,
+        }),
       }),
-    importResponseFile: (file: File, scanJobId?: string) => {
+    importResponseFile: (file: File, scanJobId?: string, fiscalJobId?: string) => {
       const body = new FormData()
       body.append('file', file)
       // Ties the import back to the inbox row it was started from, so that row
       // can show the receipt instead of staying on "needs_review".
       if (scanJobId) body.append('scan_job_id', scanJobId)
-      return request<any>('/api/fiscal-queue/import-response-file', { method: 'POST', headers: {}, body })
+      if (fiscalJobId) body.append('fiscal_job_id', fiscalJobId)
+      return request<XmlImportResult>('/api/fiscal-queue/import-response-file', { method: 'POST', headers: {}, body })
     },
     run: (id: string) => request<any>(`/api/fiscal-queue/${id}/run`, { method: 'POST' }),
     runPublicApi: (id: string) => request<any>(`/api/fiscal-queue/${id}/api`, { method: 'POST' }),
@@ -422,7 +550,7 @@ export const api = {
       request<TelegramSettings>(`/api/settings/telegram/chats/${chatId}`, { method: 'DELETE' }),
     messages: (conversationKey?: string) =>
       request<TelegramMessageLogList>(
-        `/api/telegram/messages${qs({ conversation_key: conversationKey, limit: 100 })}`,
+        `/api/telegram/messages${qs({ conversation_key: conversationKey, limit: 200 })}`,
       ),
   },
   mcp: {
@@ -440,8 +568,57 @@ export const api = {
   warranties: {
     list: () => request<WarrantyProduct[]>('/api/warranties'),
   },
+  bankTransactions: {
+    list: (params: { status?: string; accountId?: string } = {}) =>
+      request<BankTransaction[]>(
+        `/api/bank-transactions${qs({ status: params.status, account_id: params.accountId })}`,
+      ),
+    summary: () => request<BankTransactionSummaryRow[]>('/api/bank-transactions/summary'),
+    // `since` (ISO datetime) requests a deep-history backfill instead of the
+    // quick incremental poll — the backend runs it in the background and
+    // responds with { started: true } right away instead of the usual
+    // fetched/created/matched_checked counts.
+    poll: (accountId: string, since?: string) =>
+      request<{ fetched: number; created: number; matched_checked: number } | { started: true }>(
+        `/api/bank-transactions/accounts/${accountId}/poll`,
+        { method: 'POST', body: JSON.stringify({ since: since ?? null }) },
+      ),
+    testToken: (accountId: string) => request<TokenTestResult>(
+      `/api/bank-transactions/accounts/${accountId}/test-token`, { method: 'POST' },
+    ),
+    link: (id: string, receiptId: string) =>
+      request<BankTransaction>(`/api/bank-transactions/${id}/link`, {
+        method: 'POST', body: JSON.stringify({ receipt_id: receiptId }),
+      }),
+    unlink: (id: string) =>
+      request<BankTransaction>(`/api/bank-transactions/${id}/unlink`, { method: 'POST' }),
+    ignore: (id: string, reason: string) =>
+      request<BankTransaction>(`/api/bank-transactions/${id}/ignore`, {
+        method: 'POST', body: JSON.stringify({ reason }),
+      }),
+    setCategory: (id: string, categoryOverrideId: string | null) =>
+      request<BankTransaction>(`/api/bank-transactions/${id}`, {
+        method: 'PATCH', body: JSON.stringify({ category_override_id: categoryOverrideId }),
+      }),
+  },
+  bankTransactionRules: {
+    list: () => request<BankTransactionRule[]>('/api/bank-transaction-rules'),
+    create: (payload: Omit<BankTransactionRule, 'id' | 'updated_at'>) =>
+      request<BankTransactionRule>('/api/bank-transaction-rules', {
+        method: 'POST', body: JSON.stringify(payload),
+      }),
+    update: (id: string, payload: Partial<Omit<BankTransactionRule, 'id' | 'updated_at'>>) =>
+      request<BankTransactionRule>(`/api/bank-transaction-rules/${id}`, {
+        method: 'PATCH', body: JSON.stringify(payload),
+      }),
+    remove: (id: string) => request<void>(`/api/bank-transaction-rules/${id}`, { method: 'DELETE' }),
+    apply: () => request<{ updated: number }>('/api/bank-transaction-rules/apply', { method: 'POST' }),
+  },
   voice: {
-    list: () => request<VoiceMessage[]>('/api/voice'),
+    list: (includeArchived = false) =>
+      request<VoiceMessage[]>(`/api/voice?include_archived=${includeArchived}`),
+    archive: (id: string, archived = true) =>
+      request<VoiceMessage>(`/api/voice/${id}/archive?archived=${archived}`, { method: 'POST' }),
     audioUrl: (id: string) => `${BASE}/api/voice/${id}/audio`,
     // `language` (BCP-47) forces one of the configured dictation languages —
     // the retry for a phrase said in the other one.
@@ -504,9 +681,14 @@ export const api = {
     scanStats: () => request<ScanStats>('/api/inbox/scans/stats'),
     removeScan: (jobId: string, withReceipt = false) =>
       request<void>(`/api/inbox/scans/${jobId}?with_receipt=${withReceipt}`, { method: 'DELETE' }),
-    rescan: (jobId: string, ai = false, replace = false) =>
+    /**
+     * Re-run recognition on the stored photo. `escalate` resumes the AI route
+     * after the step this scan already used, reusing its QR verdict instead of
+     * paying for the ladder and the spent model a second time.
+     */
+    rescan: (jobId: string, ai = false, replace = false, escalate = false) =>
       request<UploadResult>(
-        `/api/inbox/scans/${jobId}/rescan?ai=${ai}&replace=${replace}`,
+        `/api/inbox/scans/${jobId}/rescan?ai=${ai}&replace=${replace}&escalate=${escalate}`,
         { method: 'POST' },
       ),
     /** Answer the question a batch asked: one receipt, or several. */
@@ -566,23 +748,43 @@ export const api = {
     update: (id: string, payload: { name?: string; parent_id?: string | null; sort_order?: number }) =>
       request<Category>(`/api/categories/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
     remove: (id: string) => request<void>(`/api/categories/${id}`, { method: 'DELETE' }),
-    backfill: (force = false) =>
+    backfill: (force = false, includeOther = false) =>
       request<{
         names_classified: number
         batches: number
+        queued?: boolean
         reset: { aliases_cleared: number; items_reapplied: number } | null
-      }>(`/api/categories/backfill${force ? '?force=true' : ''}`, { method: 'POST' }),
-    manualPrompt: (limit = 40, batchSize = 40) =>
-      request<ManualPrompt>(`/api/categories/manual-prompt${qs({ limit, batch_size: batchSize })}`),
+      }>(
+        `/api/categories/backfill${qs({ force: force ? 'true' : undefined, include_other: includeOther ? 'true' : undefined })}`,
+        { method: 'POST' },
+      ),
+    manualPrompt: (limit = 40, batchSize = 40, includeOther = false) =>
+      request<ManualPrompt>(
+        `/api/categories/manual-prompt${qs({ limit, batch_size: batchSize, include_other: includeOther ? 'true' : undefined })}`,
+      ),
     reset: () =>
       request<{ aliases_cleared: number; items_cleared: number }>(
         '/api/categories/reset',
         { method: 'POST' },
       ),
-    manualApply: (result: string, names?: string[]) =>
+    manualApply: (result: string, names?: string[], includeOther = false) =>
       request<ManualApplyResult>('/api/categories/manual-apply', {
         method: 'POST',
-        body: JSON.stringify({ result, names }),
+        body: JSON.stringify({ result, names, include_other: includeOther }),
+      }),
+    items: (categoryId: string, includeDescendants = false) =>
+      request<CategoryItems>(
+        `/api/categories/${categoryId}/items${qs({ include_descendants: includeDescendants ? 'true' : undefined })}`,
+      ),
+    reassignItems: (payload: {
+      category_id: string
+      normalized_names: string[]
+      target_category_id: string
+      include_descendants?: boolean
+    }) =>
+      request<CategoryItemsReassignResult>('/api/categories/items/reassign', {
+        method: 'POST',
+        body: JSON.stringify(payload),
       }),
   },
 }

@@ -4,6 +4,7 @@
 export interface StoreCapabilities {
   receipts: boolean
   manual_receipts: boolean
+  transactions: boolean
   phone_otp_login: boolean
   phone_password_login: boolean
   oauth_browser_login: boolean
@@ -15,16 +16,149 @@ export interface StoreCapabilities {
   fuel_prices: boolean
   catalog_search: boolean
   warranty_document: boolean
+  token_test: boolean
+}
+
+export interface Health {
+  status: string
+  version: string
+  started_at: string
+  uptime_seconds: number
+  uptime: string
 }
 
 export interface Store {
   id: string
   code: string
   name: string
-  auth_type: 'phone_otp' | 'phone_password' | 'phone_call' | 'device_uuid' | 'manual' | 'oauth_browser' | 'card_number'
+  auth_type: 'phone_otp' | 'phone_password' | 'phone_call' | 'device_uuid' | 'manual' | 'oauth_browser' | 'card_number' | 'api_token'
   enabled: boolean
-  network_type: 'supermarket' | 'azs' | 'tech' | 'pharmacy' | 'beauty' | 'home' | 'other' | null
+  network_type: 'supermarket' | 'azs' | 'tech' | 'pharmacy' | 'beauty' | 'home' | 'bank' | 'other' | null
   capabilities: StoreCapabilities
+  // What the account's `phone_number` slot really holds for this store — the
+  // cabinet of some chains logs in by email only (Tabletki.ua) or accepts both
+  // (AliExpress, Liki.ua). Mirrors BaseAdapter.login_field.
+  login_field: 'phone' | 'email' | 'phone_or_email'
+  // User-facing class of the chain (продуктовый / аптека / …) — one shared
+  // dictionary served by /api/stores/classes.
+  store_class: string | null
+  store_class_name: string | null
+}
+
+export interface StoreClass {
+  code: string
+  name: string
+}
+
+export interface ShoppingSettings {
+  auto_categorize: boolean
+  auto_categorize_delay_minutes: number
+}
+
+export interface LogEntry {
+  id: string
+  ts: string
+  source: string
+  source_name: string
+  level: 'info' | 'warning' | 'error'
+  title: string
+  message: string | null
+  details: Record<string, unknown>
+  link: string | null
+}
+
+/** One row of the ДПС receipt queue, as /api/fiscal-queue returns it. */
+export interface FiscalJob {
+  id: string
+  url: string
+  source: string
+  status: 'queued' | 'processing' | 'captcha' | 'imported' | 'failed'
+  attempts: number
+  receipt_id: string | null
+  scan_job_id: string | null
+  error: string | null
+  session_id: string | null
+  created_at: string
+  updated_at: string
+  receipt_url: string | null
+}
+
+/** What an uploaded ДПС XML turned into — the same answer for every screen. */
+export interface XmlImportResult {
+  /** Queue row the document belongs to, when it names a fiscal document. */
+  id: string | null
+  url: string | null
+  status: FiscalJob['status']
+  receipt_id: string | null
+  /** "created" — a receipt nobody had; "merged" — added to one already on file. */
+  outcome: 'created' | 'merged'
+  duplicate: boolean
+  scan_job_id: string | null
+  scan_job_created: boolean
+  fiscal_key: string | null
+  shop_name: string | null
+  purchased_at: string | null
+  total_amount: number | null
+  message: string
+}
+
+export interface NavBadge {
+  to: string
+  count: number
+  tone: 'danger' | 'warning'
+  hint: string
+}
+
+export interface NavBadges {
+  items: NavBadge[]
+}
+
+export interface RawResponseStoreSummary {
+  store_code: string
+  store_name: string | null
+  count: number
+  bytes: number
+  oldest_at: string | null
+  newest_at: string | null
+}
+
+export interface RawResponseSummary {
+  total_count: number
+  total_bytes: number
+  stores: RawResponseStoreSummary[]
+}
+
+export interface RawResponseCleanupResult {
+  removed: number
+}
+
+export interface RawResponseSettings {
+  retention_days: number
+  auto_cleanup: boolean
+}
+
+export interface Problem {
+  id: string
+  kind: string
+  source: string
+  source_name: string
+  level: 'info' | 'warning' | 'error'
+  title: string
+  message: string | null
+  since: string | null
+  link: string | null
+}
+
+export interface Problems {
+  total: number
+  accounts: number
+  items: Problem[]
+}
+
+export interface LogPage {
+  items: LogEntry[]
+  has_more: boolean
+  sources: { code: string; name: string }[]
 }
 
 export interface Category {
@@ -47,6 +181,29 @@ export interface CategoryStats {
   uncategorized_items: number
   classified_names: number
   per_category: CategoryStat[]
+}
+
+export interface CategoryItemName {
+  normalized_name: string
+  display_name: string
+  count: number
+  source: 'ai' | 'user' | 'store' | null
+  example_category_id: string | null
+  example_receipt_id: string | null
+  example_item_id: string | null
+  example_image_url: string | null
+}
+
+export interface CategoryItems {
+  category_id: string
+  total_names: number
+  total_items: number
+  names: CategoryItemName[]
+}
+
+export interface CategoryItemsReassignResult {
+  names: number
+  items_moved: number
 }
 
 export interface CategorySpend {
@@ -109,6 +266,19 @@ export interface StoreCategoryMatrix {
   categories: StoreCategoryRow[]
 }
 
+/** One receipt behind the savings/bonus totals — /api/dashboard/savings/receipts. */
+export interface SavingsReceipt {
+  receipt_id: string
+  purchased_at: string
+  store_code: string
+  store_name: string
+  shop_name: string | null
+  total_amount: number
+  total_discount: number
+  bonuses: number
+  bonuses_used: number
+}
+
 export interface StoreCategoryItem {
   receipt_id: string
   item_id: string
@@ -149,17 +319,26 @@ export interface Account {
   bonus_balance: number | null
   bonus_balance_updated_at: string | null
   discount_percent: number | null
+  // Recent collection failures; they survive a later successful run, unlike
+  // `last_error`.
+  failed_runs_24h: number
+  last_failed_at: string | null
+  last_failed_error: string | null
+  /** The most recent run failed — the rule every screen uses for "broken now". */
+  last_run_failed: boolean
 }
 
 export interface CollectionRun {
   id: string
-  trigger: 'manual' | 'schedule' | 'login' | 'import'
+  trigger: 'manual' | 'manual_all' | 'schedule' | 'login' | 'import'
   status: 'running' | 'success' | 'partial' | 'error'
   started_at: string
   finished_at: string | null
   receipts_found: number
   receipts_new: number
   error_message: string | null
+  progress_current: number | null
+  progress_total: number | null
 }
 
 export interface DuplicateRun {
@@ -182,6 +361,7 @@ export interface DuplicateReceiptItem {
   total_price: number
   discount: number
   barcode: string | null
+  product_code: string | null
   category_id: string | null
   product_url: string | null
   product_image_url: string | null
@@ -198,6 +378,7 @@ export interface DuplicateMergeItemSource {
   total_price: number
   discount: number
   barcode: string | null
+  product_code: string | null
   category_id: string | null
   product_url: string | null
   product_image_url: string | null
@@ -293,10 +474,21 @@ export interface AliLoginStep {
   run: CollectionRun | null
 }
 
+export interface ReceiptItemFile {
+  id: string
+  kind: 'warranty' | 'photo'
+  note: string | null
+  created_at: string
+  /** откуда картинку скачали, если её добавили ссылкой (копия всегда наша) */
+  source_url: string | null
+  url: string
+}
+
 export interface ReceiptItem {
   id: string
   name: string
   barcode: string | null
+  product_code: string | null
   category_raw: string | null
   category_id: string | null
   category_path?: string | null
@@ -313,6 +505,17 @@ export interface ReceiptItem {
   warranty_text?: string | null
   warranty_expires_at?: string | null
   warranty_checked_at?: string | null
+  files?: ReceiptItemFile[]
+}
+
+export interface ReceiptComponent {
+  id: string
+  kind: string
+  code: string | null
+  label: string
+  amount: number
+  currency: string
+  source: string | null
 }
 
 export interface Receipt {
@@ -325,10 +528,14 @@ export interface Receipt {
   currency: string
   exchange_rate_to_uah: number | null
   shop_name: string | null
+  seller_phone: string | null
   shop_address: string | null
   payment_type: string | null
   channel: 'offline' | 'online'
   total_discount: number
+  total_adjustment: number
+  adjustment_reason: string | null
+  components: ReceiptComponent[]
   bonuses: number | null
   bonuses_used: number | null
   receipt_url: string | null
@@ -340,10 +547,28 @@ export interface Receipt {
   warranty_text: string | null
   warranty_expires_at: string | null
   warranty_pdf_url: string | null
+  items_total: number
+  total_delta: number
+  has_total_mismatch: boolean
+  reconciliation_ignored_at: string | null
   account_label: string
   tags: string[]
   items: ReceiptItem[]
   duplicate?: boolean
+}
+
+export type ReceiptProblemAction =
+  | 'recalculate_amount'
+  | 'recalculate_discount'
+  | 'recalculate_both'
+  | 'ignore'
+  | 'unignore'
+  | 'delete'
+
+export interface ReceiptProblemBulkResult {
+  updated: number
+  deleted: number
+  skipped: number
 }
 
 export interface ShopSuggestion {
@@ -370,6 +595,8 @@ export interface ReceiptCreate {
   payment_type?: string | null
   channel?: 'offline' | 'online'
   total_discount?: number
+  total_adjustment?: number
+  adjustment_reason?: string | null
   receipt_url?: string | null
   items: ReceiptItemInput[]
 }
@@ -377,6 +604,7 @@ export interface ReceiptCreate {
 export interface ReceiptItemInput {
   name: string
   barcode?: string | null
+  product_code?: string | null
   category_raw?: string | null
   category_id?: string | null
   quantity: number
@@ -415,6 +643,7 @@ export interface StoreBreakdown {
   total_spent: number
   total_discount: number
   total_bonuses: number
+  total_bonuses_used: number
 }
 
 export interface ChannelBreakdown {
@@ -427,6 +656,10 @@ export interface TimeseriesPoint {
   period: string
   total_spent: number
   receipt_count: number
+  /** Savings/loyalty for the same bucket — always gross-independent amounts. */
+  total_discount: number
+  total_bonuses: number
+  total_bonuses_used: number
 }
 
 export interface FuelPrice {
@@ -478,7 +711,13 @@ export type DashboardRangeKey = '30d' | '90d' | 'year' | 'all'
 // order (array order), and an optional per-widget date-range override.
 export interface DashboardLayout {
   version: 1
-  widgets: { key: string; visible: boolean; range: DashboardRangeKey | null }[]
+  widgets: {
+    key: string
+    visible: boolean
+    range: DashboardRangeKey | null
+    /** Free-form per-widget settings (e.g. which overlay series a chart draws). */
+    options?: Record<string, unknown> | null
+  }[]
   /** false = show pre-discount (gross) amounts on the dashboard. Default true. */
   include_discount?: boolean
 }
@@ -530,6 +769,26 @@ export interface AiConfig {
   monthly_token_budget: number
 }
 
+export interface AiPrompt {
+  key: string
+  title: string
+  description: string
+  task: string
+  content: string
+  version: number
+  updated_at: string
+}
+
+export interface AiPromptRevision {
+  id: string
+  prompt_key: string
+  version: number
+  content: string
+  note: string | null
+  changed_by: string | null
+  created_at: string
+}
+
 /** Catalogue entry: a service that can be switched on. */
 export interface AiProviderMeta {
   id: string
@@ -544,6 +803,7 @@ export interface AiUsage {
   month: string
   cloud_tokens_in: number
   cloud_tokens_out: number
+  cloud_cached_tokens: number
   cloud_calls: number
   cloud_errors: number
   local_tokens_in: number
@@ -559,6 +819,7 @@ export interface AiLogEntry {
   model: string
   tokens_in: number
   tokens_out: number
+  cached_tokens: number
   duration_ms: number
   ok: boolean
   error: string
@@ -678,12 +939,29 @@ export interface ProductPrice {
   store_code: string
   store_name: string
   unit: string | null
+  currency: string
+  image_url: string | null
   last_price: number
   last_purchased_at: string
   min_price: number
   max_price: number
   avg_price: number
   times_bought: number
+  last_receipt_id: string | null
+  receipts: ProductReceipt[]
+  last_price_uah: number | null
+  min_price_uah: number | null
+  max_price_uah: number | null
+  avg_price_uah: number | null
+  exchange_rate_to_uah: number | null
+}
+
+export interface ProductReceipt {
+  receipt_id: string
+  purchased_at: string
+  total_amount: number
+  currency: string
+  total_amount_uah: number | null
 }
 
 export interface LiveProduct {
@@ -697,6 +975,8 @@ export interface LiveProduct {
   image_url: string | null
   product_url: string | null
   in_stock: boolean | null
+  seller_name: string | null
+  seller_phone: string | null
 }
 
 export interface WarrantyProduct {
@@ -713,6 +993,7 @@ export interface WarrantyProduct {
   expired: boolean
   product_url: string | null
   image_url: string | null
+  file_urls: string[]
 }
 
 // --- Document inbox / receipt scanner (ROADMAP.md Крок 3) ---
@@ -745,8 +1026,12 @@ export interface VoiceMessage {
   applied: string | null
   created_at: string
   transcribed_at: string | null
+  /** Set once the recording is put away — same archive the scan journal has. */
+  archived_at: string | null
   audio_url: string
   stt_ready: boolean
+  sender_display_name: string | null
+  sender_username: string | null
   /** Configured dictation languages, primary first — the "іншою мовою" retries. */
   languages: SpeechLanguage[]
 }
@@ -754,6 +1039,7 @@ export interface VoiceMessage {
 export interface BulkScanOut {
   done: number
   failed: number
+  queued?: boolean
   results: { id: string; ok: boolean; detail: string }[]
 }
 
@@ -806,12 +1092,60 @@ export interface ScanJob {
   receipt_deleted: boolean
   archived_at: string | null
   duplicate_of: string | null
+  /** Who read this photo: "QR", "ДПС кабінет", "AI: <service> / <model>". */
+  recognised_by?: string
+  /** The OCR route step after the one already spent, when there is one. */
+  next_ai?: { service: string; model: string; label: string } | null
+}
+
+/** One stage of one scan: what ran, what it found, what it cost. */
+export interface ScanStage {
+  stage: string
+  outcome: 'ok' | 'draft' | 'none' | 'skip' | 'fail'
+  detail: string
+  ms: number
+  tokens_in: number
+  tokens_out: number
+}
+
+/**
+ * One line of a scan's own history, in the order things happened: pipeline
+ * stages (`actor: 'auto'`) and what the user did to it — re-scans, an imported
+ * ДПС XML, an accepted draft (`actor: 'user'`).
+ */
+export interface ScanEvent {
+  ts: string
+  actor: 'auto' | 'user'
+  kind: string
+  outcome: string
+  detail: string
+  ms: number
+  tokens_in: number
+  tokens_out: number
 }
 
 export interface ScanStats {
   total: number
   by_method: Record<string, number>
   ai_share: number
+  /** Share of scans that were filed automatically (high confidence). */
+  saved_share: number
+  qr_states: Record<string, number>
+  /** Of the scans with a recorded trace, how many had their QR decoded. */
+  qr_decoded_share: number
+  qr_avg_ms: number
+  /** Which rendering of the ladder decoded the code, most-used first. */
+  qr_variants: Record<string, number>
+  stage_ms: Record<string, number>
+  ai_calls: number
+  /** Scans that needed more than one route step. */
+  ai_escalated: number
+  ai_models: Record<string, {
+    calls: number; ok: number; ms: number
+    tokens_in: number; tokens_out: number; avg_ms: number
+  }>
+  /** Rows written before the trace existed carry none of it — shares are over this. */
+  traced: number
 }
 
 export interface InboxConfig {
@@ -890,4 +1224,60 @@ export interface DriveFolder {
 export interface DriveColorPalette {
   colors: string[]
   default: string
+}
+
+export type BankTransactionStatus = 'unmatched' | 'matched' | 'needs_review' | 'ignored'
+
+export interface BankTransaction {
+  id: string
+  account_id: string
+  account_label: string
+  store_code: string
+  external_id: string
+  amount: number
+  currency: string
+  mcc: number | null
+  description: string | null
+  counterparty_raw: { comment?: string | null; receiptId?: string | null; counterName?: string | null }
+  occurred_at: string
+  status: BankTransactionStatus
+  linked_receipt_id: string | null
+  ignore_reason: string | null
+  category_override_id: string | null
+  created_at: string
+}
+
+export interface BankTransactionSummaryRow {
+  category_id: string | null
+  category_name: string | null
+  total_amount: number
+  count: number
+}
+
+export interface TokenTestResult {
+  ok: boolean
+  detail: string
+}
+
+export type BankTransactionRuleCondition =
+  | { kind: 'always' }
+  | { kind: 'position_in_month'; position: number }
+  | { kind: 'count_in_month'; count: number }
+  | { kind: 'amount_gte'; amount: number }
+  | { kind: 'amount_lte'; amount: number }
+  | { kind: 'amount_between'; min: number; max: number }
+
+export interface BankTransactionRuleBranch {
+  condition: BankTransactionRuleCondition
+  category_id?: string | null
+  ignore_reason?: string | null
+}
+
+export interface BankTransactionRule {
+  id: string
+  label: string
+  counterparty_match: string
+  priority: number
+  branches: BankTransactionRuleBranch[]
+  updated_at: string
 }

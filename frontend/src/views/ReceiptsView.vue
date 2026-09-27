@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import { api } from '@/lib/api'
 import { storeFallbackIcon, storeLogoUrl } from '@/lib/storeIcons'
-import type { Account, Receipt, Store } from '@/types/api'
+import type { Account, Receipt, ReceiptProblemAction, Store } from '@/types/api'
 import { fmtDateTime } from '@/lib/datetime'
 
 const route = useRoute()
@@ -23,10 +23,16 @@ const filters = ref({
   date_from: typeof q.date_from === 'string' ? q.date_from : '',
   date_to: typeof q.date_to === 'string' ? q.date_to : '',
   tag: typeof q.tag === 'string' ? q.tag : '',
+  problem: typeof q.problem === 'string' ? q.problem : '',
+  sort_by: typeof q.sort_by === 'string' ? q.sort_by : 'date',
+  sort_dir: q.sort_dir === 'asc' ? 'asc' : 'desc',
 })
 const tagStats = ref<import('@/types/api').TagSummary[]>([])
 const limit = 50
 const offset = ref(0)
+const selected = ref<Set<string>>(new Set())
+const bulkBusy = ref(false)
+const bulkMessage = ref('')
 
 async function load() {
   loading.value = true
@@ -39,6 +45,9 @@ async function load() {
     store_code: filters.value.store_code || undefined,
     channel: filters.value.channel || undefined,
     tag: filters.value.tag || undefined,
+    problem: filters.value.problem || undefined,
+    sort_by: filters.value.sort_by || undefined,
+    sort_dir: filters.value.sort_dir || undefined,
     date_from: dateFrom,
     date_to: dateTo,
     limit,
@@ -46,7 +55,44 @@ async function load() {
   })
   receipts.value = res.items
   total.value = res.total
+  selected.value = new Set()
   loading.value = false
+}
+
+const visibleIds = computed(() => receipts.value.map((receipt) => receipt.id))
+const allVisibleSelected = computed(() =>
+  visibleIds.value.length > 0 && visibleIds.value.every((id) => selected.value.has(id)),
+)
+const selectedCount = computed(() => selected.value.size)
+
+function toggleSelected(id: string) {
+  const next = new Set(selected.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selected.value = next
+}
+
+function toggleAllVisible() {
+  selected.value = allVisibleSelected.value ? new Set() : new Set(visibleIds.value)
+}
+
+async function runBulk(action: ReceiptProblemAction, confirmation: string) {
+  const ids = [...selected.value]
+  if (!ids.length || bulkBusy.value) return
+  if (!confirm(`${confirmation} для ${ids.length} чеків?`)) return
+  bulkBusy.value = true
+  bulkMessage.value = ''
+  try {
+    const result = await api.receipts.bulkProblemAction(ids, action)
+    bulkMessage.value = action === 'delete'
+      ? `Видалено чеків: ${result.deleted}`
+      : `Оброблено чеків: ${result.updated}`
+    await load()
+  } catch (e) {
+    bulkMessage.value = (e as Error).message
+  } finally {
+    bulkBusy.value = false
+  }
 }
 
 async function loadTagStats() {
@@ -106,8 +152,64 @@ function prevPage() {
     </select>
     <input v-model="filters.date_from" type="date" />
     <input v-model="filters.date_to" type="date" />
+    <select v-model="filters.problem">
+      <option value="">Проблеми: всі чеки</option>
+      <option value="open">Тільки проблемні</option>
+      <option value="ignored">Проблемні з ігнором</option>
+    </select>
+    <select v-model="filters.sort_by" aria-label="Сортувати за">
+      <option value="date">Сортувати: дата</option>
+      <option value="account">Сортувати: акаунт</option>
+      <option value="channel">Сортувати: канал</option>
+      <option value="store">Сортувати: магазин</option>
+      <option value="address">Сортувати: адреса</option>
+      <option value="tags">Сортувати: теги</option>
+      <option value="amount">Сортувати: сума</option>
+      <option value="discount">Сортувати: знижка</option>
+      <option value="items_total">Сортувати: сума позицій</option>
+      <option value="difference">Сортувати: розбіжність</option>
+      <option value="problem_ignored_at">Сортувати: дата ігнорування</option>
+    </select>
+    <select v-model="filters.sort_dir" aria-label="Напрямок сортування">
+      <option value="desc">За спаданням ↓</option>
+      <option value="asc">За зростанням ↑</option>
+    </select>
     <span class="muted">Знайдено: {{ total }}</span>
   </div>
+
+  <div v-if="selectedCount" class="card bulk-bar" style="margin-bottom: 16px">
+    <strong>Вибрано: {{ selectedCount }}</strong>
+    <button class="secondary" :disabled="bulkBusy" @click="runBulk('recalculate_amount', 'Оновити суму')">
+      Оновити суму
+    </button>
+    <button class="secondary" :disabled="bulkBusy" @click="runBulk('recalculate_discount', 'Оновити знижку')">
+      Оновити знижку
+    </button>
+    <button class="secondary" :disabled="bulkBusy" @click="runBulk('recalculate_both', 'Оновити суму та знижку')">
+      Оновити все
+    </button>
+    <button
+      v-if="filters.problem !== 'ignored'"
+      class="secondary"
+      :disabled="bulkBusy"
+      @click="runBulk('ignore', 'Ігнорувати розбіжності')"
+    >
+      Ігнорувати проблему
+    </button>
+    <button
+      v-if="filters.problem === 'ignored'"
+      class="secondary"
+      :disabled="bulkBusy"
+      @click="runBulk('unignore', 'Повернути в проблеми')"
+    >
+      Скасувати ігнор
+    </button>
+    <button class="danger" :disabled="bulkBusy" @click="runBulk('delete', 'Видалити')">Видалити</button>
+    <button class="secondary" :disabled="bulkBusy" @click="selected = new Set()">Зняти вибір</button>
+    <span v-if="bulkBusy" class="muted">Обробляємо…</span>
+    <span v-else-if="bulkMessage" class="muted">{{ bulkMessage }}</span>
+  </div>
+  <p v-else-if="bulkMessage" class="muted">{{ bulkMessage }}</p>
 
   <div v-if="tagStats.length" class="card" style="margin-bottom: 16px">
     <div class="stat-label" style="margin-bottom: 8px">Витрати за тегами</div>
@@ -129,6 +231,7 @@ function prevPage() {
   <table v-else>
     <thead>
       <tr>
+        <th><input type="checkbox" :checked="allVisibleSelected" @change="toggleAllVisible" /></th>
         <th>Дата</th>
         <th>Акаунт</th>
         <th>Канал</th>
@@ -137,10 +240,12 @@ function prevPage() {
         <th>Теги</th>
         <th>Сума</th>
         <th>Знижка</th>
+        <th>Звірка</th>
       </tr>
     </thead>
     <tbody>
       <tr v-for="r in receipts" :key="r.id">
+        <td><input type="checkbox" :checked="selected.has(r.id)" @change="toggleSelected(r.id)" /></td>
         <td style="white-space: nowrap">
           <RouterLink :to="`/receipts/${r.id}`">{{ fmtDate(r.purchased_at) }}</RouterLink>
           <span v-if="r.has_warranty" title="Є гарантійний талон" style="margin-left: 4px">🛡️</span>
@@ -174,9 +279,19 @@ function prevPage() {
         </td>
         <td style="white-space: nowrap">{{ fmtMoney(r.total_amount) }}</td>
         <td class="muted" style="white-space: nowrap">{{ r.total_discount ? fmtMoney(r.total_discount) : '—' }}</td>
+        <td style="white-space: nowrap">
+          <span v-if="r.has_total_mismatch && !r.reconciliation_ignored_at" class="badge badge-danger">
+            ⚠ {{ fmtMoney(Math.abs(r.total_delta)) }}
+          </span>
+          <span v-else-if="r.has_total_mismatch && r.reconciliation_ignored_at" class="badge">
+            Ігноровано
+            <span class="muted" style="display: block; font-size: 11px">{{ fmtDate(r.reconciliation_ignored_at) }}</span>
+          </span>
+          <span v-else class="muted">OK</span>
+        </td>
       </tr>
       <tr v-if="!receipts.length">
-        <td colspan="8" class="muted">Нічого не знайдено</td>
+        <td colspan="10" class="muted">Нічого не знайдено</td>
       </tr>
     </tbody>
   </table>
@@ -186,3 +301,18 @@ function prevPage() {
     <button class="secondary" :disabled="offset + limit >= total" @click="nextPage">Далі →</button>
   </div>
 </template>
+
+<style scoped>
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.badge-danger {
+  color: var(--danger, #c0392b);
+  border: 1px solid color-mix(in srgb, var(--danger, #c0392b) 40%, transparent);
+  background: color-mix(in srgb, var(--danger, #c0392b) 10%, transparent);
+}
+</style>

@@ -34,6 +34,10 @@ NETWORKS: list[NetworkRef] = [
     NetworkRef("Novus", "supermarket", None, ("33299901",), ("NOVUS",)),
     NetworkRef("Ашан", "supermarket", None, ("32090294",), ("АШАН", "AUCHAN")),
     NetworkRef("Епіцентр К", "home", "epicentrk", ("35590956",), ("ЕПІЦЕНТР",)),
+    # ПРРО-документи ОЛДІ несуть лише ПН — ЄДРПОУ не підтверджено, тож пара
+    # лишається з порожньою половиною сутності.
+    NetworkRef("ОЛДИ", "home", None, (), ("ОЛДИ", "ОЛДІ", "OLDI"),
+               (("247388426505", ""),)),
     NetworkRef("Нова Лінія", "home", None, ("30777091",), ("НОВА ЛІНІЯ",)),
     NetworkRef("WOG", "azs", "wog", ("38870739",), ("WOG",)),
     # Fiscal identities accumulate under the sign; a newly observed issuer must

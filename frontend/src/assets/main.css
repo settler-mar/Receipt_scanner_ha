@@ -8,6 +8,8 @@
   --accent: #38bdf8;
   --accent-dim: #0369a1;
   --success: #4ade80;
+  /* Loyalty bonuses — deliberately not --accent, which the spend bars already use. */
+  --bonus: #a78bfa;
   --warning: #fbbf24;
   --danger: #f87171;
   --radius: 10px;
@@ -99,6 +101,26 @@ a:hover {
 .nav-link-active {
   background: var(--accent-dim);
   color: white;
+}
+
+/* How many open items a section has. `danger` = something is broken, `warning`
+   = something waits for a decision. Both disappear once the count is zero. */
+.nav-badge {
+  margin-left: auto;
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  color: white;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+}
+.nav-badge-danger {
+  background: var(--danger);
+}
+.nav-badge-warning {
+  background: var(--warning);
+  color: #1a1a1a;
 }
 
 /* One level of nesting (Settings sub-pages): indented to the parent's label. */
@@ -203,6 +225,11 @@ tr:hover td {
   background: rgba(248, 113, 113, 0.15);
   color: var(--danger);
 }
+/* "Was flaky recently, works now" — distinct from a current failure. */
+.badge-warning {
+  background: rgba(251, 191, 36, 0.15);
+  color: var(--warning);
+}
 .badge-channel-offline {
   background: rgba(148, 163, 184, 0.15);
   color: var(--text-dim);
@@ -210,6 +237,11 @@ tr:hover td {
 .badge-channel-online {
   background: rgba(56, 189, 248, 0.15);
   color: var(--accent);
+}
+.integration-class-badge {
+  background: rgba(129, 140, 248, 0.15);
+  color: #a5b4fc;
+  white-space: nowrap;
 }
 .badge-warranty-active {
   background: rgba(74, 222, 128, 0.15);
@@ -423,4 +455,39 @@ textarea {
   .sidebar {
     transition: none;
   }
+}
+
+/* Backend uptime/version strip pinned to the bottom of the sidebar. */
+.sidebar-footer {
+  margin-top: auto;
+  padding: 10px 12px 0;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.sidebar-footer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-footer-down {
+  color: var(--danger);
+}
+.receipt-component-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.receipt-component-discount {
+  color: var(--success);
 }

@@ -13,7 +13,14 @@ import logging
 import re
 from typing import Any
 
-from app.adapters.base import ROTATED_ACCESS_TOKEN_KEY, AdapterError, BaseAdapter, NormalizedItem, NormalizedReceipt
+from app.adapters.base import (
+    ROTATED_ACCESS_TOKEN_KEY,
+    AdapterError,
+    BaseAdapter,
+    NormalizedItem,
+    NormalizedReceipt,
+    NormalizedReceiptComponent,
+)
 from app.integrations import (
     BrowserSession,
     BrowserSessionConfig,
@@ -26,6 +33,19 @@ from app.integrations import (
 )
 
 ORDERS_URL = "https://www.aliexpress.com/p/order/index.html"
+RECENT_PAGE_TIMEOUT_MS = 90_000
+FULL_HISTORY_PAGE_TIMEOUT_MS = 180_000
+RECENT_INITIAL_WAIT_MS = 4_000
+FULL_HISTORY_INITIAL_WAIT_MS = 10_000
+RECENT_MAX_PAGES = 100
+FULL_HISTORY_MAX_PAGES = 300
+RECENT_CLICK_TIMEOUT_MS = 10_000
+FULL_HISTORY_CLICK_TIMEOUT_MS = 30_000
+RECENT_RESPONSE_WAIT_ATTEMPTS = 40
+FULL_HISTORY_RESPONSE_WAIT_ATTEMPTS = 120
+DETAIL_PAGE_TIMEOUT_MS = 120_000
+DETAIL_INITIAL_WAIT_MS = 6_000
+DETAIL_BATCH_SIZE = 100
 logger = logging.getLogger(__name__)
 # Compatibility aliases for callers written before the generic history class.
 FULL_HISTORY_MARKER = FullHistoryImport.marker_key("aliexpress")
@@ -139,6 +159,61 @@ def _absolute_url(value: Any) -> str | None:
     return url
 
 
+_VARIANT_KEYS = (
+    "selectedSku", "selectedSKU", "selected_sku", "skuInfo", "sku_info",
+    "skuText", "sku_text", "skuDescription", "skuDesc", "sku_desc",
+    "skuAttr", "sku_attr", "skuAttributes", "sku_attributes",
+    "skuProperties", "sku_properties", "skuPropertyValues", "properties",
+    "attributes", "variation", "variant", "productSku", "product_sku",
+)
+
+
+def _variant_value(value: Any) -> str:
+    """Turn AliExpress' several selected-SKU shapes into display text."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [_variant_value(entry) for entry in value]
+        return "; ".join(part for part in parts if part)
+    if isinstance(value, dict):
+        # Property objects are usually {propertyName, propertyValue}; the
+        # aliases below cover the mobile/web order payloads as well.
+        label = _first(value, "propertyName", "property_name", "name", "label", "key", "skuName")
+        selected = _first(
+            value, "propertyValue", "property_value", "value", "text",
+            "displayValue", "display_value", "skuValue", "valueName",
+        )
+        if label is not None and selected is not None:
+            return f"{label}: {selected}"
+        for key in ("skuPropertyValues", "propertyValues", "values", "items", "list"):
+            if key in value:
+                nested = _variant_value(value[key])
+                if nested:
+                    return nested
+        parts = []
+        for key, nested_value in value.items():
+            if key.lower() in {"id", "skuId".lower(), "propertyId".lower()}:
+                continue
+            text = _variant_value(nested_value)
+            if text:
+                parts.append(f"{key}: {text}")
+        return "; ".join(parts)
+    return ""
+
+
+def _variant_text(data: dict) -> str | None:
+    parts = []
+    for key in _VARIANT_KEYS:
+        if key not in data:
+            continue
+        text = _variant_value(data[key])
+        if text and text.casefold() not in {part.casefold() for part in parts}:
+            parts.append(text)
+    return "; ".join(parts) or None
+
+
 def _item(data: dict, order_store: str | None) -> NormalizedItem:
     quantity = _number(_first(data, "quantity", "count", "productCount", "skuCount"), 1) or 1
     unit_price = _number(_first(data, "unit_price", "unitPrice", "price", "productPrice", "skuPrice"))
@@ -152,8 +227,12 @@ def _item(data: dict, order_store: str | None) -> NormalizedItem:
         url = "https:" + url
     elif isinstance(url, str) and url.startswith("/"):
         url = "https://www.aliexpress.com" + url
+    name = str(_first(data, "name", "title", "productName", "productTitle", default="Товар AliExpress")).strip()
+    variant = _variant_text(data)
+    if variant and variant.casefold() not in name.casefold():
+        name = f"{name} ({variant})"
     return NormalizedItem(
-        name=str(_first(data, "name", "title", "productName", "productTitle", default="Товар AliExpress")).strip(),
+        name=name,
         quantity=quantity,
         unit=_first(data, "unit", default="шт"),
         unit_price=unit_price,
@@ -181,6 +260,9 @@ def _orders(payload: dict) -> list[dict]:
         if nested is None:
             break
         candidates = nested
+    dida = _dida_orders(payload)
+    if dida:
+        return dida
     raise ValueError("AliExpress: очікується JSON з масивом orders/orderList")
 
 
@@ -228,7 +310,7 @@ def _dida_orders(value: Any, depth: int = 0) -> list[dict]:
             for line in fields["orderLines"]:
                 if not isinstance(line, dict):
                     continue
-                items.append({
+                item = {
                     "name": _first(line, "itemTitle", "productTitle", default="Товар AliExpress"),
                     "quantity": _first(line, "quantity", default=1),
                     "unitPrice": _first(line, "itemPriceText", "formatPriceInfo"),
@@ -237,7 +319,11 @@ def _dida_orders(value: Any, depth: int = 0) -> list[dict]:
                     "itemUrl": line.get("itemDetailUrl"),
                     "imageUrl": line.get("itemImgUrl"),
                     "storeName": store,
-                })
+                }
+                for key in _VARIANT_KEYS:
+                    if key in line:
+                        item[key] = line[key]
+                items.append(item)
             found.append({
                 "orderId": fields["orderId"],
                 "date": fields.get("orderDateText"),
@@ -248,6 +334,11 @@ def _dida_orders(value: Any, depth: int = 0) -> list[dict]:
                 "orderUrl": fields.get("orderDetailUrl"),
                 "trackingUrl": tracking_url,
                 "items": items,
+                # Keep the original server-side fields. The normalized keys
+                # above are intentionally compact for the importer, while the
+                # raw-response archive needs prices, fees and adjustments that
+                # are not yet understood by us.
+                "_raw_fields": fields,
             })
             return found
         for child in value.values():
@@ -289,6 +380,146 @@ def _dida_page_info(value: Any, depth: int = 0) -> PageInfo | None:
     return None
 
 
+def _order_needs_detail(order: dict) -> bool:
+    """Prioritize orders whose list card cannot explain its final total."""
+    fields = order.get("_raw_fields") if isinstance(order.get("_raw_fields"), dict) else order
+    total_text = _first(fields, "totalPriceText", "formatPriceInfo")
+    if total_text in (None, ""):
+        return True
+    total = _number(total_text, default=-1)
+    if total < 0:
+        return True
+    line_sum = 0.0
+    for line in fields.get("orderLines") or order.get("items") or []:
+        if not isinstance(line, dict):
+            continue
+        price = _number(_first(line, "itemPriceText", "formatPriceInfo", "totalPrice", "total_price"))
+        quantity = _number(_first(line, "quantity", "count"), default=1) or 1
+        line_sum += price * quantity
+    return abs(total - line_sum) > 0.02
+
+
+def _has_detail_price_breakdown(order: dict) -> bool:
+    fields = order.get("_raw_fields") if isinstance(order.get("_raw_fields"), dict) else {}
+    responses = fields.get("_detail_responses") or []
+
+    def visit(value: Any, depth: int = 0) -> bool:
+        if depth > 10:
+            return False
+        if isinstance(value, dict):
+            price_details = value.get("priceDetails")
+            total_price = value.get("totalPrice")
+            if isinstance(price_details, list) and isinstance(total_price, dict):
+                return True
+            return any(visit(child, depth + 1) for child in value.values())
+        if isinstance(value, list):
+            return any(visit(child, depth + 1) for child in value)
+        return False
+
+    return visit(responses)
+
+
+def _component_kind(label: str) -> str:
+    normalized = label.casefold()
+    if "shipping" in normalized or "delivery" in normalized or "достав" in normalized:
+        return "delivery"
+    if "tax" in normalized or "vat" in normalized or "подат" in normalized:
+        return "tax"
+    if any(token in normalized for token in ("coupon", "discount", "coins", "зниж", "купон")):
+        return "discount"
+    if "fee" in normalized or "service" in normalized or "коміс" in normalized:
+        return "fee"
+    if "adjustment" in normalized or "кориг" in normalized:
+        return "adjustment"
+    return "other"
+
+
+def _detail_components(order: dict) -> list[NormalizedReceiptComponent]:
+    """Extract provider order components without assigning them to products."""
+    fields = order.get("_raw_fields") if isinstance(order.get("_raw_fields"), dict) else order
+    responses = fields.get("_detail_responses") or []
+
+    def visit(value: Any, depth: int = 0) -> list[dict]:
+        if depth > 10:
+            return []
+        if isinstance(value, dict):
+            details = value.get("priceDetails")
+            if isinstance(details, list):
+                return [row for row in details if isinstance(row, dict)]
+            for child in value.values():
+                found = visit(child, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = visit(child, depth + 1)
+                if found:
+                    return found
+        return []
+
+    components: list[NormalizedReceiptComponent] = []
+    for row in visit(responses):
+        label = str(_first(row, "title", "label", "name", default="Other charge")).strip()
+        if not label or label.casefold() == "subtotal":
+            continue
+        raw_value = _first(row, "value", "amount", "price")
+        amount = _number(raw_value)
+        if str(raw_value or "").strip().startswith(("-", "−")):
+            amount = -abs(amount)
+        if abs(amount) < 0.005:
+            continue
+        components.append(NormalizedReceiptComponent(
+            kind=_component_kind(label),
+            code=re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_") or None,
+            label=label,
+            amount=round(amount, 2),
+            currency="UAH",
+            source="aliexpress.order_detail",
+            raw=row,
+        ))
+    return components
+
+
+def _receipt_adjustment(
+    order: dict,
+    total: float,
+    items: list[NormalizedItem],
+    components: list[NormalizedReceiptComponent] | None = None,
+) -> tuple[float, str | None]:
+    line_sum = round(sum(float(item.total_price or 0) for item in items), 2)
+    component_sum = round(sum(float(component.amount or 0) for component in (components or [])), 2)
+    residual = round(total - line_sum - component_sum, 2)
+    # Backward-compatible helper behavior for callers that only ask whether a
+    # detail payload exists; the full parser passes an explicit component list
+    # and can therefore preserve any still-unparsed residual as an adjustment.
+    if components is None and _has_detail_price_breakdown(order):
+        return 0.0, None
+    if abs(residual) < 0.01:
+        return 0.0, None
+    reason = (
+        "AliExpress: в деталях заказа остался нераспознанный компонент"
+        if _has_detail_price_breakdown(order)
+        else "AliExpress: причина расхождения не определена по доступным данным заказа"
+    )
+    return residual, reason
+
+
+async def _capture_order_details(page, capture: JsonResponseCapture, order: dict) -> list[Any]:
+    order_url = _absolute_url(_first(order, "orderUrl", "order_url", "url"))
+    if not order_url:
+        return []
+    before = len(capture.payloads)
+    try:
+        await page.goto(order_url, wait_until="domcontentloaded", timeout=DETAIL_PAGE_TIMEOUT_MS)
+        await page.wait_for_timeout(DETAIL_INITIAL_WAIT_MS)
+        await capture.drain()
+        return capture.payloads[before:]
+    except Exception:
+        logger.warning("AliExpress order detail could not be captured", exc_info=True)
+        await capture.drain()
+        return capture.payloads[before:]
+
+
 def is_terminal_order_status(status: str | None) -> bool:
     """Compatibility wrapper; new integrations should use OrderDeliveryUpdater."""
     return OrderDeliveryUpdater().is_terminal(status)
@@ -315,6 +546,7 @@ async def _tracking_numbers_from_page(context, url: str) -> list[str]:
 
 class AliExpressAdapter(BaseAdapter):
     store_code = "aliexpress"
+    login_field = "phone_or_email"
 
     @staticmethod
     def _record_key(order: dict) -> str | None:
@@ -322,12 +554,20 @@ class AliExpressAdapter(BaseAdapter):
         return str(value) if value not in (None, "") else None
 
     @classmethod
-    def _page_collector(cls, max_pages: int) -> PaginatedRecordCollector:
+    def _page_collector(
+        cls,
+        max_pages: int,
+        *,
+        click_timeout_ms: int = RECENT_CLICK_TIMEOUT_MS,
+        response_wait_attempts: int = RECENT_RESPONSE_WAIT_ATTEMPTS,
+    ) -> PaginatedRecordCollector:
         return PaginatedRecordCollector(
             record_groups=_order_rows,
             record_key=cls._record_key,
             page_info=_dida_page_info,
             max_pages=max_pages,
+            click_timeout_ms=click_timeout_ms,
+            response_wait_attempts=response_wait_attempts,
         )
 
     async def fetch_receipts(self, access_token: str, extra: dict, since=None):
@@ -347,23 +587,57 @@ class AliExpressAdapter(BaseAdapter):
                 lambda url: any(marker in url for marker in ("order", "trade", "mtop")),
                 lambda body: bool(_order_rows(body)),
             )
-            async with BrowserSession(access_token) as session:
+            async with BrowserSession(access_token, BrowserSessionConfig(headless=True)) as session:
                 page = session.page
                 assert page is not None
                 capture.attach(page)
-                await page.goto(ORDERS_URL, wait_until="domcontentloaded", timeout=90_000)
-                await page.wait_for_timeout(4_000)
+                page_timeout = FULL_HISTORY_PAGE_TIMEOUT_MS if history.load_all else RECENT_PAGE_TIMEOUT_MS
+                initial_wait = FULL_HISTORY_INITIAL_WAIT_MS if history.load_all else RECENT_INITIAL_WAIT_MS
+                await page.goto(ORDERS_URL, wait_until="domcontentloaded", timeout=page_timeout)
+                await page.wait_for_timeout(initial_wait)
                 if any(part in page.url.lower() for part in ("login", "signin")):
                     raise AdapterError("AliExpress: сесія завершилась — увійдіть повторно")
                 await capture.drain()
 
-                result = await self._page_collector(max_pages=100).collect(
+                result = await self._page_collector(
+                    max_pages=FULL_HISTORY_MAX_PAGES if history.load_all else RECENT_MAX_PAGES,
+                    click_timeout_ms=(
+                        FULL_HISTORY_CLICK_TIMEOUT_MS if history.load_all else RECENT_CLICK_TIMEOUT_MS
+                    ),
+                    response_wait_attempts=(
+                        FULL_HISTORY_RESPONSE_WAIT_ATTEMPTS
+                        if history.load_all else RECENT_RESPONSE_WAIT_ATTEMPTS
+                    ),
+                ).collect(
                     page,
                     capture,
                     paginate=history.load_all,
                     known_keys=history.known_keys,
                     stop_on_known=history.load_all and not backfill,
                 )
+
+                if history.refresh_details and result.records:
+                    detail_capture = JsonResponseCapture(
+                        lambda url: "mtop.aliexpress.trade.buyer.order.detail" in url,
+                    )
+                    detail_capture.attach(page)
+                    candidates = [
+                        order for order in result.records.values()
+                        if (
+                            _order_needs_detail(order)
+                            and str(self._record_key(order)) not in history.detail_known_keys
+                        )
+                    ][:DETAIL_BATCH_SIZE]
+                    for order in candidates:
+                        details = await _capture_order_details(page, detail_capture, order)
+                        if not details:
+                            continue
+                        fields = order.get("_raw_fields")
+                        if not isinstance(fields, dict):
+                            fields = dict(order)
+                        enriched = dict(fields)
+                        enriched["_detail_responses"] = details
+                        order["_raw_fields"] = enriched
                 extra[ROTATED_ACCESS_TOKEN_KEY] = await session.serialized_storage_state()
                 if not result.records:
                     if result.stopped_on_known:
@@ -398,7 +672,7 @@ class AliExpressAdapter(BaseAdapter):
             lambda url: "mtop.aliexpress.trade.buyer.order.list" in url,
             lambda body: bool(_order_rows(body)),
         )
-        config = BrowserSessionConfig(block_heavy_assets=True)
+        config = BrowserSessionConfig(headless=True, block_heavy_assets=True)
         async with BrowserSession(access_token, config) as session:
             page = session.page
             context = session.context
@@ -442,6 +716,9 @@ class AliExpressAdapter(BaseAdapter):
             items = [_item(item, store) for item in raw_items if isinstance(item, dict)]
             total = _number(_first(order, "total_amount", "totalAmount", "payAmount", "orderAmount", "total"), sum(i.total_price for i in items))
             currency = _first(order, "currency", "currencyCode", "currency_code", default="USD")
+            components = _detail_components(order)
+            total_adjustment, adjustment_reason = _receipt_adjustment(order, total, items, components)
+            total_discount = round(sum(abs(component.amount) for component in components if component.amount < 0), 2)
             result.append(NormalizedReceipt(
                 external_id=str(order_id),
                 purchased_at=_date(_first(order, "created_at", "createdAt", "createTime", "gmtCreate", "orderTime", "date")),
@@ -451,12 +728,16 @@ class AliExpressAdapter(BaseAdapter):
                 payment_type=_first(order, "paymentMethod", "payment_method", "payType"),
                 channel="online",
                 items=items,
+                components=components,
                 receipt_url=_absolute_url(_first(
                     order, "orderUrl", "order_url", "url",
                     default=f"https://www.aliexpress.com/p/order/detail.html?orderId={order_id}",
                 )),
                 order_status=status,
                 tracking_numbers=_tracking(order),
-                raw=order,
+                total_discount=total_discount if components else None,
+                total_adjustment=total_adjustment,
+                adjustment_reason=adjustment_reason,
+                raw=order.get("_raw_fields") or order,
             ))
         return result

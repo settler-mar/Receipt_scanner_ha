@@ -21,9 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import datetime as dt
+import hashlib
 import json
 import logging
+import re
 import time
 from urllib.parse import urlparse
 from typing import Any, Literal
@@ -34,6 +37,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import decrypt, encrypt
 from app.models.models import AppSetting
+from app.services import prompt_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -599,7 +603,8 @@ def _current_month() -> str:
 
 def _empty_usage() -> dict[str, Any]:
     return {"month": _current_month(),
-            "cloud_tokens_in": 0, "cloud_tokens_out": 0, "cloud_calls": 0, "cloud_errors": 0,
+            "cloud_tokens_in": 0, "cloud_tokens_out": 0, "cloud_cached_tokens": 0,
+            "cloud_calls": 0, "cloud_errors": 0,
             "local_tokens_in": 0, "local_tokens_out": 0, "local_calls": 0, "local_errors": 0}
 
 
@@ -612,12 +617,14 @@ def load_usage(db: Session) -> dict[str, Any]:
 
 
 def _record_usage(db: Session, *, backend: str, tokens_in: int = 0, tokens_out: int = 0,
-                  ok: bool = True) -> None:
+                  cached_tokens: int = 0, ok: bool = True) -> None:
     usage = load_usage(db)
     p = "cloud" if backend == "cloud" else "local"
     usage[f"{p}_calls"] += 1
     usage[f"{p}_tokens_in"] += tokens_in
     usage[f"{p}_tokens_out"] += tokens_out
+    if p == "cloud":
+        usage["cloud_cached_tokens"] += cached_tokens
     if not ok:
         usage[f"{p}_errors"] += 1
     row = db.get(AppSetting, USAGE_KEY)
@@ -629,7 +636,7 @@ def _record_usage(db: Session, *, backend: str, tokens_in: int = 0, tokens_out: 
 
 
 _LOG_DEFAULTS = {"ts": "", "task": "", "backend": "", "model": "", "tokens_in": 0,
-                 "tokens_out": 0, "duration_ms": 0, "ok": True, "error": "", "note": "",
+                 "tokens_out": 0, "cached_tokens": 0, "duration_ms": 0, "ok": True, "error": "", "note": "",
                  "prompt": "", "response": ""}
 
 
@@ -644,7 +651,8 @@ _RESPONSE_CAP = 4000
 
 
 def log_event(db: Session, *, task: str, backend: str = "", model: str = "",
-              tokens_in: int = 0, tokens_out: int = 0, duration_ms: int = 0,
+              tokens_in: int = 0, tokens_out: int = 0, cached_tokens: int = 0,
+              duration_ms: int = 0,
               ok: bool = True, error: str = "", note: str = "",
               prompt: str = "", response: str = "") -> None:
     """Append one line to the AI activity log (ring buffer in app_settings).
@@ -655,8 +663,9 @@ def log_event(db: Session, *, task: str, backend: str = "", model: str = "",
         "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "task": task, "backend": backend, "model": model,
         "tokens_in": int(tokens_in), "tokens_out": int(tokens_out),
+        "cached_tokens": int(cached_tokens),
         "duration_ms": int(duration_ms), "ok": bool(ok),
-        "error": (error or "")[:300], "note": (note or "")[:300],
+        "error": (error or "")[:800], "note": (note or "")[:300],
         "prompt": (prompt or "")[:_PROMPT_CAP], "response": (response or "")[:_RESPONSE_CAP],
     }
     row = db.get(AppSetting, LOG_KEY)
@@ -719,40 +728,141 @@ def _anthropic_client(key: str, workspace_id: str | None = None):
 async def _anthropic_call(
     key: str, *, model: str, system: str, content: Any, max_tokens: int,
     workspace_id: str | None = None,
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int, int]:
     client = _anthropic_client(key, workspace_id)
     msg = await client.messages.create(
-        model=model, max_tokens=max_tokens, system=system,
+        model=model, max_tokens=max_tokens,
+        system=[{"type": "text", "text": system,
+                 "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": content}],
     )
     text = "".join(b.text for b in msg.content if b.type == "text")
-    return text, msg.usage.input_tokens, msg.usage.output_tokens
+    cached = int(getattr(msg.usage, "cache_read_input_tokens", 0) or 0)
+    created = int(getattr(msg.usage, "cache_creation_input_tokens", 0) or 0)
+    total_input = int(msg.usage.input_tokens) + cached + created
+    return text, total_input, int(msg.usage.output_tokens), cached
+
+
+def _http(timeout: float = 120) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=timeout)
+
+
+#: Endpoints that rejected `max_tokens` / `temperature`, learned from their own
+#: 400 and remembered for the life of the process: the newer OpenAI reasoning
+#: models renamed the first and fixed the second, and there is no way to know
+#: which family a model id belongs to for a custom endpoint. Keyed
+#: "<base url>|<model>" so one provider's quirk never silences another's.
+_RENAMED_TOKEN_FIELD: set[str] = set()
+_NO_TEMPERATURE: set[str] = set()
+
+#: A provider that says "try again in N seconds" is worth waiting for; one that
+#: says nothing, or names a longer wait, is not — the task's route has a next
+#: step, and sitting on a daily quota that resets tomorrow helps nobody.
+RETRY_WAIT_CAP_S = 20.0
+
+
+def _error_detail(resp: httpx.Response) -> str:
+    """The provider's own message ("The model 'X' does not exist…") rather than
+    a bare "404 Not Found"."""
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 — not every error body is JSON
+        return resp.text
+    if isinstance(body, list):          # Google's OpenAI-compatible errors
+        body = body[0] if body else {}
+    if isinstance(body, dict):
+        message = (body.get("error") or {}).get("message")
+        if message:
+            return str(message)
+    return resp.text
+
+
+def _unsupported_parameter(detail: str) -> str | None:
+    """The request parameter a 400 is complaining about, if it names one.
+
+    Seen in the AI journal: "Unsupported parameter: 'max_tokens' is not
+    supported with this model. Use 'max_completion_tokens' instead." Every call
+    to that model failed outright, which is worth one adapted retry rather than
+    an unusable provider.
+    """
+    match = re.search(r"[Uu]nsupported (?:parameter|value): '([a-z_]+)'", detail)
+    return match.group(1) if match else None
+
+
+def _retry_wait(status: int, body: str) -> float | None:
+    """Seconds to wait before one retry, or None to give up on this target.
+
+    503 is a model under load and clears in seconds. 429 is either a per-minute
+    limit (the provider names a `retryDelay`) or an exhausted plan quota, which
+    no amount of waiting fixes — so only the first is retried. Reads the whole
+    response body, not the error message: `retryDelay` sits beside it in
+    `details`, which is why this takes the raw text.
+    """
+    if status == 503:
+        return 2.0
+    if status == 429:
+        match = re.search(r'"?retry[-_]?[Dd]elay"?[":\s]+"?(\d+(?:\.\d+)?)s', body)
+        if match:
+            wait = float(match.group(1))
+            return wait if wait <= RETRY_WAIT_CAP_S else None
+    return None
 
 
 async def _openai_call(
     base_url: str, key: str | None, *, model: str, messages: list[dict], max_tokens: int
-) -> tuple[str, int, int]:
-    payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
+) -> tuple[str, int, int, int]:
+    url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        if resp.status_code >= 400:
-            # Surface the provider's own message ("The model 'X' does not exist…")
-            # instead of a bare "404 Not Found".
-            detail = resp.text
-            try:
-                detail = resp.json().get("error", {}).get("message") or detail
-            except Exception:
-                pass
-            raise RuntimeError(f"{resp.status_code} {detail}")
-        body = resp.json()
-    text = body["choices"][0]["message"]["content"] or ""
-    usage = body.get("usage") or {}
-    return text, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
+    target = f"{base_url}|{model}"
+
+    def build() -> dict:
+        payload: dict[str, Any] = {"model": model, "messages": messages}
+        # OpenAI caches matching prompt prefixes automatically. A deterministic
+        # key improves routing for pre-5.6 models and separates each workflow's
+        # cache accounting. Third-party compatible endpoints may reject it.
+        if base_url.rstrip("/") == "https://api.openai.com/v1":
+            stable_prefix = next(
+                (m.get("content", "") for m in messages if m.get("role") == "system"), ""
+            )
+            if isinstance(stable_prefix, str) and stable_prefix:
+                digest = hashlib.sha256(stable_prefix.encode("utf-8")).hexdigest()[:24]
+                payload["prompt_cache_key"] = f"receipt-scanner-{digest}"
+        payload["max_completion_tokens" if target in _RENAMED_TOKEN_FIELD
+                else "max_tokens"] = max_tokens
+        if target not in _NO_TEMPERATURE:
+            payload["temperature"] = 0
+        return payload
+
+    status, detail = 0, ""
+    async with _http() as client:
+        # Three attempts at most, and only for a reason: each retry is either the
+        # provider telling us to wait, or a payload it told us how to fix.
+        for _attempt in range(3):
+            resp = await client.post(url, headers=headers, json=build())
+            if resp.status_code < 400:
+                body = resp.json()
+                text = body["choices"][0]["message"]["content"] or ""
+                usage = body.get("usage") or {}
+                details = usage.get("prompt_tokens_details") or {}
+                return (text, int(usage.get("prompt_tokens", 0)),
+                        int(usage.get("completion_tokens", 0)),
+                        int(details.get("cached_tokens", 0) or 0))
+            status, detail = resp.status_code, _error_detail(resp)
+            parameter = _unsupported_parameter(detail) if status == 400 else None
+            if parameter == "max_tokens" and target not in _RENAMED_TOKEN_FIELD:
+                logger.info("%s wants max_completion_tokens; adapting", target)
+                _RENAMED_TOKEN_FIELD.add(target)
+                continue
+            if parameter == "temperature" and target not in _NO_TEMPERATURE:
+                logger.info("%s rejects an explicit temperature; dropping it", target)
+                _NO_TEMPERATURE.add(target)
+                continue
+            wait = _retry_wait(status, resp.text)
+            if wait is None:
+                break
+            logger.info("%s answered %d; one retry in %.1fs", target, status, wait)
+            await asyncio.sleep(wait)
+    raise RuntimeError(f"{status} {detail}")
 
 
 def _image_data_uri(image: bytes, media_type: str) -> str:
@@ -770,48 +880,65 @@ def _cloud_context(db: Session, cfg: AiConfig, provider: str) -> tuple[ProviderS
     return spec, key, conf
 
 
+def _provider_result(value: tuple) -> tuple[str, int, int, int]:
+    """Normalize provider results while keeping older adapters/test doubles valid."""
+    text, tokens_in, tokens_out = value[:3]
+    cached_tokens = value[3] if len(value) > 3 else 0
+    return text, int(tokens_in), int(tokens_out), int(cached_tokens)
+
+
 async def _cloud_text(
     db: Session, cfg: AiConfig, *, provider: str, model: str, system: str, user: str,
     max_tokens: int,
-) -> tuple[str, int, int, str]:
+) -> tuple[str, int, int, str, int]:
     spec, key, conf = _cloud_context(db, cfg, provider)
     if spec.kind == "anthropic":
-        text, tin, tout = await _anthropic_call(
+        text, tin, tout, cached = _provider_result(await _anthropic_call(
             key, model=model, system=system, content=user, max_tokens=max_tokens,
-            workspace_id=(conf.workspace_id if conf else "") or None)
+            workspace_id=(conf.workspace_id if conf else "") or None))
     else:
-        text, tin, tout = await _openai_call(
+        text, tin, tout, cached = _provider_result(await _openai_call(
             _openai_base_url(cfg, provider, spec), key, model=model, max_tokens=max_tokens,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-    return text, tin, tout, text
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}]))
+    return text, tin, tout, text, cached
 
 
 async def _cloud_vision(
     db: Session, cfg: AiConfig, *, provider: str, model: str, system: str, prompt: str,
-    image: bytes, media_type: str, max_tokens: int,
-) -> tuple[str, int, int, str]:
+    image: bytes, media_type: str, max_tokens: int, extra_images: list[bytes] | None = None,
+) -> tuple[str, int, int, str, int]:
+    """One model call over one photo — or over every frame of one receipt.
+
+    A receipt taller than the camera frame is shot in parts, and the parts are
+    one document: sent together in a single message they are read as one, with
+    the overlap between frames resolved by the model. Sent one call each they
+    would come back as several receipts, which is the thing to avoid.
+    """
     spec, key, conf = _cloud_context(db, cfg, provider)
+    frames = [image, *(extra_images or [])]
     if spec.kind == "anthropic":
         content = [
             {"type": "image", "source": {"type": "base64", "media_type": media_type,
-                                         "data": base64.b64encode(image).decode()}},
-            {"type": "text", "text": prompt},
+                                         "data": base64.b64encode(frame).decode()}}
+            for frame in frames
         ]
-        text, tin, tout = await _anthropic_call(
+        content.append({"type": "text", "text": prompt})
+        text, tin, tout, cached = _provider_result(await _anthropic_call(
             key, model=model, system=system, content=content, max_tokens=max_tokens,
-            workspace_id=(conf.workspace_id if conf else "") or None)
-        return text, tin, tout, text
+            workspace_id=(conf.workspace_id if conf else "") or None))
+        return text, tin, tout, text, cached
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": _image_data_uri(image, media_type)}},
+            *({"type": "image_url", "image_url": {"url": _image_data_uri(frame, media_type)}}
+              for frame in frames),
         ]},
     ]
-    text, tin, tout = await _openai_call(
+    text, tin, tout, cached = _provider_result(await _openai_call(
         _openai_base_url(cfg, provider, spec), key, model=model, messages=messages,
-        max_tokens=max_tokens)
-    return text, tin, tout, text
+        max_tokens=max_tokens))
+    return text, tin, tout, text, cached
 
 
 def _extract_json(text: str) -> Any:
@@ -829,31 +956,55 @@ class CategoryGuess(BaseModel):
     confidence: float = 0.0
 
 
-def build_classify_prompt(names: list[str], taxonomy: list[str]) -> tuple[str, str]:
+def build_classify_prompt(
+    names: list[str],
+    taxonomy: list[str],
+    contexts: dict[str, dict[str, Any]] | None = None,
+    db: Session | None = None,
+) -> tuple[str, str]:
     """(system, user) prompt for product-category classification. Shared by the
-    live API path and the manual "bring your own AI" path (api/categories.py)."""
-    user = (
-        "Assign every product to the single best-fitting category path from the "
-        "allowed list. If none fits, use an empty string.\n\n"
+    live API path and the manual "bring your own AI" path (api/categories.py).
+
+    Automatic classification can attach receipt context (most importantly the
+    shop name) without changing the product name used as the response/cache key.
+    """
+    products: list[str] | list[dict[str, Any]]
+    if contexts:
+        products = [
+            {"name": name, **contexts.get(name, {})}
+            for name in names
+        ]
+        products_label = "Products with receipt context"
+    else:
+        products = names
+        products_label = "Products"
+    system = (
+        f"{prompt_catalog.get(db, 'json_response_rules')}\n\n"
+        f"{prompt_catalog.get(db, 'language_variants')}\n\n"
+        f"{prompt_catalog.get(db, 'classify_rules')}\n\n"
         f"Allowed category paths:\n{json.dumps(taxonomy, ensure_ascii=False)}\n\n"
-        f"Products:\n{json.dumps(names, ensure_ascii=False)}\n\n"
         'Reply as {"<product>": {"category_path": "<path>", "confidence": <0..1>}, ...}.'
     )
-    return _JSON_SYSTEM, user
+    user = (
+        f"{products_label}:\n{json.dumps(products, ensure_ascii=False)}\n\n"
+        "Classify every product above."
+    )
+    return system, user
 
 
 def _numbered(names: list[str], start: int = 1) -> dict[str, str]:
     return {str(i): n for i, n in enumerate(names, start)}
 
 
-def build_manual_prompt(names: list[str], taxonomy: list[str], *, start: int = 1) -> str:
+def build_manual_prompt(names: list[str], taxonomy: list[str], *, start: int = 1,
+                        db: Session | None = None) -> str:
     """One-message manual prompt. Products are keyed by a **number** so the answer
     stays valid JSON even when a name contains quotes, and short so chatbots don't
     truncate it — the app maps the numbers back to names on apply."""
     return (
-        f"{_JSON_SYSTEM}\n\n"
-        "Assign every product to the single best-fitting category path from the "
-        "allowed list. If none fits, use an empty string.\n\n"
+        f"{prompt_catalog.get(db, 'json_response_rules')}\n\n"
+        f"{prompt_catalog.get(db, 'language_variants')}\n\n"
+        f"{prompt_catalog.get(db, 'classify_rules')}\n\n"
         f"Allowed category paths:\n{json.dumps(taxonomy, ensure_ascii=False)}\n\n"
         f"Products (id: name):\n{json.dumps(_numbered(names, start), ensure_ascii=False, indent=0)}\n\n"
         'Reply with the SAME numeric ids as keys: '
@@ -861,12 +1012,14 @@ def build_manual_prompt(names: list[str], taxonomy: list[str], *, start: int = 1
     )
 
 
-def build_classify_preamble(taxonomy: list[str]) -> str:
+def build_classify_preamble(taxonomy: list[str], db: Session | None = None) -> str:
     """The shared instruction block for the batched manual flow: system rules +
     task + the allowed taxonomy, but no products. The user pastes this once, then
     feeds the numbered product lists (see `build_classify_batch`) one at a time."""
     return (
-        f"{_JSON_SYSTEM}\n\n"
+        f"{prompt_catalog.get(db, 'json_response_rules')}\n\n"
+        f"{prompt_catalog.get(db, 'language_variants')}\n\n"
+        f"{prompt_catalog.get(db, 'classify_rules')}\n\n"
         "I will send you several batches of products, one message at a time. Each "
         'batch is a JSON object {"<id>": "<product name>", ...}. For every product '
         "assign the single best-fitting category path from the allowed list below; "
@@ -884,7 +1037,10 @@ def build_classify_batch(names: list[str], *, start: int = 1) -> str:
 
 
 async def classify_products(
-    db: Session, names: list[str], taxonomy: list[str]
+    db: Session,
+    names: list[str],
+    taxonomy: list[str],
+    contexts: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, CategoryGuess]:
     """Map each distinct product name to a category path from `taxonomy`.
 
@@ -896,7 +1052,7 @@ async def classify_products(
     if not names:
         return {}
     cfg = load_config(db)
-    system, user = build_classify_prompt(names, taxonomy)
+    system, user = build_classify_prompt(names, taxonomy, contexts, db)
     preview = f"{len(names)} назв: " + ", ".join(names[:12]) + ("…" if len(names) > 12 else "")
     raw = await run_text(db, cfg, "classify", system=system, user=user, max_tokens=4096,
                          prompt_preview=preview)
@@ -923,21 +1079,90 @@ async def normalize_query(db: Session, phrase: str, store_code: str) -> str:
         "Return the best short catalogue search query (Ukrainian, 1–3 words, no brand "
         'unless the entry named one) as {"query": "<text>"}.'
     )
-    raw = await run_text(db, cfg, "normalize", system=_JSON_SYSTEM, user=user, max_tokens=256,
+    system = (f"{prompt_catalog.get(db, 'json_response_rules')}\n\n"
+              f"{prompt_catalog.get(db, 'language_variants')}\n\n"
+              f"{prompt_catalog.get(db, 'normalize_rules')}")
+    raw = await run_text(db, cfg, "normalize", system=system, user=user, max_tokens=256,
                          prompt_preview=f'"{phrase}" · магазин {store_code}')
     data = raw if isinstance(raw, dict) else _extract_json(raw)
     return str(data.get("query") or phrase).strip()
 
 
-async def ocr_receipt(db: Session, image: bytes, media_type: str = "image/jpeg") -> dict | None:
+@dataclasses.dataclass
+class ReceiptOcr:
+    """A vision reading of a receipt photo, and the route step that produced it."""
+    data: dict | None
+    service: str = ""
+    model: str = ""
+    steps: list[str] = dataclasses.field(default_factory=list)
+    attempts: list[dict] = dataclasses.field(default_factory=list)
+    error: str = ""
+
+
+def _ocr_objection(raw: Any) -> str | None:
+    """Why this reply is objectively unusable, or None if it is worth keeping.
+
+    The bar is deliberately low and entirely factual (ROADMAP §2.2): a reply
+    that is not JSON, or that carries neither items nor a total, or whose lines
+    contradict its own total beyond any plausible discount, has not read the
+    receipt — and the next model in the route is worth its cost. Everything
+    softer (a collapsed screenshot, a shop name the model was unsure of, its own
+    `complete` flag) is the pipeline's business to judge, not grounds for
+    spending a second model.
+    """
+    data = raw if isinstance(raw, dict) else None
+    if data is None:
+        try:
+            data = _extract_json(raw)
+        except Exception:  # noqa: BLE001 — a reply that is not JSON is not a receipt
+            return "відповідь не є структурованим JSON"
+    if not isinstance(data, dict):
+        return "відповідь не є структурованим JSON"
+
+    items = [row for row in (data.get("items") or []) if isinstance(row, dict)]
+    try:
+        total = float(data.get("total_amount"))
+    except (TypeError, ValueError):
+        total = 0.0
+    if not items and total <= 0:
+        return "модель не повернула ні товарів, ні суми"
+    if not items:
+        return "модель не повернула жодного товару"
+    if total <= 0:
+        return "модель не повернула підсумкової суми"
+
+    lines = 0.0
+    for row in items:
+        try:
+            lines += float(row.get("total_price"))
+        except (TypeError, ValueError):
+            continue
+    # Discounts, deposits and rounding routinely move the sum of the lines a
+    # little; a fifth of the receipt is not a discount, it is a misread.
+    if lines and abs(lines - total) > max(0.2 * total, 5.0):
+        return f"сума рядків {lines:.2f} не сходиться з підсумком {total:.2f}"
+    return None
+
+
+async def ocr_receipt(db: Session, image: bytes, media_type: str = "image/jpeg", *,
+                      start_after: tuple[str, str] | None = None,
+                      extra_images: list[bytes] | None = None) -> ReceiptOcr:
     """Vision OCR of a narrow paper receipt → a raw structured dict.
 
     Only reached from the receipt branch of the upload router (never for personal
-    documents — see ROADMAP.md § 3). Returns the parsed model output, or None
-    when no routed provider could read the photo.
+    documents — see ROADMAP.md § 3). Walks the "OCR чеків (фото)" route and stops
+    at the first step whose answer is usable; `start_after` resumes the walk past
+    a step already spent, which is what "спробувати сильнішу AI" does.
+
+    `extra_images` are further frames of the *same* receipt — one call, one
+    receipt, whatever number of photos it took to capture it.
     """
     cfg = load_config(db)
     system = (
+        f"{prompt_catalog.get(db, 'json_response_rules')}\n\n"
+        f"{prompt_catalog.get(db, 'language_variants')}\n\n"
+        f"{prompt_catalog.get(db, 'ocr_rules')}\n\n"
+        f"{prompt_catalog.get(db, 'receipt_amount_rules')}\n\n"
         "You transcribe photographed retail receipts and screenshots containing a receipt QR. "
         "Inspect the entire image, including the header above the item list. Copy the visible "
         "merchant, shop, fuel-station or location header exactly into shop_name (for example "
@@ -949,41 +1174,135 @@ async def ocr_receipt(db: Session, image: bytes, media_type: str = "image/jpeg")
         "check set complete=true and transcribe every item. Reply with one JSON object: "
         '{"complete" (boolean), "seller_name", "shop_name", "shop_address", '
         '"payment_type" (cash/card/null), "purchased_at" (ISO 8601 or null), "total_amount" (number), '
-        '"currency", "items":[{"name","quantity","unit_price","total_price"}]}.'
+        '"currency", "total_discount" (number|null), "delivery_amount" (number|null), '
+        '"extra_charges":[{"name","amount"}], '
+        '"items":[{"name","quantity","unit_price","total_price","discount" (number|null)}]}. '
     )
+    frames = 1 + len(extra_images or [])
+    if frames > 1:
+        # Without this the model answers per picture and the caller gets three
+        # short receipts instead of one long one.
+        system += (
+            f" The {frames} images are parts of ONE receipt, shot in order and overlapping: "
+            "merge them into a single receipt, do not repeat an item that appears in two "
+            "images, keep the original item names exactly as printed, never translate them, "
+            "and use null for anything you cannot read."
+        )
+    prompt = ("Transcribe this receipt." if frames == 1
+              else f"Transcribe this receipt, photographed in {frames} overlapping parts.")
     try:
-        raw = await run_vision(db, cfg, "ocr", system=system, prompt="Transcribe this receipt.",
-                               image=image, media_type=media_type, max_tokens=4096,
-                               prompt_preview=f"фото чека ({len(image)} B)")
+        answer = await run_vision(db, cfg, "ocr", system=system, prompt=prompt,
+                                  image=image, media_type=media_type, max_tokens=4096,
+                                  prompt_preview=(f"фото чека ({len(image)} B)" if frames == 1
+                                                  else f"{frames} фото одного чека"),
+                                  accept=_ocr_objection, start_after=start_after,
+                                  extra_images=extra_images)
     except AiConfigError as exc:
         logger.warning("receipt OCR has no usable backend: %s", exc)
-        return None
+        return ReceiptOcr(None, error=str(exc))
+    raw = answer.value
     try:
-        return _extract_json(raw) if not isinstance(raw, dict) else raw
-    except Exception:  # noqa: BLE001 — a reply that is not JSON is not a receipt
+        data = raw if isinstance(raw, dict) else _extract_json(raw)
+    except Exception:  # noqa: BLE001 — _ocr_objection already rejects these
         logger.warning("receipt OCR returned unparsable output", exc_info=True)
-        return None
+        return ReceiptOcr(None, service=answer.provider, model=answer.model,
+                          steps=answer.steps, attempts=answer.attempts)
+    return ReceiptOcr(data, service=answer.provider, model=answer.model,
+                      steps=[*answer.steps, f"{answer.provider}/{answer.model}"],
+                      attempts=answer.attempts)
+
+
+def ocr_route_steps(cfg: AiConfig) -> list[tuple[str, str]]:
+    """Every (service, model) the "OCR чеків (фото)" route names, in order."""
+    return [(t.provider, target_model(cfg, t)) for t in cfg.route("ocr")
+            if target_model(cfg, t)]
+
+
+def next_ocr_step(db: Session, after: tuple[str, str] | None,
+                  cfg: "AiConfig | None" = None) -> tuple[str, str, str] | None:
+    """The step after `after` in the current OCR route: (service, model, label).
+
+    Looked up by the service+model pair rather than by a stored position, so a
+    route the user has since reordered still escalates in the order they see.
+    Returns None when `after` was the last usable step — the caller then hides
+    the "stronger AI" action instead of offering a step that cannot run.
+    """
+    cfg = cfg if cfg is not None else load_config(db)
+    steps = ocr_route_steps(cfg)
+    start = 0
+    if after is not None and after in steps:
+        start = steps.index(after) + 1
+    for provider, model in steps[start:]:
+        if provider_ready(db, cfg, provider) is None:
+            conf = cfg.provider(provider)
+            label = (conf.label if conf else provider) or provider
+            return provider, model, label
+    return None
 
 
 # --------------------------------------------------------------------------- #
 # Routing
 # --------------------------------------------------------------------------- #
+@dataclasses.dataclass
+class AiAnswer:
+    """What a routed call produced, and which step of the route produced it.
+
+    The step matters beyond bookkeeping: the user is shown it ("Розпізнано AI:
+    Google Gemini / gemini-…") and the "try a stronger AI" action resumes the
+    route *after* this exact service+model pair, so escalation follows the order
+    the user set in AI → Маршрути задач rather than a remembered index.
+    """
+    value: Any
+    provider: str = ""
+    model: str = ""
+    #: Every "provider/model" this call went through, the successful one last.
+    steps: list[str] = dataclasses.field(default_factory=list)
+    #: One row per step the route actually spent, successful or not:
+    #: {service, model, ok, ms, tokens_in, tokens_out, cached_tokens, error}. This is what the
+    #: per-receipt recognition log and the model statistics are built from — the
+    #: ai_log ring buffer holds the same facts but only for the last N calls,
+    #: across every task at once.
+    attempts: list[dict] = dataclasses.field(default_factory=list)
+
+
 async def _run(db: Session, cfg: AiConfig, task: str, *, make_call,
-               prompt_preview: str = "") -> Any:
+               prompt_preview: str = "", accept=None,
+               start_after: tuple[str, str] | None = None,
+               skip: set[str] | None = None) -> AiAnswer:
     """Walk the task's priority list (Settings block 2) and use the first target
-    that is enabled, configured and answers.
+    that is enabled, configured and answers *usably*.
 
     `make_call(provider, model)` returns an awaitable yielding
-    (result, tokens_in, tokens_out, raw_reply_text), or None when that target
-    cannot serve this kind of request (a local model asked for vision). Every
+    (result, tokens_in, tokens_out, raw_reply_text[, cached_tokens]), or None when
+    that target cannot serve this kind of request (a local model asked for vision). Every
     attempt — success or failure — is metered (ai_usage) and logged (ai_log)
     together with `prompt_preview` and the raw model reply.
+
+    `accept(result)` returns None for an answer worth keeping, or why it is
+    objectively broken — empty, unparsable, missing the fields the task exists
+    to produce. Only that moves the walk on to the next step; a model's own
+    opinion of how well it did never does, because paying for a second model on
+    a self-reported "confidence" spends real money on nothing.
+
+    `start_after` resumes the route after a service+model pair already used (the
+    user pressing "try a stronger AI"), and `skip` drops pairs already spent, so
+    an escalation never re-runs work that is already on file.
     """
     attempted: list[str] = []
     errors: list[str] = []
+    attempts: list[dict] = []
+    resuming = start_after is not None
     for target in cfg.route(task):
         provider = target.provider
         model = target_model(cfg, target)
+        if resuming:
+            # Matched on the pair, not on position: the user may have reordered
+            # or edited the route since the answer we are escalating from.
+            if (provider, model) == start_after:
+                resuming = False
+            continue
+        if skip and f"{provider}/{model}" in skip:
+            continue
         reason = provider_ready(db, cfg, provider)
         if reason:
             errors.append(f"{provider}: {reason}")
@@ -1003,7 +1322,9 @@ async def _run(db: Session, cfg: AiConfig, task: str, *, make_call,
         attempted.append(f"{provider}/{model}")
         t0 = time.monotonic()
         try:
-            result, tin, tout, raw = await call()
+            call_result = await call()
+            result, tin, tout, raw = call_result[:4]
+            cached = int(call_result[4]) if len(call_result) > 4 else 0
         except Exception as exc:  # noqa: BLE001 — fall through to the next target
             dur = int((time.monotonic() - t0) * 1000)
             logger.warning("AI target %s/%s failed for %s: %s", provider, model, task, exc)
@@ -1011,13 +1332,32 @@ async def _run(db: Session, cfg: AiConfig, task: str, *, make_call,
             log_event(db, task=task, backend=provider, model=model, duration_ms=dur,
                       ok=False, error=str(exc), prompt=prompt_preview)
             errors.append(f"{provider}: {exc}")
+            attempts.append({"service": provider, "model": model, "ok": False,
+                             "ms": dur, "tokens_in": 0, "tokens_out": 0,
+                             "error": str(exc)[:300]})
             continue
         dur = int((time.monotonic() - t0) * 1000)
-        _record_usage(db, backend=_meter_bucket(provider), tokens_in=tin, tokens_out=tout)
+        _record_usage(db, backend=_meter_bucket(provider), tokens_in=tin, tokens_out=tout,
+                      cached_tokens=cached)
+        objection = accept(result) if accept is not None else None
         log_event(db, task=task, backend=provider, model=model, tokens_in=tin,
-                  tokens_out=tout, duration_ms=dur, ok=True,
-                  prompt=prompt_preview, response=str(raw))
-        return result
+                  tokens_out=tout, cached_tokens=cached, duration_ms=dur,
+                  ok=objection is None,
+                  error=objection or None, prompt=prompt_preview, response=str(raw))
+        attempts.append({"service": provider, "model": model, "ok": objection is None,
+                         "ms": dur, "tokens_in": int(tin), "tokens_out": int(tout),
+                         "cached_tokens": cached,
+                         "error": (objection or "")[:300]})
+        if objection is not None:
+            # Answered, but not with the thing that was asked for. Worth the
+            # next step in the route — and worth saying which step failed and
+            # why, since that is what the AI journal is read for.
+            logger.info("AI target %s/%s answered unusably for %s: %s",
+                        provider, model, task, objection)
+            errors.append(f"{provider}/{model}: {objection}")
+            continue
+        return AiAnswer(result, provider=provider, model=model, steps=list(attempted),
+                        attempts=attempts)
     raise AiConfigError(
         f"no usable AI backend for {task!r}"
         + (f" (tried {', '.join(attempted)})" if attempted else "")
@@ -1041,22 +1381,30 @@ async def run_text(db: Session, cfg: AiConfig, task: str, *, system: str, user: 
         return lambda: _cloud_text(db, cfg, provider=provider, model=model, system=system,
                                    user=user, max_tokens=max_tokens)
 
-    return await _run(db, cfg, task, make_call=make_call, prompt_preview=prompt_preview)
+    answer = await _run(db, cfg, task, make_call=make_call, prompt_preview=prompt_preview)
+    return answer.value
 
 
 async def run_vision(db: Session, cfg: AiConfig, task: str, *, system: str, prompt: str,
                      image: bytes, media_type: str, max_tokens: int,
-                     prompt_preview: str = "") -> Any:
+                     prompt_preview: str = "", accept=None,
+                     start_after: tuple[str, str] | None = None,
+                     extra_images: list[bytes] | None = None) -> AiAnswer:
     """Image prompt through the task's routing. Local targets are skipped: the
-    Ollama path here speaks text only."""
+    Ollama path here speaks text only.
+
+    Returns the whole `AiAnswer` — for a photo the caller needs to know which
+    model read it, both to show the user and to offer the next step up.
+    """
     def make_call(provider: str, model: str):
         if provider == LOCAL:
             return None
         return lambda: _cloud_vision(db, cfg, provider=provider, model=model, system=system,
                                      prompt=prompt, image=image, media_type=media_type,
-                                     max_tokens=max_tokens)
+                                     max_tokens=max_tokens, extra_images=extra_images)
 
-    return await _run(db, cfg, task, make_call=make_call, prompt_preview=prompt_preview)
+    return await _run(db, cfg, task, make_call=make_call, prompt_preview=prompt_preview,
+                      accept=accept, start_after=start_after)
 
 
 # --------------------------------------------------------------------------- #

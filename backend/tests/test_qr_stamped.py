@@ -11,7 +11,7 @@ import pytest
 from app.scanner.fiscal_qr import scan_qr
 
 URL = ("https://cabinet.tax.gov.ua/cashregs/check?"
-       "id=1&fn=4001118996&date=20260912&time=121046&sm=9253.67")
+       "id=1&fn=4000000002&date=20260912&time=121046&sm=9253.67")
 
 
 def _qr_photo() -> np.ndarray:

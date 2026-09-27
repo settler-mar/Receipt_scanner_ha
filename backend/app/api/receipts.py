@@ -5,25 +5,38 @@ import io
 import re
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from pypdf import PdfReader
 from sqlalchemy import delete as sa_delete, func, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, noload, selectinload
 
 from app.adapters.base import AdapterError, NotImplementedYet, NormalizedItem, NormalizedReceipt
 from app.core.time import store_local_to_utc
 from app.adapters.registry import get_adapter
 from app.core.config import BASE_DIR
 from app.db import get_db
-from app.models.models import Account, Receipt, ReceiptItem, ReceiptTag, derive_unit_price
+from app.models.models import (
+    Account,
+    Receipt,
+    ReceiptComponent,
+    ReceiptItem,
+    ReceiptItemFile,
+    ReceiptTag,
+    derive_unit_price,
+)
 from app.schemas.schemas import (
     ReceiptCreate,
     ExchangeRateBackfillOut,
     ReceiptItemCreate,
+    ReceiptItemCategorize,
+    ReceiptItemFileLink,
+    ReceiptItemFileOut,
     ReceiptItemOut,
     ReceiptItemUpdate,
+    ReceiptProblemBulkAction,
     ReceiptListOut,
     ReceiptOut,
     ReceiptTagSummary,
@@ -31,12 +44,19 @@ from app.schemas.schemas import (
     ShopSuggestion,
     TagRename,
 )
-from app.services.categorize import apply_known_categories, record_user_choice
+from app.services import ai
+from app.services.product_images import ImageDownloadError, download_image
+from app.services.categorize import (
+    apply_known_categories,
+    classify_receipt_item,
+    record_user_choice,
+)
 from app.services.exchange_rates import rate_to_uah
-from app.services.exchange_rates import backfill_missing_rates
+from app.services import exchange_rates
 from app.services.text import normalize_tag, normalize_tags
 from app.services.shopping_list import match_receipt
 from app.services.collector import ensure_fresh_token, persist_rotated_access_token
+from app.services.reconciliation import recalculate_receipt
 from app.services.manual_dedup import find_duplicate, ingestion_lock
 from app.services.receipt_visibility import visible_receipt_clause
 
@@ -48,6 +68,10 @@ _ALLOWED_PHOTO_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 _MAX_PHOTO_BYTES = 15 * 1024 * 1024
 
 WARRANTY_DIR = BASE_DIR / "data" / "warranty"
+# Per-item attachments (photo of the product or of a paper warranty talon) —
+# the manual, non-PDF way to document a warranty, see ReceiptItemFile.
+ITEM_FILE_DIR = BASE_DIR / "data" / "item_files"
+_ITEM_FILE_KINDS = {"warranty", "photo"}
 _MAX_WARRANTY_BYTES = 15 * 1024 * 1024
 # Дніпро-М's own phrasing ("Гарантія діє з 09.06.2026 по 09.06.2029") — confirmed
 # against a real downloaded warranty-card PDF, see RESEARCH.md. Best-effort only:
@@ -77,6 +101,8 @@ def _extract_warranty_expiry(pdf_bytes: bytes) -> dt.datetime | None:
 def _get_receipt_or_404(receipt_id: str, db: Session) -> Receipt:
     r = db.get(Receipt, receipt_id, options=[
         selectinload(Receipt.items).selectinload(ReceiptItem.category),
+        selectinload(Receipt.items).selectinload(ReceiptItem.files),
+        selectinload(Receipt.components),
         selectinload(Receipt.account),
         selectinload(Receipt.tags),
     ])
@@ -92,14 +118,52 @@ def _item_data_with_unit_price(item) -> dict:
     return data
 
 
+def _normalized_item(item) -> NormalizedItem:
+    """A typed-in line in the shape the duplicate check speaks.
+
+    The two shapes name one thing differently: the shop's own category label is
+    `category` on the adapters' `NormalizedItem` and `category_raw` on the
+    column it lands in. Splatting the payload into both is what made manual
+    entry fail outright — the ORM row took `category_raw`, the dataclass did not.
+    """
+    data = _item_data_with_unit_price(item)
+    return NormalizedItem(category=data.pop("category_raw", None), **data)
+
+
+def _file_url(item: ReceiptItem, file: ReceiptItemFile) -> str:
+    return f"/api/receipts/{item.receipt_id}/items/{item.id}/files/{file.id}"
+
+
+def _item_out(item: ReceiptItem) -> ReceiptItemOut:
+    out = ReceiptItemOut.model_validate(item)
+    out.category_path = item.category.path if item.category else None
+    if out.unit_price is None:
+        out.unit_price = derive_unit_price(out.quantity, out.total_price)
+    for file_out, file in zip(out.files, item.files):
+        file_out.url = _file_url(item, file)
+    return out
+
+
+def _unlink_item_files(item: ReceiptItem) -> None:
+    for file in item.files:
+        if file.filename:
+            (ITEM_FILE_DIR / file.filename).unlink(missing_ok=True)
+
+
 def _out(r: Receipt) -> ReceiptOut:
     out = ReceiptOut.model_validate(r)
+    out.items_total = float(r.items_total or 0)
+    out.total_delta = float(r.reconciliation_delta or 0)
+    out.has_total_mismatch = r.reconciliation_status == "open"
+    out.seller_phone = (r.raw or {}).get("seller_phone")
     source_items = {it.id: it for it in r.items}
     for item_out in out.items:
         source_item = source_items[item_out.id]
         item_out.category_path = source_item.category.path if source_item.category else None
         if item_out.unit_price is None:
             item_out.unit_price = derive_unit_price(item_out.quantity, item_out.total_price)
+        for file_out, file in zip(item_out.files, source_item.files):
+            file_out.url = _file_url(source_item, file)
     out.account_label = r.account.label
     out.tags = [t.tag for t in r.tags]
     out.photo_url = f"/api/receipts/{r.id}/photo" if r.photo_filename else None
@@ -108,6 +172,19 @@ def _out(r: Receipt) -> ReceiptOut:
     out.warranty_text = (r.raw or {}).get("warranty_text")
     out.warranty_pdf_url = f"/api/receipts/{r.id}/warranty" if r.warranty_pdf_filename else None
     return out
+
+
+def _items_total_subquery():
+    return (
+        select(func.coalesce(func.sum(ReceiptItem.total_price), 0))
+        .where(ReceiptItem.receipt_id == Receipt.id)
+        .correlate(Receipt)
+        .scalar_subquery()
+    )
+
+
+def _mismatch_clause():
+    return Receipt.reconciliation_status == "open"
 
 
 @router.get("/shops", response_model=list[ShopSuggestion])
@@ -138,11 +215,15 @@ def list_receipts(
     date_to: dt.datetime | None = None,
     search: str | None = Query(default=None, description="Free-text over shop name / item names"),
     tag: str | None = Query(default=None, description="Only receipts carrying this hashtag"),
+    problem: str | None = Query(default=None, description="open | ignored"),
+    sort_by: str = Query(default="purchased_at"),
+    sort_dir: str = Query(default="desc", pattern="^(asc|desc)$"),
     limit: int = Query(default=50, le=200),
     offset: int = 0,
 ):
     stmt = select(Receipt).options(
-        selectinload(Receipt.items).selectinload(ReceiptItem.category),
+        noload(Receipt.items),
+        noload(Receipt.components),
         selectinload(Receipt.account),
         selectinload(Receipt.tags),
     ).where(visible_receipt_clause())
@@ -162,11 +243,35 @@ def list_receipts(
         stmt = stmt.where(
             Receipt.id.in_(select(ReceiptTag.receipt_id).where(ReceiptTag.tag == normalize_tag(tag)))
         )
+    if problem == "open":
+        stmt = stmt.where(_mismatch_clause(), Receipt.reconciliation_ignored_at.is_(None))
+    elif problem == "ignored":
+        stmt = stmt.where(_mismatch_clause(), Receipt.reconciliation_ignored_at.is_not(None))
 
-    total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
-    rows = db.execute(
-        stmt.order_by(Receipt.purchased_at.desc()).limit(limit).offset(offset)
-    ).scalars().all()
+    sort_columns = {
+        "date": Receipt.purchased_at,
+        "account": select(Account.label).where(Account.id == Receipt.account_id).scalar_subquery(),
+        "channel": Receipt.channel,
+        "store": Receipt.shop_name,
+        "address": Receipt.shop_address,
+        "tags": select(func.min(ReceiptTag.tag)).where(ReceiptTag.receipt_id == Receipt.id).scalar_subquery(),
+        "amount": Receipt.total_amount,
+        "discount": Receipt.total_discount,
+        "items_total": Receipt.items_total,
+        "difference": func.abs(Receipt.reconciliation_delta),
+        "problem_ignored_at": Receipt.reconciliation_ignored_at,
+    }
+    sort_expression = sort_columns.get(sort_by, Receipt.purchased_at)
+    sort_expression = sort_expression.asc() if sort_dir == "asc" else sort_expression.desc()
+
+    # Count and page in one SQL statement.  The previous implementation ran
+    # the full filtered query twice on every page request.
+    paged_stmt = stmt.add_columns(func.count().over().label("_total"))
+    result_rows = db.execute(
+        paged_stmt.order_by(sort_expression, Receipt.id.asc()).limit(limit).offset(offset)
+    ).all()
+    total = int(result_rows[0][1]) if result_rows else 0
+    rows = [row[0] for row in result_rows]
 
     return ReceiptListOut(total=total, items=[_out(r) for r in rows])
 
@@ -192,8 +297,54 @@ def list_tags(db: Session = Depends(get_db)):
 
 
 @router.post("/exchange-rates/backfill", response_model=ExchangeRateBackfillOut)
-def backfill_exchange_rates(db: Session = Depends(get_db), limit: int | None = Query(default=None, ge=1, le=5000)):
-    return backfill_missing_rates(db, limit=limit)
+def backfill_exchange_rates(
+    background: BackgroundTasks,
+    limit: int | None = Query(default=None, ge=1, le=5000),
+):
+    try:
+        exchange_rates.reserve_backfill()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    background.add_task(exchange_rates.run_backfill_in_background, limit=limit)
+    return ExchangeRateBackfillOut(checked=0, updated=0, missing=0, queued=True)
+
+
+@router.post("/bulk/problem-actions")
+def bulk_problem_action(payload: ReceiptProblemBulkAction, db: Session = Depends(get_db)):
+    """Apply a reconciliation action to the selected problematic receipts."""
+    now = dt.datetime.now(dt.timezone.utc)
+    updated = deleted = skipped = 0
+    for receipt_id in dict.fromkeys(payload.receipt_ids):
+        r = _get_receipt_or_404(receipt_id, db)
+        if payload.action == "delete":
+            if r.photo_filename:
+                (PHOTO_DIR / r.photo_filename).unlink(missing_ok=True)
+            for item in r.items:
+                _unlink_item_files(item)
+            db.delete(r)
+            deleted += 1
+            continue
+        if payload.action in {"recalculate_amount", "recalculate_both"}:
+            r.total_amount = round(
+                sum(float(item.total_price or 0) for item in r.items)
+                + sum(float(component.amount or 0) for component in r.components),
+                2,
+            )
+            r.total_adjustment = 0
+            r.adjustment_reason = None
+        if payload.action in {"recalculate_discount", "recalculate_both"}:
+            r.total_discount = round(sum(float(item.discount or 0) for item in r.items), 2)
+        if payload.action == "ignore":
+            r.reconciliation_ignored_at = now
+        elif payload.action == "unignore":
+            r.reconciliation_ignored_at = None
+        elif payload.action in {"recalculate_amount", "recalculate_discount", "recalculate_both"}:
+            r.reconciliation_ignored_at = None
+        if payload.action != "delete":
+            recalculate_receipt(db, r)
+        updated += 1
+    db.commit()
+    return {"updated": updated, "deleted": deleted, "skipped": skipped}
 
 
 @router.post("/tags/rename", response_model=list[ReceiptTagSummary])
@@ -235,8 +386,11 @@ def create_receipt(payload: ReceiptCreate, db: Session = Depends(get_db)):
         total_amount=payload.total_amount, currency=payload.currency,
         shop_name=payload.shop_name, shop_address=payload.shop_address,
         payment_type=payload.payment_type, channel=payload.channel,
-        total_discount=payload.total_discount, receipt_url=payload.receipt_url,
-        items=[NormalizedItem(**_item_data_with_unit_price(item)) for item in payload.items],
+        total_discount=payload.total_discount,
+        total_adjustment=payload.total_adjustment,
+        adjustment_reason=payload.adjustment_reason,
+        receipt_url=payload.receipt_url,
+        items=[_normalized_item(item) for item in payload.items],
         raw={"source": "manual", "ingest_scope": "manual"},
     )
     with ingestion_lock():
@@ -259,6 +413,8 @@ def create_receipt(payload: ReceiptCreate, db: Session = Depends(get_db)):
             payment_type=payload.payment_type,
             channel=payload.channel,
             total_discount=payload.total_discount,
+            total_adjustment=payload.total_adjustment,
+            adjustment_reason=payload.adjustment_reason,
             receipt_url=payload.receipt_url,
             raw={"source": "manual", "ingest_scope": "manual"},
         )
@@ -269,6 +425,7 @@ def create_receipt(payload: ReceiptCreate, db: Session = Depends(get_db)):
         for it in payload.items:
             db.add(ReceiptItem(receipt_id=receipt.id, **_item_data_with_unit_price(it)))
         db.flush()
+        recalculate_receipt(db, receipt)
         db.refresh(receipt)
         apply_known_categories(db, receipt)
         try:
@@ -311,10 +468,16 @@ def update_receipt(receipt_id: str, payload: ReceiptUpdate, db: Session = Depend
     tags = data.pop("tags", None)
     for field, value in data.items():
         setattr(r, field, value)
+    if "total_amount" in data or "total_discount" in data:
+        r.reconciliation_ignored_at = None
+    if "total_amount" in data:
+        r.total_adjustment = 0
+        r.adjustment_reason = None
     if "exchange_rate_to_uah" not in data and ("currency" in data or "purchased_at" in data):
         r.exchange_rate_to_uah = rate_to_uah(r.currency, r.purchased_at)
     if tags is not None:
         _set_tags(r, tags)
+    recalculate_receipt(db, r)
     db.commit()
     db.refresh(r)
     return _out(_get_receipt_or_404(receipt_id, db))
@@ -325,21 +488,39 @@ def delete_receipt(receipt_id: str, db: Session = Depends(get_db)):
     r = _get_receipt_or_404(receipt_id, db)
     if r.photo_filename:
         (PHOTO_DIR / r.photo_filename).unlink(missing_ok=True)
+    for item in r.items:
+        _unlink_item_files(item)
     db.delete(r)
     db.commit()
+
+
+@router.post("/{receipt_id}/problem")
+def set_receipt_problem_state(
+    receipt_id: str,
+    action: str = Query(..., pattern="^(ignore|unignore)$"),
+    db: Session = Depends(get_db),
+):
+    r = _get_receipt_or_404(receipt_id, db)
+    r.reconciliation_ignored_at = (
+        dt.datetime.now(dt.timezone.utc) if action == "ignore" else None
+    )
+    db.commit()
+    return {"reconciliation_ignored_at": r.reconciliation_ignored_at}
 
 
 @router.post("/{receipt_id}/items", response_model=ReceiptItemOut, status_code=201)
 def add_item(receipt_id: str, payload: ReceiptItemCreate, db: Session = Depends(get_db)):
     r = _get_receipt_or_404(receipt_id, db)
     item = ReceiptItem(receipt_id=r.id, **_item_data_with_unit_price(payload))
+    r.reconciliation_ignored_at = None
     db.add(item)
     db.flush()
+    recalculate_receipt(db, r)
     db.refresh(r)
     apply_known_categories(db, r)
     db.commit()
     db.refresh(item)
-    return item
+    return _item_out(item)
 
 
 @router.patch("/{receipt_id}/items/{item_id}", response_model=ReceiptItemOut)
@@ -351,15 +532,23 @@ def update_item(receipt_id: str, item_id: str, payload: ReceiptItemUpdate, db: S
     fields = payload.model_dump(exclude_unset=True)
     for field, value in fields.items():
         setattr(item, field, value)
+    if fields.keys() & {"quantity", "unit", "unit_price", "total_price", "discount"}:
+        r.reconciliation_ignored_at = None
     if item.unit_price is None:
         item.unit_price = derive_unit_price(item.quantity, item.total_price)
     # A hand-set category is sticky — remember it against this product name so
     # the background AI pass never overwrites it (categorize.record_user_choice).
     if "category_id" in fields:
         record_user_choice(db, item.name, fields["category_id"])
+    # Warranty typed in by hand counts as a check: the WarrantiesView badge and
+    # the adapters' enrichment both read warranty_checked_at to tell "nobody
+    # looked yet" from "looked, and this is what it is".
+    if fields.keys() & {"has_warranty", "warranty_text", "warranty_expires_at"}:
+        item.warranty_checked_at = dt.datetime.now(dt.timezone.utc)
+    recalculate_receipt(db, r)
     db.commit()
     db.refresh(item)
-    return item
+    return _item_out(item)
 
 
 @router.delete("/{receipt_id}/items/{item_id}", status_code=204)
@@ -368,8 +557,176 @@ def delete_item(receipt_id: str, item_id: str, db: Session = Depends(get_db)):
     item = next((it for it in r.items if it.id == item_id), None)
     if item is None:
         raise HTTPException(status_code=404, detail="Item not found on this receipt")
+    _unlink_item_files(item)
+    r.reconciliation_ignored_at = None
     db.delete(item)
+    db.flush()
+    recalculate_receipt(db, r)
     db.commit()
+
+
+@router.post("/{receipt_id}/items/{item_id}/categorize", response_model=ReceiptOut)
+async def categorize_item(
+    receipt_id: str,
+    item_id: str,
+    payload: ReceiptItemCategorize,
+    db: Session = Depends(get_db),
+):
+    receipt = _get_receipt_or_404(receipt_id, db)
+    item = next((row for row in receipt.items if row.id == item_id), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found on this receipt")
+    if not payload.clarification.strip():
+        raise HTTPException(status_code=422, detail="Вкажіть уточнення для категоризації")
+    try:
+        category_id = await classify_receipt_item(db, receipt, item, payload.clarification)
+    except ai.AiConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if category_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="AI не зміг впевнено вибрати категорію з поточного дерева",
+        )
+    db.expire_all()
+    return _out(_get_receipt_or_404(receipt_id, db))
+
+
+def _mark_warranty_documented(item: ReceiptItem, kind: str) -> None:
+    """A talon attached by hand is the proof the line has a warranty; the dates
+    stay optional (PATCH /items/{id} takes them when they are known)."""
+    if kind == "warranty" and not item.has_warranty:
+        item.has_warranty = True
+        item.warranty_checked_at = dt.datetime.now(dt.timezone.utc)
+
+
+def _get_item_or_404(receipt_id: str, item_id: str, db: Session) -> ReceiptItem:
+    r = _get_receipt_or_404(receipt_id, db)
+    item = next((it for it in r.items if it.id == item_id), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found on this receipt")
+    return item
+
+
+@router.post("/{receipt_id}/items/{item_id}/files", response_model=ReceiptItemOut, status_code=201)
+async def upload_item_file(
+    receipt_id: str,
+    item_id: str,
+    file: UploadFile,
+    kind: str = Query(default="warranty", description="warranty | photo"),
+    note: str | None = Query(default=None, max_length=500),
+    db: Session = Depends(get_db),
+):
+    """Attach a photo/scan to one line — the manual alternative to a warranty
+    PDF: most Ukrainian shops give out a stamped paper talon and nothing
+    downloadable, so a phone photo of it (plus the dates typed into PATCH
+    /items/{id}) is the whole warranty record. Unlike the receipt photo, these
+    add up instead of replacing each other: a talon can be several pages."""
+    item = _get_item_or_404(receipt_id, item_id, db)
+    if kind not in _ITEM_FILE_KINDS:
+        raise HTTPException(status_code=400, detail=f"Непідтримуваний тип вкладення: {kind}")
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in _ALLOWED_PHOTO_EXT:
+        raise HTTPException(status_code=400, detail=f"Непідтримуваний тип файлу: {ext or '(немає)'}")
+
+    content = await file.read()
+    if len(content) > _MAX_PHOTO_BYTES:
+        raise HTTPException(status_code=400, detail="Файл завеликий (максимум 15 МБ)")
+
+    ITEM_FILE_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{item.id}-{uuid.uuid4().hex}{ext}"
+    (ITEM_FILE_DIR / filename).write_bytes(content)
+
+    row = ReceiptItemFile(
+        item_id=item.id,
+        kind=kind,
+        filename=filename,
+        original_name=file.filename,
+        content_type=file.content_type,
+        note=(note or None),
+    )
+    db.add(row)
+    _mark_warranty_documented(item, kind)
+    db.commit()
+    # The session already holds this receipt with its old files collection —
+    # expire it so the re-read actually reloads the attachments.
+    db.expire_all()
+    return _item_out(_get_item_or_404(receipt_id, item_id, db))
+
+
+@router.post("/{receipt_id}/items/{item_id}/files/link", response_model=ReceiptItemOut, status_code=201)
+async def link_item_file(
+    receipt_id: str,
+    item_id: str,
+    payload: ReceiptItemFileLink,
+    db: Session = Depends(get_db),
+):
+    """Attach an image by URL — a photo that already exists in the store's
+    product page, in cloud storage or in a chat. The link is only the input
+    method: the bytes are copied into data/item_files/ like an upload, so the
+    attachment outlives the other host deleting or rotating the file. The
+    original URL is kept alongside, as provenance."""
+    item = _get_item_or_404(receipt_id, item_id, db)
+    if payload.kind not in _ITEM_FILE_KINDS:
+        raise HTTPException(status_code=400, detail=f"Непідтримуваний тип вкладення: {payload.kind}")
+    if payload.url.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Очікується http(s)-посилання")
+
+    source_url = str(payload.url)
+    try:
+        content, ext, content_type = await download_image(source_url)
+    except ImageDownloadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    ITEM_FILE_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{item.id}-{uuid.uuid4().hex}{ext}"
+    (ITEM_FILE_DIR / filename).write_bytes(content)
+
+    db.add(
+        ReceiptItemFile(
+            item_id=item.id,
+            kind=payload.kind,
+            filename=filename,
+            source_url=source_url,
+            original_name=Path(urlparse(source_url).path).name or None,
+            content_type=content_type,
+            note=(payload.note or None),
+        )
+    )
+    _mark_warranty_documented(item, payload.kind)
+    db.commit()
+    db.expire_all()
+    return _item_out(_get_item_or_404(receipt_id, item_id, db))
+
+
+@router.get("/{receipt_id}/items/{item_id}/files/{file_id}")
+def get_item_file(receipt_id: str, item_id: str, file_id: str, db: Session = Depends(get_db)):
+    item = _get_item_or_404(receipt_id, item_id, db)
+    row = next((f for f in item.files if f.id == file_id), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Вкладення не знайдено")
+    if not row.filename:
+        # A linked image is fetched by the browser straight from its host.
+        raise HTTPException(status_code=404, detail="Вкладення є посиланням, а не файлом")
+    path = ITEM_FILE_DIR / row.filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Файл вкладення відсутній на диску")
+    return FileResponse(path, media_type=row.content_type or None)
+
+
+@router.delete("/{receipt_id}/items/{item_id}/files/{file_id}", response_model=ReceiptItemOut)
+def delete_item_file(receipt_id: str, item_id: str, file_id: str, db: Session = Depends(get_db)):
+    item = _get_item_or_404(receipt_id, item_id, db)
+    row = next((f for f in item.files if f.id == file_id), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Вкладення не знайдено")
+    if row.filename:
+        (ITEM_FILE_DIR / row.filename).unlink(missing_ok=True)
+    db.delete(row)
+    db.commit()
+    # The session already holds this receipt with its old files collection —
+    # expire it so the re-read actually reloads the attachments.
+    db.expire_all()
+    return _item_out(_get_item_or_404(receipt_id, item_id, db))
 
 
 @router.post("/{receipt_id}/photo", response_model=ReceiptOut)

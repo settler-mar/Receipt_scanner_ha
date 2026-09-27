@@ -108,3 +108,22 @@ def test_missing_unit_price_is_derived_from_quantity_and_line_total(client):
 
     assert response.status_code == 201
     assert response.json()["items"][0]["unit_price"] == 25
+
+
+def test_a_typed_in_line_may_carry_the_shop_category_label(client):
+    """The duplicate check runs on the adapters' shape, where this field is
+    called `category`, while the column is `category_raw`. Passing the payload
+    to both unchanged used to fail the whole request with a TypeError, so manual
+    entry could not be used at all."""
+    c, _ = client
+    acc_id = c.get("/api/receipts?limit=1").json()["items"][0]["account_id"]
+    response = c.post("/api/receipts", json={
+        "account_id": acc_id,
+        "purchased_at": "2026-08-03T10:00:00Z",
+        "total_amount": 40,
+        "items": [{"name": "Сир", "quantity": 1, "total_price": 40,
+                   "category_raw": "Молочні продукти"}],
+    })
+
+    assert response.status_code == 201
+    assert response.json()["items"][0]["category_raw"] == "Молочні продукти"

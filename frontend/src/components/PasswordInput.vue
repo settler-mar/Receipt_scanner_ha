@@ -15,9 +15,13 @@ function translateLayout(from: string, to: string) {
   const source = Array.from(from)
   const target = Array.from(to)
   source.forEach((character, index) => {
-    table.set(character, target[index])
+    // The two layout strings are written to the same length; a character with no
+    // counterpart is simply left alone rather than mapped to undefined.
+    const replacement = target[index]
+    if (replacement === undefined) return
+    table.set(character, replacement)
     if (character.toUpperCase() !== character) {
-      table.set(character.toUpperCase(), target[index].toUpperCase())
+      table.set(character.toUpperCase(), replacement.toUpperCase())
     }
   })
   emit('update:modelValue', Array.from(props.modelValue).map((character) => table.get(character) ?? character).join(''))

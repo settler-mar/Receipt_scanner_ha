@@ -49,6 +49,13 @@ _UNITS = {
     "десяток": "десяток", "десятка": "десяток", "дес": "десяток",
 }
 
+# These are purposes/objects, not people. They stay in the product name:
+# "крепление для телевизора" is one product, not a product for a person.
+_FOR_OBJECTS = {
+    "автомобиля", "авто", "дома", "детей", "дитей", "телевизора", "телевізора",
+    "кухни", "ванной", "ванної", "сада", "города", "выпечки", "випічки",
+}
+
 
 class CaptureItem(BaseModel):
     """One priced line of a spoken receipt."""
@@ -85,6 +92,7 @@ class CaptureShoppingItem(BaseModel):
     qty: float = 1
     unit: str | None = None
     note: str | None = None
+    target_store_code: str | None = None
 
 
 class CaptureDraft(BaseModel):
@@ -191,7 +199,8 @@ Use null for "receipt"/"fuel" when the intent is not that one, and [] for
 "shopping" when the intent is not "shopping"."""
 
 
-def build_prompt(text: str, known_shops: list[str] | None = None) -> tuple[str, str]:
+def build_prompt(text: str, known_shops: list[str] | None = None,
+                 db: Session | None = None) -> tuple[str, str]:
     """(system, user) for the capture call. Split out so tests can assert on the
     rules without reaching a model."""
     hint = ""
@@ -201,7 +210,12 @@ def build_prompt(text: str, known_shops: list[str] | None = None) -> tuple[str, 
             "the message means one of them:\n"
             f"{json.dumps(known_shops, ensure_ascii=False)}"
         )
-    return _SYSTEM, f"{_RULES}{hint}\n\nMessage:\n{text.strip()}"
+    # Hosted providers cache exact prompt prefixes, so the long invariant rules
+    # belong before the changing shop hints and message.
+    system = (f"{ai.prompt_catalog.get(db, 'json_response_rules')}\n\n"
+              f"{ai.prompt_catalog.get(db, 'language_variants')}\n\n"
+              f"{ai.prompt_catalog.get(db, 'intent_rules')}\n\n{_SYSTEM}\n\n{_RULES}")
+    return system, f"{hint.lstrip()}\n\nMessage:\n{text.strip()}"
 
 
 def known_shop_names(db: Session, limit: int = _SHOP_HINTS) -> list[str]:
@@ -248,6 +262,21 @@ def _unit(value: Any) -> str | None:
 def _clean_str(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _person_note(text: str, note: str | None) -> tuple[str, str | None]:
+    """Move a trailing ``для <person>`` out of an item name when AI missed it."""
+    if note or not text:
+        return text, note
+    match = re.search(r"\s+для\s+([^,;]+?)\s*$", text, flags=re.IGNORECASE)
+    if not match:
+        return text, note
+    target = match.group(1).strip()
+    words = target.split()
+    if not target or len(words) > 2 or any(word.casefold() in _FOR_OBJECTS for word in words):
+        return text, note
+    base = text[:match.start()].strip(" ,;—–-")
+    return (base or text), f"для {target}"
 
 
 def parse_payload(data: Any, source_text: str = "") -> CaptureDraft:
@@ -319,12 +348,13 @@ def parse_payload(data: Any, source_text: str = "") -> CaptureDraft:
             text = _clean_str(row.get("text"))
             if not text:
                 continue
+            text, note = _person_note(text, _clean_str(row.get("note")))
             qty = _num(row.get("qty"))
             if qty is None or qty <= 0:
                 qty = 1.0
             shopping.append(CaptureShoppingItem(
                 text=text, qty=qty, unit=_unit(row.get("unit")),
-                note=_clean_str(row.get("note")),
+                note=note,
             ))
 
     # A reading with nothing in it is not an instruction, whatever the model
@@ -354,11 +384,75 @@ async def parse_capture(db: Session, text: str) -> CaptureDraft:
         return CaptureDraft(source_text="")
 
     cfg = ai.load_config(db)
-    system, user = build_prompt(text, known_shop_names(db))
+    system, user = build_prompt(text, known_shop_names(db), db)
     raw = await ai.run_text(db, cfg, "intent", system=system, user=user, max_tokens=1500,
                             prompt_preview=text[:300])
     data = raw if isinstance(raw, dict) else ai._extract_json(raw)
     return parse_payload(data, source_text=text)
+
+
+async def parse_image_capture(db: Session, image: bytes, media_type: str = "image/jpeg",
+                              instruction: str = "") -> CaptureDraft:
+    """Read a photographed handwritten shopping list.
+
+    This is deliberately a fallback after receipt scanning: a receipt remains
+    authoritative when it has a QR or a usable draft.  The model returns the
+    same capture envelope as a typed shopping instruction, so normalization,
+    deduplication and store/category inference stay in one place.
+    """
+    cfg = ai.load_config(db)
+    system = (
+        f"{ai.prompt_catalog.get(db, 'json_response_rules')}\n\n"
+        f"{ai.prompt_catalog.get(db, 'language_variants')}\n\n"
+        f"{ai.prompt_catalog.get(db, 'intent_rules')}\n\n"
+        "You inspect a photo sent to a household shopping-list app. Decide whether "
+        "the image is a handwritten or printed list of things still to buy. "
+        "Do not treat a retail receipt, invoice, screen of purchases, or unrelated "
+        "photo as a shopping list. Read every visible line, preserving the user's "
+        "language and wording. Split separate lines/items, infer quantity and unit "
+        "only when visibly written, and never invent missing text. Do not fill an "
+        "unreadable line with common groceries or words suggested by context. If "
+        "the handwriting is too blurry, return unknown and an empty shopping list. "
+        "Count the separate visible item lines before transcribing them; the count "
+        "must match the number of returned items. Reply with one valid JSON object "
+        "and nothing else in this exact shape: "
+        '{"intent":"shopping|unknown","confidence":0..1,"visible_item_count":0,'
+        '"shopping":[{"text":"...","qty":1,"unit":null,"note":null}]}'
+    )
+    prompt = (
+        "Read this shopping list photo."
+        + (f" The sender's instruction was: {instruction.strip()}" if instruction.strip() else "")
+    )
+
+    def objection(raw: Any) -> str | None:
+        data = raw if isinstance(raw, dict) else None
+        if data is None:
+            try:
+                data = ai._extract_json(raw)
+            except Exception:  # noqa: BLE001 — malformed model output is unusable
+                return "відповідь не є структурованим JSON"
+        if not isinstance(data, dict) or str(data.get("intent", "")).lower() != "shopping":
+            return "це не список покупок"
+        if not isinstance(data.get("shopping"), list) or not data["shopping"]:
+            return "список покупок порожній"
+        try:
+            confidence = float(data.get("confidence"))
+            visible_count = int(data.get("visible_item_count"))
+        except (TypeError, ValueError):
+            return "модель не порахувала видимі рядки"
+        if confidence < 0.7:
+            return "модель не впевнена в прочитаному тексті"
+        if visible_count <= 0 or len(data["shopping"]) != visible_count:
+            return "кількість позицій не збігається з видимими рядками"
+        return None
+
+    answer = await ai.run_vision(
+        db, cfg, "ocr", system=system, prompt=prompt, image=image,
+        media_type=media_type, max_tokens=1800,
+        prompt_preview="фото списку покупок", accept=objection,
+    )
+    raw = answer.value if isinstance(answer.value, dict) else ai._extract_json(answer.value)
+    return parse_payload(raw, source_text=instruction)
 
 
 # --------------------------------------------------------------------------- #
@@ -413,17 +507,50 @@ def record_fuel(db: Session, draft: CaptureDraft) -> dict[str, Any]:
     )
 
 
-def add_shopping_items(db: Session, draft: CaptureDraft) -> list[Any]:
+def add_shopping_items(db: Session, draft: CaptureDraft, *,
+                       added_method: str = "capture",
+                       added_by: str | None = None) -> list[Any]:
     """Add every read entry to the shopping list through the same handler the UI
     uses, so normalization, category reuse and auto-tick stay identical."""
     from app.api.shopping_list import create_item
     from app.schemas.shopping import ShoppingItemCreate
 
     rows = []
+    explicit_store = _infer_shopping_store(db, draft.source_text)
     for item in draft.shopping:
         rows.append(create_item(
             ShoppingItemCreate(raw_text=item.text, qty=item.qty, unit=item.unit,
-                               note=item.note),
+                               note=item.note, added_method=added_method,
+                               added_by=added_by,
+                               target_store_code=item.target_store_code or explicit_store),
             db=db,
         ))
     return rows
+
+
+def _infer_shopping_store(db: Session, source_text: str) -> str | None:
+    """Resolve an explicitly named store in a shopping instruction.
+
+    This is deliberately deterministic: a store mentioned in the user's own
+    phrase is a pin, not a recommendation. It applies to every item in that
+    phrase (e.g. "нужно купить в метро ...").
+    """
+    if not source_text:
+        return None
+    from app.models.models import Store
+    text = source_text.casefold()
+    aliases = {
+        "metro": ("метро", "metro"),
+        "epicentrk": ("епіцентр", "епицентр"),
+        "atb": ("атб", "атб-маркет"),
+        "silpo": ("сільпо", "силпо"),
+        "fozzy": ("фоззі", "fozzy"),
+        "fora": ("фора",),
+        "rozetka": ("розетка", "rozetka"),
+        "prom": ("prom.ua", "пром"),
+    }
+    stores = {s.code: s for s in db.execute(select(Store)).scalars()}
+    for code, names in aliases.items():
+        if code in stores and any(re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text) for name in names):
+            return code
+    return None

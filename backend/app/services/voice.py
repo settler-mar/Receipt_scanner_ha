@@ -7,12 +7,13 @@ run again later — from the web inbox or from the chat it arrived in.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import uuid
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import BASE_DIR
@@ -73,10 +74,32 @@ def get(db: Session, voice_id: str) -> VoiceMessage | None:
     return db.get(VoiceMessage, voice_id)
 
 
-def recent(db: Session, limit: int = 50) -> list[VoiceMessage]:
+def recent(db: Session, limit: int = 50, *, include_archived: bool = False) -> list[VoiceMessage]:
+    query = select(VoiceMessage)
+    if not include_archived:
+        query = query.where(VoiceMessage.archived_at.is_(None))
     return list(db.execute(
-        select(VoiceMessage).order_by(VoiceMessage.created_at.desc()).limit(limit)
+        query.order_by(VoiceMessage.created_at.desc()).limit(limit)
     ).scalars())
+
+
+def set_archived(db: Session, row: VoiceMessage, archived: bool) -> VoiceMessage:
+    """Put a handled recording away (or bring it back). The audio is kept either
+    way, so an archived message can still be played and recognised again."""
+    row.archived_at = dt.datetime.now(dt.timezone.utc) if archived else None
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def open_count(db: Session) -> int:
+    """Recordings still waiting for the user: not archived and not yet acted on."""
+    return db.execute(
+        select(func.count()).select_from(VoiceMessage).where(
+            VoiceMessage.archived_at.is_(None),
+            VoiceMessage.applied.is_(None),
+        )
+    ).scalar_one()
 
 
 def path(row: VoiceMessage) -> Path:
@@ -108,7 +131,9 @@ async def transcribe(db: Session, row: VoiceMessage, *, language: str | None = N
     on the row so the list shows why nothing came out and the retry button has
     something to explain.
     """
-    data = audio_bytes(row)
+    # Large voice notes can make a blocking filesystem read visible to every
+    # request on the event loop.
+    data = await asyncio.to_thread(audio_bytes, row)
     used = (language or "").strip() or (stt.language_options(db) or ["uk-UA"])[0]
     try:
         text = await stt.transcribe(

@@ -57,6 +57,7 @@ from app.adapters.base import (
     LoyaltyBalance,
     NormalizedItem,
     NormalizedReceipt,
+    NormalizedReceiptComponent,
 )
 
 logger = logging.getLogger(__name__)
@@ -316,6 +317,11 @@ def _normalize_online(order: dict) -> NormalizedReceipt:
         )
         for it in order.get("items") or []
     ]
+    shipping = _to_float(order.get("shipping_amount"))
+    components = ([NormalizedReceiptComponent(
+        kind="delivery", amount=shipping, code="shipping_amount", label="Доставка",
+        source="eva.order", raw={"shipping_amount": order.get("shipping_amount")},
+    )] if shipping else [])
     return NormalizedReceipt(
         external_id=str(order.get("order_id")),
         purchased_at=store_local_to_utc(_parse_dt(order.get("created_at"))),
@@ -325,6 +331,7 @@ def _normalize_online(order: dict) -> NormalizedReceipt:
         channel="online",
         order_status=order.get("status") or None,
         items=items,
+        components=components,
         raw=order,
     )
 

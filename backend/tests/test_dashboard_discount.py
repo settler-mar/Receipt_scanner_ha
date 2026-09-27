@@ -25,6 +25,8 @@ def _db_with_discounted_receipt():
         purchased_at=dt.datetime(2026, 9, 1),
         total_amount=80,  # paid; 20 was taken off by discounts
         total_discount=20,
+        bonuses=5,
+        bonuses_used=3,
         currency="UAH",
     )
     receipt.items = [
@@ -64,3 +66,29 @@ def test_item_totals_can_be_shown_before_discount():
     items = dashboard.store_category_items(store_code="atb", db=db, include_discount=False)
     assert (items[0].net, items[0].discount) == (100.0, 20.0)
     assert dashboard.store_category_items(store_code="atb", db=db)[0].net == 80.0
+
+
+def test_timeseries_carries_savings_and_bonuses():
+    """The spend chart draws discount/bonus overlay series off the same buckets;
+    unlike total_spent these stay the same whichever way the discount toggle is set."""
+    db = _db_with_discounted_receipt()
+
+    for include_discount in (True, False):
+        point = dashboard.timeseries(db=db, bucket="day", include_discount=include_discount)[0]
+        assert (point.total_discount, point.total_bonuses, point.total_bonuses_used) == (20.0, 5.0, 3.0)
+
+    store = dashboard.by_store(db=db)[0]
+    assert (store.total_discount, store.total_bonuses, store.total_bonuses_used) == (20.0, 5.0, 3.0)
+
+
+def test_savings_receipts_drill_down():
+    """Each savings/bonus total can be traced to the receipts behind it; `sort`
+    picks the metric and filters out receipts with nothing in that column."""
+    db = _db_with_discounted_receipt()
+
+    row = dashboard.savings_receipts(db=db, sort="bonuses")[0]
+    assert (row.store_name, row.total_amount, row.bonuses, row.bonuses_used) == ("ATB", 80.0, 5.0, 3.0)
+    assert dashboard.savings_receipts(db=db, sort="discount", store_code="atb")[0].total_discount == 20.0
+    assert dashboard.savings_receipts(db=db, sort="discount", store_code="silpo") == []
+    # "date" ignores which column is biggest — any receipt with savings shows up.
+    assert dashboard.savings_receipts(db=db, sort="date")[0].receipt_id == row.receipt_id

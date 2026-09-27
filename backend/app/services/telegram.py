@@ -6,6 +6,8 @@ import dataclasses
 import datetime as dt
 import html
 import ipaddress
+import io
+import json
 import logging
 import re
 import time
@@ -14,7 +16,7 @@ from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.security import decrypt, encrypt
@@ -35,6 +37,19 @@ _MAX_DOWNLOAD = 40 * 1024 * 1024
 _HTML_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 # How many captured shopping batches stay undoable.
 _CAPTURE_BATCH_MEMORY = 20
+
+# Telegram shows these in the slash-command picker. Keep this list deliberately
+# short: the remaining commands are still supported by the dispatcher, but are
+# either contextual (/buy, /trip_done, /cancel) or easier to use in plain
+# language (/add, /find). This keeps the picker useful instead of turning it
+# into a second, noisy help page.
+_BOT_COMMANDS = [
+    {"command": "start", "description": "Справка и возможности бота"},
+    {"command": "trip", "description": "Чеклист и выбор магазина"},
+    {"command": "receipts", "description": "Показать последние чеки"},
+    {"command": "spending", "description": "Показать расходы"},
+]
+_commands_configured_token: str | None = None
 
 
 class TelegramConfig(BaseModel):
@@ -190,12 +205,30 @@ async def _api(token: str, method: str, payload: dict | None = None) -> dict:
     return data
 
 
+async def _ensure_bot_commands(token: str) -> None:
+    """Install the slash-command menu once per bot token.
+
+    Telegram keeps commands server-side, so doing this on polling startup also
+    fixes menus for an already-running bot after a deploy or token change.
+    """
+    global _commands_configured_token
+    if _commands_configured_token == token:
+        return
+    try:
+        await _api(token, "setMyCommands", {"commands": _BOT_COMMANDS})
+    except Exception:  # noqa: BLE001 — a temporary Telegram outage must not stop polling
+        logger.warning("could not configure Telegram command menu", exc_info=True)
+        return
+    _commands_configured_token = token
+
+
 @dataclasses.dataclass
 class BotReply:
     """A bot answer that may carry an inline keyboard of follow-up actions."""
 
     text: str
     keyboard: list[list[dict]] | None = None
+    photo: bytes | None = None
 
 
 async def _send(
@@ -217,6 +250,76 @@ async def _send(
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     await _api(token, "sendMessage", payload)
+
+
+async def _send_photo(
+    token: str,
+    chat_id: int,
+    photo: bytes,
+    caption: str,
+    *,
+    reply_to: int | None = None,
+    thread_id: int | None = None,
+    keyboard: list[list[dict]] | None = None,
+) -> None:
+    """Send a generated chart through Telegram's multipart upload endpoint."""
+    data = {"chat_id": str(chat_id), "caption": caption[:1024], "parse_mode": "HTML"}
+    if thread_id is not None:
+        data["message_thread_id"] = str(thread_id)
+    if reply_to is not None:
+        data["reply_parameters"] = json.dumps({
+            "message_id": reply_to,
+            "allow_sending_without_reply": True,
+        })
+    if keyboard:
+        data["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    async with httpx.AsyncClient(timeout=65) as client:
+        response = await client.post(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            data=data,
+            files={"photo": ("spending.png", photo, "image/png")},
+        )
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description") or "sendPhoto")
+
+
+async def _edit_message(token: str, chat_id: int, message_id: int, text: str,
+                        keyboard: list[list[dict]] | None = None) -> None:
+    """Replace a Telegram checklist message in place.
+
+    Shopping-trip callbacks are deliberately rendered as one evolving message:
+    all participants keep looking at the same checklist instead of receiving a
+    new bot message for every checkbox or store choice.
+    """
+    await _api(token, "editMessageText", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text[:4000],
+        "parse_mode": "HTML",
+        "reply_markup": {"inline_keyboard": keyboard or []},
+    })
+
+
+#: Button actions slow enough that silence reads as a dead button. The text is
+#: what the user sees while the work runs; the result follows in the same thread.
+_STARTED_LINES = {
+    ("rev", "rescan"): "🔄 Пересканую…",
+    ("rev", "ai"): "🤖 Розпізнаю через AI…",
+    ("rev", "up"): "⚡ Пробую сильнішу AI…",
+    ("rev", "save"): "💾 Зберігаю чернетку…",
+    ("ser", "one"): "🧩 Склеюю кадри в один чек…",
+    ("ser", "many"): "🧾 Розбираю кадри як окремі чеки…",
+    ("voi", "stt"): "🎧 Розпізнаю запис…",
+    ("voi", "lang"): "🎧 Розпізнаю запис іншою мовою…",
+    ("tri", "categorize"): "🧠 Розподіляю товари за категоріями…",
+}
+
+
+def _started_line(prefix: str, action: str) -> str:
+    """What to say before a slow button action, or "" for an instant one."""
+    return _STARTED_LINES.get((prefix, action.removesuffix("x")), "")
 
 
 async def _ack(token: str, chat_id: int, reply_to: int | None,
@@ -387,7 +490,8 @@ async def _download_telegram_file(token: str, file_id: str) -> tuple[bytes, str]
 
 
 def _review_keyboard(scan_job_id: str, *, saved: bool = False,
-                     rescan: bool = True, save: bool = True) -> list[list[dict]]:
+                     rescan: bool = True, save: bool = True,
+                     next_ai: tuple[str, str, str] | None = None) -> list[list[dict]]:
     """Actions offered under a scan result.
 
     A saved receipt keeps the rescan and delete buttons — a parse can look
@@ -402,6 +506,11 @@ def _review_keyboard(scan_job_id: str, *, saved: bool = False,
     but rerunning it through vision, attaching the next frame or throwing the
     attempt away are exactly what the user needs next — a dead-end message with
     no buttons was the worst place to leave them.
+
+    `next_ai` is the step of the OCR route after the one this photo already
+    spent — offered by name, because "stronger" is only the wording: the real
+    order is the one the user set in AI → Маршрути задач. Absent for a result no
+    model read, and once the route has no step left.
     """
     flag = "x" if saved else ""
     rows = []
@@ -412,6 +521,10 @@ def _review_keyboard(scan_job_id: str, *, saved: bool = False,
             {"text": "🔄 Пересканувати", "callback_data": f"rev:rescan{flag}:{scan_job_id}"},
             {"text": "🤖 Розпізнати AI", "callback_data": f"rev:ai{flag}:{scan_job_id}"},
         ])
+        if next_ai:
+            _service, model, label = next_ai
+            rows.append([{"text": f"⚡ Сильніша AI → {label} / {model}",
+                          "callback_data": f"rev:up{flag}:{scan_job_id}"}])
     if not saved:
         # A receipt longer than the frame is shot in parts; this is how the next
         # part is attached to the draft standing here.
@@ -427,6 +540,22 @@ def _review_keyboard(scan_job_id: str, *, saved: bool = False,
     if inbox_url:
         rows.append([{"text": "✏️ Відкрити в Інбоксі", "url": inbox_url}])
     return rows
+
+
+def _shopping_capture_reply(db: Session, rows: list) -> BotReply:
+    """Render a shopping capture and keep the same one-tap undo as text input."""
+    batch = _remember_capture_batch(db, [row.id for row in rows])
+    lines = [f"🛒 Додано до списку ({len(rows)}):"]
+    for row in rows:
+        qty = (f" — {float(row.qty):g}{(' ' + row.unit) if row.unit else ''}"
+               if row.qty and float(row.qty) != 1 else "")
+        note = f" ({row.note})" if row.note else ""
+        state = {"new": "🆕", "changed": "✏️", "existing": "↩️"}.get(
+            getattr(row, "_shopping_add_state", "new"), "🆕")
+        lines.append(f"{state} {row.raw_text}{qty}{note}")
+    return BotReply("\n".join(lines), keyboard=[
+        [{"text": "↩️ Скасувати", "callback_data": f"cap:undo:{batch}"}],
+    ])
 
 
 # --------------------------------------------------------------------------- #
@@ -479,8 +608,12 @@ async def _album_worker(token: str, media_group_id: str, *, chat_id: int,
     except Exception as exc:  # noqa: BLE001 — a background task swallows nothing
         logger.exception("Telegram album handling failed")
         reply = BotReply(f"Не вдалося обробити серію фото: {exc}")
-    await _send(token, chat_id, html.escape(reply.text), reply_to=reply_to,
-                thread_id=thread_id, keyboard=reply.keyboard)
+    if reply.photo:
+        await _send_photo(token, chat_id, reply.photo, html.escape(reply.text),
+                          reply_to=reply_to, thread_id=thread_id, keyboard=reply.keyboard)
+    else:
+        await _send(token, chat_id, html.escape(reply.text), reply_to=reply_to,
+                    thread_id=thread_id, keyboard=reply.keyboard)
 
 
 def _arm_pending_series(chat_id: int, job_id: str) -> None:
@@ -575,31 +708,82 @@ async def _describe_series(result, sent: int) -> "BotReply":
     with SessionLocal() as db:
         scan_job = db.get(ScanJob, result.scan_job_id)
         raw = (scan_job.raw_ocr or {}) if scan_job else {}
+        next_ai = _next_ai_step(db, scan_job)
+        source = "\n".join(filter(None, (_source_line(scan_job), _trace_line(scan_job))))
         if result.receipt_id:
             receipt = db.get(Receipt, result.receipt_id)
             return _saved_receipt_reply(receipt, result, raw.get("qr_state"),
-                                        raw.get("fiscal_url"))
+                                        raw.get("fiscal_url"), next_ai=next_ai,
+                                        source=source)
 
     draft = raw.get("draft") or {}
     if not draft:
         return BotReply(
             "Жодне з фото не вдалося розпізнати. "
             "Спробуйте зняти чек ще раз, з перекриттям між кадрами.",
-            keyboard=_review_keyboard(result.scan_job_id, save=False),
+            keyboard=_review_keyboard(result.scan_job_id, save=False, next_ai=next_ai),
         )
     seams = [n for n in (raw.get("notes") or []) if "спільних" in n or "розрив" in n
              or "загубилася" in n]
     return BotReply(
         f"🧩 Склеєно з {raw.get('parts', sent)} фото.\n"
         + ("\n".join(seams) + "\n\n" if seams else "\n")
+        + (f"{source}\n" if source else "")
         + format_draft_message(draft)
         + "\n\nПеревірте позиції: якщо чогось бракує — додайте ще одне фото "
           "з перекриттям.",
-        keyboard=_review_keyboard(result.scan_job_id),
+        keyboard=_review_keyboard(result.scan_job_id, next_ai=next_ai),
     )
 
 
-async def _scan_bytes(data: bytes, media_type: str, filename: str, *, chat_id: int | None = None) -> "str | BotReply":
+def _shopping_instruction(text: str) -> bool:
+    """Whether the caption explicitly asks for a shopping-list operation."""
+    value = (text or "").casefold()
+    return any(phrase in value for phrase in (
+        "список покупок", "список покупок", "добавь в список", "додай в список",
+        "додати до списку", "додай до списку",
+    ))
+
+
+async def _try_image_shopping(db: Session, data: bytes, media_type: str,
+                              instruction: str, *, required: bool = False) -> BotReply | None:
+    from app.services import capture
+
+    if not load_config(db).capture_enabled:
+        return BotReply("Розпізнавання списку покупок вимкнено в налаштуваннях AI.") if required else None
+    try:
+        draft = await capture.parse_image_capture(db, data, media_type, instruction=instruction)
+    except AiConfigError:
+        if required:
+            return BotReply("AI не налаштовано — не можу прочитати список покупок з фото.")
+        return None
+    except Exception as exc:  # noqa: BLE001 — a normal receipt fallback must survive
+        logger.info("image shopping-list capture unavailable: %s", exc)
+        if required:
+            return BotReply("Не вдалося прочитати список покупок. Надішліть чіткіше фото.")
+        return None
+    if draft.intent != "shopping" or not draft.shopping:
+        return (BotReply(
+            "Не вдалося впевнено розпізнати список покупок. "
+            "Надішліть фото ближче, без відблисків і тіней."
+        ) if required else None)
+    rows = capture.add_shopping_items(db, draft, added_method="telegram-photo", added_by="Telegram")
+    shopping_reply = _shopping_capture_reply(db, rows)
+    return BotReply("📷 Розпізнав список покупок з фото.\n\n" + shopping_reply.text,
+                    keyboard=shopping_reply.keyboard)
+
+
+async def _scan_bytes(data: bytes, media_type: str, filename: str, *, chat_id: int | None = None,
+                      instruction: str = "", shopping_first: bool = False,
+                      uploader: str | None = None) -> "str | BotReply":
+    if shopping_first:
+        with SessionLocal() as db:
+            shopping_reply = await _try_image_shopping(
+                db, data, media_type, instruction, required=True,
+            )
+        if shopping_reply is not None:
+            return shopping_reply
+
     # Import lazily to avoid coupling app startup to the API module graph.
     from app.api.inbox import _handle_receipt
 
@@ -611,6 +795,7 @@ async def _scan_bytes(data: bytes, media_type: str, filename: str, *, chat_id: i
         result = await _handle_receipt(
             db, data, filename, media_type,
             fiscal_override=parse_fiscal_url(pending_url) if pending_url else None,
+            uploader=uploader,
         )
         from app.models.scanner import ScanJob
         scan_job = db.get(ScanJob, result.scan_job_id)
@@ -620,27 +805,42 @@ async def _scan_bytes(data: bytes, media_type: str, filename: str, *, chat_id: i
             from app.services.fiscal_queue import enqueue
             if fiscal_url:
                 enqueue(db, fiscal_url, source="telegram", chat_id=chat_id, scan_job_id=result.scan_job_id)
+        next_ai = _next_ai_step(db, scan_job)
+        source = "\n".join(filter(None, (_source_line(scan_job), _trace_line(scan_job))))
         if result.receipt_id:
             if pending_url:
                 cfg.pending_fiscal_urls.pop(str(chat_id), None)
                 save_config(db, cfg)
             from app.models.models import Receipt
             receipt = db.get(Receipt, result.receipt_id)
-            return _saved_receipt_reply(receipt, result, qr_state, fiscal_url)
+            return _saved_receipt_reply(receipt, result, qr_state, fiscal_url,
+                                        next_ai=next_ai, source=source)
+    # A photo can be a handwritten shopping list rather than a receipt.  Try
+    # that interpretation only after the receipt pipeline found no usable
+    # result, and only when capture is enabled; QR/receipt recognition remains
+    # authoritative and never gets replaced by a guess about a list.
+    if not result.receipt_id and not result.needs_review:
+        with SessionLocal() as db:
+            shopping_reply = await _try_image_shopping(db, data, media_type, instruction)
+            if shopping_reply is not None:
+                return shopping_reply
+
     qr_line = _qr_status_line(qr_state, fiscal_url)
     retake = "📷 Надішліть чіткіше фото чека у відповідь на це повідомлення."
     if result.needs_review:
         return BotReply(
             f"🟡 Чек розпізнано частково · метод {result.method}.\n"
-            f"{qr_line}\n\n"
+            + (f"{source}\n" if source else "")
+            + f"{qr_line}\n\n"
             f"{format_draft_message(raw.get('draft') or {})}\n"
             f"{retake}",
-            keyboard=_review_keyboard(result.scan_job_id),
+            keyboard=_review_keyboard(result.scan_job_id, next_ai=next_ai),
         )
     return BotReply(
         "Не вдалося надійно розпізнати чек.\n"
-        f"{qr_line}\n{retake}",
-        keyboard=_review_keyboard(result.scan_job_id, save=False),
+        + (f"{source}\n" if source else "")
+        + f"{qr_line}\n{retake}",
+        keyboard=_review_keyboard(result.scan_job_id, save=False, next_ai=next_ai),
     )
 
 
@@ -702,7 +902,9 @@ def format_draft_message(draft: dict) -> str:
     return "\n".join(lines)
 
 
-def _saved_receipt_reply(receipt, result, qr_state, fiscal_url) -> "BotReply":
+def _saved_receipt_reply(receipt, result, qr_state, fiscal_url, *,
+                         next_ai: tuple[str, str, str] | None = None,
+                         source: str = "") -> "BotReply":
     """A saved receipt, with the rescan actions still attached.
 
     Even a receipt that filed cleanly can be a misread, so the rerun buttons
@@ -713,9 +915,60 @@ def _saved_receipt_reply(receipt, result, qr_state, fiscal_url) -> "BotReply":
     from app.scanner.fiscal_qr import QR_UNREADABLE
 
     text = format_receipt_message(receipt, duplicate=result.duplicate, method=result.method)
+    if source:
+        text += f"\n{source}"
     if fiscal_url or qr_state == QR_UNREADABLE:
         text += f"\n\n{_qr_status_line(qr_state, fiscal_url)}"
-    return BotReply(text, keyboard=_review_keyboard(result.scan_job_id, saved=True))
+    return BotReply(text, keyboard=_review_keyboard(result.scan_job_id, saved=True,
+                                                    next_ai=next_ai))
+
+
+def _next_ai_step(db: Session, job) -> tuple[str, str, str] | None:
+    """The route step to offer after the one this scan used, if any.
+
+    Only offered once a model has actually read the photo: before that the
+    ordinary "🤖 Розпізнати AI" button already starts the route at step 1, and
+    two buttons doing the same thing is worse than one.
+    """
+    from app.services import ai, scan_jobs
+
+    if job is None:
+        return None
+    used = scan_jobs.used_ai_step(job)
+    if used is None:
+        return None
+    try:
+        return ai.next_ocr_step(db, used)
+    except Exception:  # noqa: BLE001 — a broken AI config must not break the reply
+        logger.warning("could not read the AI route for scan %s", job.id, exc_info=True)
+        return None
+
+
+def _trace_line(job) -> str:
+    """One line of "what it cost": the stages that actually spent time.
+
+    The same record the inbox shows expanded — in a chat it has to fit on one
+    line, so only the stages that took measurable time or tokens are named.
+    """
+    steps = (job.raw_ocr or {}).get("trace") or [] if job is not None else []
+    parts: list[str] = []
+    tokens = 0
+    for step in steps:
+        tokens += int(step.get("tokens_in") or 0) + int(step.get("tokens_out") or 0)
+        ms = int(step.get("ms") or 0)
+        if ms >= 100:
+            parts.append(f"{step.get('stage')} {ms / 1000:.1f}с")
+    if tokens:
+        parts.append(f"{tokens} ток.")
+    return "⏱ " + " · ".join(parts) if parts else ""
+
+
+def _source_line(job) -> str:
+    """"Розпізнано: QR" / "Розпізнано AI: <service> / <model>", or nothing."""
+    from app.services import scan_jobs
+
+    source = scan_jobs.recognised_by(job) if job is not None else ""
+    return f"🔎 Розпізнано: {source}" if source else ""
 
 
 def _qr_status_line(qr_state: str | None, fiscal_url: str | None) -> str:
@@ -829,7 +1082,8 @@ def _delete_job(job_id: str, *, with_receipt: bool = False) -> str:
     return "🗑 Чек і сканування видалено." if receipt_id else "🗑 Видалено з інбоксу."
 
 
-async def _rescan_job(job_id: str, *, ai_first: bool, replace: bool = False) -> "str | BotReply":
+async def _rescan_job(job_id: str, *, ai_first: bool, replace: bool = False,
+                      escalate: bool = False) -> "str | BotReply":
     from app.models.models import Receipt
     from app.models.scanner import ScanJob
     from app.services import scan_jobs
@@ -842,17 +1096,23 @@ async def _rescan_job(job_id: str, *, ai_first: bool, replace: bool = False) -> 
             if job is not None and series_scan.is_series(job) and not job.receipt_id:
                 # A series lives in several frames; the ordinary rescan would
                 # re-run only the first one and quietly shorten the receipt.
-                result = await series_scan.rescan_series(db, job, ai_first=ai_first)
+                result = await series_scan.rescan_series(db, job, ai_first=ai_first,
+                                                         escalate=escalate)
             else:
                 result = await scan_jobs.rescan_job(db, job_id, ai_first=ai_first,
-                                                    replace=replace)
+                                                    replace=replace, escalate=escalate)
         except (scan_jobs.ScanJobError, ValueError) as exc:
             return str(exc)
 
-        raw = (db.get(ScanJob, result.scan_job_id).raw_ocr or {})
+        fresh = db.get(ScanJob, result.scan_job_id)
+        raw = (fresh.raw_ocr or {})
+        next_ai = _next_ai_step(db, fresh)
+        source = "\n".join(filter(None, (_source_line(fresh), _trace_line(fresh))))
         if result.receipt_id:
             receipt = db.get(Receipt, result.receipt_id)
-            reply = _saved_receipt_reply(receipt, result, raw.get("qr_state"), raw.get("fiscal_url"))
+            reply = _saved_receipt_reply(receipt, result, raw.get("qr_state"),
+                                         raw.get("fiscal_url"), next_ai=next_ai,
+                                         source=source)
             if result.replaced_receipt_id:
                 reply.text = "♻️ Попередній чек замінено.\n\n" + reply.text
             return reply
@@ -866,7 +1126,8 @@ async def _rescan_job(job_id: str, *, ai_first: bool, replace: bool = False) -> 
             head += "\nРаніше збережений чек залишено без змін."
         body = f"\n{format_draft_message(raw.get('draft') or {})}" if result.needs_review else ""
         return BotReply(
-            f"{head}\n{_qr_status_line(raw.get('qr_state'), raw.get('fiscal_url'))}\n{body}\n"
+            f"{head}\n" + (f"{source}\n" if source else "")
+            + f"{_qr_status_line(raw.get('qr_state'), raw.get('fiscal_url'))}\n{body}\n"
             "📷 Або надішліть чіткіше фото у відповідь на це повідомлення.",
             keyboard=_review_keyboard(result.scan_job_id, save=result.needs_review),
         )
@@ -981,9 +1242,178 @@ async def _scan_url(url: str, *, chat_id: int | None = None) -> "str | BotReply"
     return "Посилання відкрито, але воно не віддає зображення чека. Надішліть фото або пряме посилання на файл."
 
 
-def _mcp_command(text: str) -> str | None:
+def _receipt_day_bounds(value: dt.date) -> tuple[dt.datetime, dt.datetime]:
+    """Return UTC-naive bounds for one Kyiv calendar day in SQLite."""
+    start = dt.datetime.combine(value, dt.time.min, tzinfo=KYIV).astimezone(dt.timezone.utc)
+    end = dt.datetime.combine(value + dt.timedelta(days=1), dt.time.min,
+                              tzinfo=KYIV).astimezone(dt.timezone.utc)
+    return start.replace(tzinfo=None), end.replace(tzinfo=None)
+
+
+def _receipt_date_arg(value: str) -> dt.date | None:
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _receipts_reply(*, limit: int = 10, page: int = 0,
+                    selected_date: dt.date | None = None) -> BotReply:
+    """Render a paginated receipt index with one button per receipt."""
+    from app.models.models import Receipt, Store
+
+    limit = max(1, min(limit, 50))
+    page = max(0, page)
+    clauses = []
+    date_label = "весь період"
+    if selected_date:
+        lo, hi = _receipt_day_bounds(selected_date)
+        clauses.extend([Receipt.purchased_at >= lo, Receipt.purchased_at < hi])
+        date_label = selected_date.strftime("%d.%m.%Y")
+
+    with SessionLocal() as db:
+        total = db.execute(select(func.count()).select_from(Receipt).where(*clauses)).scalar_one()
+        pages = max(1, (total + limit - 1) // limit)
+        page = min(page, pages - 1)
+        rows = db.execute(
+            select(Receipt).where(*clauses)
+            .order_by(Receipt.purchased_at.desc())
+            .offset(page * limit).limit(limit)
+        ).scalars().all()
+        store_names = {row.code: row.name for row in db.execute(select(Store)).scalars().all()}
+
+        lines = [f"🧾 Чеки · {date_label}", f"Сторінка {page + 1}/{pages} · усього: {total}", ""]
+        keyboard: list[list[dict]] = []
+        for row in rows:
+            local = as_utc(row.purchased_at).astimezone(KYIV) if row.purchased_at else None
+            when = local.strftime("%d.%m %H:%M") if local else "без дати"
+            shop = row.shop_name or store_names.get(row.store_code, row.store_code) or "Невідомий магазин"
+            lines.append(f"{when} · {shop} · {_amount(row.total_amount)} {row.currency or 'UAH'}")
+            keyboard.append([{
+                "text": f"🔎 Деталі · {when} · {_amount(row.total_amount)}",
+                "callback_data": f"rc:detail:{row.id}",
+            }])
+
+        if not rows:
+            lines.append("Чеків не знайдено.")
+        navigation = []
+        if page > 0:
+            date_key = selected_date.strftime("%Y%m%d") if selected_date else "all"
+            navigation.append({
+                "text": "◀️ Назад",
+                "callback_data": f"rc:list:{page - 1}:{limit}:{date_key}",
+            })
+        if page + 1 < pages:
+            date_key = selected_date.strftime("%Y%m%d") if selected_date else "all"
+            navigation.append({
+                "text": "Далі ▶️",
+                "callback_data": f"rc:list:{page + 1}:{limit}:{date_key}",
+            })
+        if navigation:
+            keyboard.append(navigation)
+    return BotReply("\n".join(lines), keyboard=keyboard)
+
+
+def _receipt_detail_reply(receipt_id: str) -> str:
+    from app.models.models import Receipt
+
+    with SessionLocal() as db:
+        receipt = db.get(Receipt, receipt_id)
+        if receipt is None:
+            return "Чек уже недоступний."
+        text = format_receipt_message(receipt)
+    return text.replace("✅ Чек додано", "🧾 Деталі чека", 1)
+
+
+def _parse_receipts_args(arg: str) -> str | BotReply:
+    """Accept `/receipts`, `/receipts 20`, or `/receipts 20 2026-09-27`."""
+    parts = arg.split()
+    limit = 10
+    selected_date = None
+    if parts:
+        if parts[0].isdigit():
+            limit = int(parts.pop(0))
+        if parts:
+            selected_date = _receipt_date_arg(parts.pop(0))
+        if parts or selected_date is None and arg and not arg.split()[0].isdigit():
+            return "Формат: /receipts [кількість] [РРРР-ММ-ДД]"
+    return _receipts_reply(limit=limit, selected_date=selected_date)
+
+
+def _spending_chart(values: list[tuple[dt.date, float]], *, days: int, total: float,
+                    receipt_count: int) -> bytes:
+    """Build a small dependency-light bar chart suitable for Telegram."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    width, height = 1100, 620
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    try:
+        regular = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 34)
+        value_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+    except OSError:
+        regular = title_font = value_font = ImageFont.load_default()
+
+    draw.text((55, 32), f"Витрати за останні {days} днів", fill="#172033", font=title_font)
+    draw.text((58, 82), f"Разом: {_amount(total)} грн · чеків: {receipt_count}",
+              fill="#4b5563", font=regular)
+    left, top, right, bottom = 90, 145, width - 55, height - 95
+    max_value = max((value for _, value in values), default=0)
+    max_value = max(max_value, 1)
+    draw.line((left, bottom, right, bottom), fill="#cbd5e1", width=2)
+    draw.line((left, top, left, bottom), fill="#cbd5e1", width=2)
+    slot = (right - left) / max(len(values), 1)
+    bar_width = max(8, int(slot * 0.62))
+    label_step = max(1, len(values) // 14)
+    for index, (day, value) in enumerate(values):
+        x = left + slot * index + (slot - bar_width) / 2
+        bar_top = bottom - (bottom - top) * value / max_value
+        draw.rounded_rectangle((x, bar_top, x + bar_width, bottom), radius=7, fill="#2563eb")
+        if value:
+            label = _amount(value)
+            bbox = draw.textbbox((0, 0), label, font=value_font)
+            draw.text((x + (bar_width - bbox[2]) / 2, max(top, bar_top - 30)), label,
+                      fill="#172033", font=value_font)
+        if index % label_step == 0 or index == len(values) - 1:
+            label = day.strftime("%d.%m")
+            bbox = draw.textbbox((0, 0), label, font=regular)
+            draw.text((x + (bar_width - bbox[2]) / 2, bottom + 18), label,
+                      fill="#4b5563", font=regular)
+
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _spending_reply(days: int = 7) -> BotReply | str:
+    from app.api.dashboard import get_stats, timeseries
+
+    days = max(1, min(days, 366))
+    today = dt.datetime.now(KYIV).date()
+    first_day = today - dt.timedelta(days=days - 1)
+    start = dt.datetime.combine(first_day, dt.time.min, tzinfo=KYIV).astimezone(dt.timezone.utc)
+    end = dt.datetime.combine(today + dt.timedelta(days=1), dt.time.min,
+                              tzinfo=KYIV).astimezone(dt.timezone.utc)
+    with SessionLocal() as db:
+        stats = get_stats(db=db, date_from=start, date_to=end)
+        rows = timeseries(db=db, date_from=start, date_to=end, bucket="day")
+    by_day = {dt.date.fromisoformat(row.period): float(row.total_spent) for row in rows}
+    values = [(first_day + dt.timedelta(days=index),
+               by_day.get(first_day + dt.timedelta(days=index), 0.0))
+              for index in range(days)]
+    caption = (f"📊 Витрати за останні {days} днів\n"
+               f"💰 Разом: {_amount(stats.total_spent)} грн\n"
+               f"🧾 Чеків: {stats.total_receipts}\n"
+               f"Період: {first_day:%d.%m.%Y} — {today:%d.%m.%Y}")
+    return BotReply(caption, photo=_spending_chart(
+        values, days=days, total=float(stats.total_spent), receipt_count=stats.total_receipts,
+    ))
+
+
+def _mcp_command(text: str) -> str | BotReply | None:
     """Reuse the same functions exposed by MCP, without an internal HTTP hop."""
-    from app.mcp_server import add_to_shopping_list, list_receipts, search_products, spending_summary
+    from app.mcp_server import add_to_shopping_list, search_products
 
     command, _, arg = text.partition(" ")
     arg = arg.strip()
@@ -993,17 +1423,202 @@ def _mcp_command(text: str) -> str | None:
         rows = search_products(arg)[:8]
         return "\n".join(f"• {r.get('name')} — {r.get('last_price')} грн" for r in rows) or "Нічого не знайдено"
     if command == "/spending":
-        value = spending_summary(group_by="total")
-        return f"Витрати: {value.get('total_spent', 0)} грн · чеків: {value.get('receipt_count', 0)}"
+        if arg and not arg.isdigit():
+            return "Формат: /spending [кількість днів]"
+        return _spending_reply(int(arg) if arg else 7)
     if command == "/receipts":
-        value = list_receipts(limit=10)
-        return "\n".join(f"• {(r.get('purchased_at') or '')[:10]} · {r.get('shop_name') or r.get('store_name')} · {r.get('total_amount')} грн" for r in value["items"]) or "Чеків ще немає"
+        return _parse_receipts_args(arg)
     if command == "/add":
         if not arg:
             return "Формат: /add молоко"
         value = add_to_shopping_list(arg)
         return f"✅ Додано до списку: {value.get('raw_text') or arg}"
+    if command in {"/shopping", "/list"}:
+        with SessionLocal() as db:
+            from app.services import shopping_list as shopping_svc
+            from app.models.models import Category, Store
+            rows = shopping_svc.active_items(db)
+        pending = [r for r in rows if r.status.value == "pending"]
+        bought = [r for r in rows if r.status.value == "bought"]
+        lines = [f"🛒 Список покупок · до покупки: {len(pending)}"]
+        for row in pending[:40]:
+            qty = (f" × {float(row.qty):g}{(' ' + row.unit) if row.unit else ''}"
+                   if row.qty and float(row.qty) != 1 else "")
+            meta = []
+            if row.target_store_code:
+                store = db.execute(select(Store).where(Store.code == row.target_store_code)).scalar_one_or_none()
+                meta.append(f"🏪 {store.name if store else row.target_store_code}")
+            if row.category_id:
+                meta.append(f"📂 {shopping_svc.category_name_ru(db.get(Category, row.category_id))}")
+            if row.tag:
+                meta.append(f"🏷 {row.tag}")
+            note = f" ({row.note})" if row.note else ""
+            lines.append(f"☐ {row.raw_text}{note}{qty}" + (f" · {' · '.join(meta)}" if meta else ""))
+        if len(pending) > 40:
+            lines.append(f"…ще {len(pending) - 40}")
+        if bought:
+            lines.append(f"\n✅ Вже куплено: {len(bought)}")
+        return "\n".join(lines) if rows else "🛒 Список покупок порожній."
+    if command in {"/buy", "/куплено"}:
+        if not arg:
+            return "Формат: /buy молоко"
+        with SessionLocal() as db:
+            from app.services import shopping_list as shopping_svc
+            trip_item = shopping_svc.mark_trip_by_text(db, arg)
+            row = db.get(shopping_svc.ShoppingListItem, trip_item.shopping_list_item_id) if trip_item else None
+        return (f"✅ Позначено як куплене: {row.raw_text}"
+                if row else "Не знайшов точного товару в активному чеклисте.")
+    if command == "/trip":
+        with SessionLocal() as db:
+            from app.services import shopping_list as shopping_svc
+            trip = shopping_svc.create_trip(db)
+            rows = db.query(shopping_svc.ShoppingTripItem).filter(
+                shopping_svc.ShoppingTripItem.trip_id == trip.id
+            ).all()
+        lines = [f"🛒 Чеклист готовий · позицій: {len(rows)}"]
+        lines.extend(
+            f"☐ {row.raw_text}{f' ({row.note})' if row.note else ''}"
+            for row in rows
+        )
+        lines.append("\nПозначити: /buy товар · завершити: /trip_done")
+        return "\n".join(lines)
+    if command == "/trip_done":
+        with SessionLocal() as db:
+            from app.models.shopping import ShoppingTrip, ShoppingTripStatus
+            from app.services import shopping_list as shopping_svc
+            trip = db.query(ShoppingTrip).filter(ShoppingTrip.status == ShoppingTripStatus.active).first()
+            if trip is None:
+                return "Активного чеклиста немає. Почніть через /trip."
+            shopping_svc.complete_trip(db, trip)
+        return "✅ Чеклист завершено. Невідмічені товари залишилися у списку."
+    if command == "/suggestions":
+        return _suggestions_reply()
     return None
+
+
+def _trip_reply(trip_id: str | None = None, store_code: str | None = None) -> BotReply:
+    """Render the active shopping trip as an inline, Telegram-native-like list."""
+    from app.models.models import Store
+    from app.models.shopping import ShoppingTrip, ShoppingTripItem, ShoppingTripItemStatus, ShoppingTripStatus
+    from app.services import shopping_list as shopping_svc
+
+    with SessionLocal() as db:
+        trip = db.get(ShoppingTrip, trip_id) if trip_id else db.query(ShoppingTrip).filter(
+            ShoppingTrip.status == ShoppingTripStatus.active
+        ).first()
+        if trip is None and trip_id is None:
+            trip = shopping_svc.create_trip(db, store_code=store_code)
+        elif trip is not None and trip_id is None:
+            trip = shopping_svc.create_trip(db, store_code=store_code)
+        if trip is None:
+            return BotReply("Активного чеклиста немає. Створіть його командою /trip.")
+        rows = db.query(ShoppingTripItem).filter(ShoppingTripItem.trip_id == trip.id).order_by(
+            ShoppingTripItem.created_at.asc()
+        ).all()
+        store = db.query(Store).filter(Store.code == trip.store_code).first() if trip.store_code else None
+        done = sum(row.status == ShoppingTripItemStatus.bought for row in rows)
+        keyboard = []
+        for row in rows:
+            mark = "☑" if row.status == ShoppingTripItemStatus.bought else "☐"
+            note = f" ({row.note})" if row.note else ""
+            keyboard.append([{"text": f"{mark} {row.raw_text}{note}",
+                              # The Bot API caps callback_data at 64 bytes;
+                              # the item id is globally unique, so trip id is
+                              # resolved from the row after the click.
+                              "callback_data": f"tri:item:{row.id}"}])
+        keyboard.append([{"text": "✅ Завершить поход", "callback_data": f"tri:done:{trip.id}"}])
+        store_name = store.name if store else (trip.store_code or "Все магазины")
+        return BotReply(
+                        f"🛒 Чеклист · магазин: {store_name}\n"
+                        f"Позиции: {len(rows)} · выполнено: {done}",
+                        keyboard=keyboard)
+
+
+def _uncategorized_trip_menu(rows: list) -> BotReply:
+    """Offer an explicit choice before starting a store checklist."""
+    return BotReply(
+        f"🗂 Є товарів без категорії: {len(rows)}. Що зробити перед покупками?",
+        keyboard=[
+            [{"text": "🧠 Розподілити", "callback_data": "tri:categorize"}],
+            [{"text": "👀 Показати", "callback_data": "tri:uncategorized"}],
+            [{"text": "🛒 Перейти до покупок", "callback_data": "tri:continue"}],
+        ],
+    )
+
+
+def _uncategorized_trip_reply() -> BotReply:
+    from app.services import shopping_list as shopping_svc
+
+    with SessionLocal() as db:
+        rows = shopping_svc.uncategorized_pending(db)
+    if not rows:
+        return BotReply("✅ Усі товари вже мають категорію.", keyboard=[
+            [{"text": "🛒 Перейти до покупок", "callback_data": "tri:continue"}],
+        ])
+    lines = [f"🗂 Без категорії ({len(rows)}):"]
+    for row in rows[:40]:
+        qty = (f" — {float(row.qty):g}{(' ' + row.unit) if row.unit else ''}"
+               if row.qty and float(row.qty) != 1 else "")
+        lines.append(f"☐ {row.raw_text}{qty}")
+    if len(rows) > 40:
+        lines.append(f"…ще {len(rows) - 40}")
+    return BotReply("\n".join(lines), keyboard=[
+        [{"text": "🧠 Розподілити", "callback_data": "tri:categorize"}],
+        [{"text": "🛒 Перейти до покупок", "callback_data": "tri:continue"}],
+    ])
+
+
+def _trip_store_picker(*, check_uncategorized: bool = True,
+                       intro: str = "") -> BotReply:
+    from app.models.models import Store
+    from app.services import shopping_list as shopping_svc
+    with SessionLocal() as db:
+        if check_uncategorized:
+            uncategorized = shopping_svc.uncategorized_pending(db)
+            if uncategorized:
+                return _uncategorized_trip_menu(uncategorized)
+        stores = [(store, shopping_svc.store_pending_item_count(db, store.code))
+                  for store in db.query(Store).filter(Store.network_type.is_not(None))
+                  .order_by(Store.name.asc()).all()]
+        stores = [(store, count) for store, count in stores if count > 0]
+    if not stores:
+        reply = _trip_reply()
+        if intro:
+            reply.text = intro + "\n\n" + reply.text
+        return reply
+    text = "🛒 В какой магазин идём? Выберите магазин или нажмите «Все магазины»."
+    if intro:
+        text = intro + "\n\n" + text
+    return BotReply(
+        text,
+        keyboard=[
+            [{"text": f"{store.name} · {count}", "callback_data": f"tri:store:{store.code}"}
+             for store, count in stores[i:i + 2]]
+            for i in range(0, len(stores), 2)
+        ] + [[{"text": "Все магазины", "callback_data": "tri:store:"}]],
+    )
+
+
+def _suggestions_reply() -> BotReply:
+    with SessionLocal() as db:
+        from app.services import shopping_list as shopping_svc
+        rows = shopping_svc.routine_suggestions(db)
+    if not rows:
+        return BotReply("🔔 Прострочених регулярних покупок немає.")
+    lines = ["🔔 Можливо, вже час купити:"]
+    keyboard = []
+    for row in rows[:20]:
+        lines.append(f"• {row['display_name']} — раз на {row['interval_days']:g} дн., прострочено {row['days_overdue']} дн.")
+        token = shopping_svc.routine_token(row["normalized_name"])
+        keyboard.append([
+            {"text": f"➕ {row['display_name']}", "callback_data": f"rec:add:{token}"},
+            {"text": "⏰ Пізніше", "callback_data": f"rec:later:{token}"},
+            {"text": "🚫 Не нагадувати", "callback_data": f"rec:ignore:{token}"},
+        ])
+        if row.get("category_id"):
+            keyboard.append([{"text": f"🚫 Ігнорувати категорію {row.get('category_path') or ''}"[:60],
+                              "callback_data": f"rec:cat:{row['category_id']}"}])
+    return BotReply("\n".join(lines), keyboard=keyboard)
 
 
 async def _voice_reply(token: str, media: dict, *, message_id: int | None = None,
@@ -1058,13 +1673,20 @@ async def _voice_reply(token: str, media: dict, *, message_id: int | None = None
 
 
 def _note_voice_applied(voice_id: str, reply_text: str) -> None:
-    """Keep, next to the recording, one line about what it turned into."""
+    """Keep the action summary, including shopping-list item details."""
     from app.services import voice as voice_svc
+
+    lines = [line.strip() for line in reply_text.splitlines() if line.strip()]
+    applied = lines[0] if lines else ""
+    for index, line in enumerate(lines):
+        if line.startswith("🛒 Додано до списку"):
+            applied = " ".join(lines[index:])
+            break
 
     with SessionLocal() as db:
         row = voice_svc.get(db, voice_id)
         if row is not None:
-            voice_svc.note_applied(db, row, reply_text.splitlines()[0][:200])
+            voice_svc.note_applied(db, row, applied[:500])
 
 
 def _voice_length(media: dict) -> str:
@@ -1153,6 +1775,7 @@ async def _capture_reply(text: str) -> "BotReply | None":
     misheard price has to be visible before it lands in the ledger.
     """
     from app.services import capture
+    from app.services import shopping_list as shopping_svc
 
     with SessionLocal() as db:
         if not load_config(db).capture_enabled:
@@ -1184,13 +1807,39 @@ async def _capture_reply(text: str) -> "BotReply | None":
             ])
 
         if draft.intent == "shopping":
-            rows = capture.add_shopping_items(db, draft)
+            rows = capture.add_shopping_items(db, draft, added_method="telegram", added_by="Telegram")
+            return _shopping_capture_reply(db, rows)
             batch = _remember_capture_batch(db, [row.id for row in rows])
+            from app.models.models import Category, Store
             lines = [f"🛒 Додано до списку ({len(rows)}):"]
+            common_store = rows[0].target_store_code if rows and all(
+                row.target_store_code and row.target_store_code == rows[0].target_store_code for row in rows
+            ) else None
+            common_category = rows[0].category_id if rows and all(
+                row.category_id and row.category_id == rows[0].category_id for row in rows
+            ) else None
+            common_tag = rows[0].tag if rows and all(
+                row.tag and row.tag == rows[0].tag for row in rows
+            ) else None
+            if common_store:
+                store = db.execute(select(Store).where(Store.code == common_store)).scalar_one_or_none()
+                lines.append(f"🏪 магазин: {store.name if store else common_store}")
+            if common_category:
+                lines.append(f"📂 категория: {shopping_svc.category_name_ru(db.get(Category, common_category))}")
+            if common_tag:
+                lines.append(f"🏷 тег: {common_tag}")
+            states = {getattr(row, "_shopping_add_state", "new") for row in rows}
+            if states - {"new"}:
+                lines.append("🆕 новая · ✏️ изменена · ↩️ уже была")
             for row in rows:
                 qty = f" — {float(row.qty):g}{(' ' + row.unit) if row.unit else ''}" if row.qty and float(row.qty) != 1 else ""
                 note = f" ({row.note})" if row.note else ""
-                lines.append(f"• {row.raw_text}{qty}{note}")
+                state = {
+                    "new": "🆕",
+                    "changed": "✏️",
+                    "existing": "↩️",
+                }.get(getattr(row, "_shopping_add_state", "new"), "🆕")
+                lines.append(f"{state} {row.raw_text}{qty}{note}")
             return BotReply("\n".join(lines), keyboard=[
                 [{"text": "↩️ Скасувати", "callback_data": f"cap:undo:{batch}"}],
             ])
@@ -1254,6 +1903,16 @@ def _undo_capture_batch(batch: str) -> str:
     return f"↩️ Прибрано зі списку: {removed}." if removed else "Ці позиції вже видалено."
 
 
+def _sender_label(message: dict) -> str | None:
+    """Short, readable Telegram identity for the scan journal."""
+    sender = message.get("from") or {}
+    name = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")])).strip()
+    username = str(sender.get("username") or "").strip().lstrip("@")
+    if name and username:
+        return f"{name} (@{username})"
+    return name or (f"@{username}" if username else None)
+
+
 async def handle_update(token: str, update: dict) -> None:
     message = update.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
@@ -1291,7 +1950,9 @@ async def handle_update(token: str, update: dict) -> None:
                       "• «додай в список покупок яйця 3 десятка, морква, молоко»\n"
                       "• «був на барс і заправився газом на 1000грн» — літри "
                       "порахуються за ціною станції\n\n"
-                      "Команди: /find товар, /spending, /receipts, /add товар.")
+                      "Основні розділи відкриваються через меню: чеклист покупок, "
+                      "історія чеків і витрати. Товар можна просто "
+                      "написати звичайною мовою — бот сам додасть або знайде його.")
         elif text == "/cancel":
             with SessionLocal() as db:
                 cfg = load_config(db)
@@ -1302,7 +1963,7 @@ async def handle_update(token: str, update: dict) -> None:
             await _ack(token, chat_id, reply_to, thread_id, "🎧 Слухаю…")
             answer = await _voice_reply(
                 token, message.get("voice") or message.get("audio") or message["video_note"],
-                message_id=reply_to, chat_id=chat_id)
+                message_id=message.get("message_id"), chat_id=chat_id)
         elif message.get("photo"):
             media_group_id = message.get("media_group_id")
             pending_job = _take_pending_series(chat_id)
@@ -1330,25 +1991,38 @@ async def handle_update(token: str, update: dict) -> None:
                         chat_id=chat_id, job_id=pending_job)
                 else:
                     answer = await _scan_bytes(data, media, "Telegram · фото чека",
-                                               chat_id=chat_id)
+                                               chat_id=chat_id, instruction=text,
+                                               shopping_first=_shopping_instruction(text),
+                                               uploader=_sender_label(message))
         elif message.get("document") and str(message["document"].get("mime_type", "")).startswith("image/"):
             doc = message["document"]
             await _ack(token, chat_id, reply_to, thread_id)
             data, media = await _download_telegram_file(token, doc["file_id"])
-            answer = await _scan_bytes(data, media, doc.get("file_name") or "telegram-image", chat_id=chat_id)
+            answer = await _scan_bytes(data, media, doc.get("file_name") or "telegram-image",
+                                       chat_id=chat_id, instruction=text,
+                                       shopping_first=_shopping_instruction(text),
+                                       uploader=_sender_label(message))
         elif (url_match := _URL_RE.search(text)):
             await _ack(token, chat_id, reply_to, thread_id)
             answer = await _scan_url(url_match.group(0).rstrip(".,)"), chat_id=chat_id)
         else:
             # Slash commands and links first; only a message that is none of
             # those is worth spending an AI call on.
-            answer = _mcp_command(text)
+            if text == "/trip":
+                answer = _trip_store_picker()
+            elif text.startswith("/trip "):
+                answer = _trip_reply(store_code=text.partition(" ")[2].strip() or None)
+            elif text == "/suggestions":
+                answer = _suggestions_reply()
+            else:
+                answer = _mcp_command(text)
             if answer is None and text:
                 await _ack(token, chat_id, reply_to, thread_id, "🧠 Читаю повідомлення…")
                 answer = await _capture_reply(text)
             if answer is None:
                 answer = ("Надішліть фото, QR або посилання на чек — або просто напишіть "
-                          "«додай чек ...» / «додай в список покупок ...». /help — команди.")
+                          "«додай чек ...» / «додай в список покупок ...». Відкрити "
+                          "основні розділи можна через меню команд.")
     except Exception as exc:  # noqa: BLE001
         logger.exception("Telegram update failed")
         answer = f"Не вдалося обробити: {exc}"
@@ -1356,8 +2030,12 @@ async def handle_update(token: str, update: dict) -> None:
     reply = answer if isinstance(answer, BotReply) else BotReply(str(answer))
     if not str(answer).startswith("Не вдалося обробити:"):
         finish_incoming_message(log_id, status="processed", outcome=reply.text)
-    await _send(token, chat_id, html.escape(reply.text), reply_to=reply_to,
-                thread_id=thread_id, keyboard=reply.keyboard)
+    if reply.photo:
+        await _send_photo(token, chat_id, reply.photo, html.escape(reply.text),
+                          reply_to=reply_to, thread_id=thread_id, keyboard=reply.keyboard)
+    else:
+        await _send(token, chat_id, html.escape(reply.text), reply_to=reply_to,
+                    thread_id=thread_id, keyboard=reply.keyboard)
 
 
 async def handle_callback(token: str, update: dict) -> None:
@@ -1376,14 +2054,106 @@ async def handle_callback(token: str, update: dict) -> None:
         await _api(token, "answerCallbackQuery", {"callback_query_id": query_id, "text": "Немає доступу"})
         return
 
+    # "rev:<action>:<scan job id>"; an action ending in "x" replaces the
+    # receipt this scan already produced.
+    prefix, _, rest = data.partition(":")
+    action, _, job_id = rest.partition(":")
+
+    # Telegram spins the button until the callback is answered and gives up on
+    # it after a few seconds — so answer first and do the work after. Waiting
+    # until the end (recognition can take half a minute) is what made a press
+    # look like nothing had happened.
+    await _api(token, "answerCallbackQuery", {"callback_query_id": query_id})
+    started = _started_line(prefix, action)
+    if started:
+        if prefix == "tri" and prompt_id is not None:
+            try:
+                await _edit_message(token, chat_id, prompt_id, started)
+            except Exception:  # noqa: BLE001 — final result may still be shown
+                logger.debug("could not show started shopping action", exc_info=True)
+        else:
+            await _ack(token, chat_id, prompt_id, thread_id, started)
+
     answer: "str | BotReply | None" = None
     try:
-        # "rev:<action>:<scan job id>"; an action ending in "x" replaces the
-        # receipt this scan already produced.
-        prefix, _, rest = data.partition(":")
-        action, _, job_id = rest.partition(":")
-        if prefix == "cap" and action == "undo" and job_id:
+        if prefix == "rc" and action == "detail" and job_id:
+            answer = _receipt_detail_reply(job_id)
+        elif prefix == "rc" and action == "list" and job_id:
+            page_text, _, limit_text = job_id.partition(":")
+            limit_text, _, date_key = limit_text.partition(":")
+            selected_date = None
+            if date_key and date_key != "all":
+                try:
+                    selected_date = dt.datetime.strptime(date_key, "%Y%m%d").date()
+                except ValueError:
+                    answer = "Не вдалося прочитати дату сторінки."
+            if answer is None:
+                try:
+                    answer = _receipts_reply(
+                        page=int(page_text), limit=int(limit_text), selected_date=selected_date,
+                    )
+                except ValueError:
+                    answer = "Сторінка чеків недоступна."
+        elif prefix == "cap" and action == "undo" and job_id:
             answer = _undo_capture_batch(job_id)
+        elif prefix == "tri" and action == "categorize":
+            from app.services import shopping_list as shopping_svc
+            with SessionLocal() as db:
+                result = await shopping_svc.categorize_pending(db)
+            summary = (
+                f"✅ Розподілення завершено: {result['categorized']} з "
+                f"{result['checked']} товарів отримали категорію."
+            )
+            if result.get("ai_error"):
+                summary += "\n⚠️ Частину не вдалося розподілити через помилку AI."
+            answer = _trip_store_picker(check_uncategorized=False, intro=summary)
+        elif prefix == "tri" and action == "uncategorized":
+            answer = _uncategorized_trip_reply()
+        elif prefix == "tri" and action == "continue":
+            answer = _trip_store_picker(check_uncategorized=False)
+        elif prefix == "tri" and action == "store":
+            # Empty job_id means the user explicitly chose "Все магазины";
+            # preserve that distinction instead of turning it into no choice.
+            answer = _trip_reply(store_code=job_id)
+        elif prefix == "tri" and action == "item" and job_id:
+            from app.models.shopping import ShoppingTrip, ShoppingTripItem, ShoppingTripItemStatus
+            from app.services import shopping_list as shopping_svc
+            with SessionLocal() as db:
+                item = db.get(ShoppingTripItem, job_id)
+                trip = db.get(ShoppingTrip, item.trip_id) if item else None
+                if trip is None or item is None:
+                    answer = "Цей чеклист вже недоступний."
+                else:
+                    status = (ShoppingTripItemStatus.planned
+                              if item.status == ShoppingTripItemStatus.bought
+                              else ShoppingTripItemStatus.bought)
+                    shopping_svc.update_trip_item(db, item, status)
+                    answer = _trip_reply(trip.id)
+        elif prefix == "tri" and action == "done" and job_id:
+            from app.models.shopping import ShoppingTrip, ShoppingTripStatus
+            from app.services import shopping_list as shopping_svc
+            with SessionLocal() as db:
+                trip = db.get(ShoppingTrip, job_id)
+                if trip is None or trip.status != ShoppingTripStatus.active:
+                    answer = "Цей чеклист вже завершено."
+                else:
+                    shopping_svc.complete_trip(db, trip)
+                    answer = "✅ Чеклист завершено. Невідмічені товари залишилися у списку."
+        elif prefix == "rec" and action in {"add", "later", "ignore"} and job_id:
+            from app.services import shopping_list as shopping_svc
+            with SessionLocal() as db:
+                name = shopping_svc.routine_name_by_token(db, job_id)
+                if name is None:
+                    answer = "Ця рекомендація вже неактуальна."
+                else:
+                    action_name = {"add": "add", "later": "postpone", "ignore": "ignore"}[action]
+                    shopping_svc.routine_action(db, name, action_name)
+                    answer = _suggestions_reply()
+        elif prefix == "rec" and action == "cat" and job_id:
+            from app.services import shopping_list as shopping_svc
+            with SessionLocal() as db:
+                shopping_svc.routine_category_action(db, job_id, "ignore")
+            answer = _suggestions_reply()
         elif prefix == "cap" and action == "undor" and job_id:
             answer = _undo_fuel_receipt(job_id)
         elif prefix == "ser" and action in {"one", "many"} and job_id:
@@ -1413,14 +2183,24 @@ async def handle_callback(token: str, update: dict) -> None:
                     answer = await _rescan_job(job_id, ai_first=False, replace=replace)
                 case "ai":
                     answer = await _rescan_job(job_id, ai_first=True, replace=replace)
+                case "up":
+                    # The next step of the route, starting from the one already
+                    # spent — no QR ladder, no repeat of the model that failed.
+                    answer = await _rescan_job(job_id, ai_first=True, replace=replace,
+                                               escalate=True)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Telegram callback failed")
         answer = f"Не вдалося: {exc}"
 
-    await _api(token, "answerCallbackQuery", {"callback_query_id": query_id})
     if answer is None:
         return
     reply = answer if isinstance(answer, BotReply) else BotReply(str(answer))
+    if prefix == "tri" and prompt_id is not None:
+        try:
+            await _edit_message(token, chat_id, prompt_id, html.escape(reply.text), reply.keyboard)
+        except Exception:  # noqa: BLE001 — don't turn a Telegram edit race into a crash
+            logger.warning("could not edit shopping checklist message", exc_info=True)
+        return
     if prompt_id is not None:
         # Drop the now-stale action buttons so the choice can't be repeated.
         try:
@@ -1429,8 +2209,12 @@ async def handle_callback(token: str, update: dict) -> None:
             })
         except Exception:  # noqa: BLE001
             logger.debug("could not clear Telegram keyboard", exc_info=True)
-    await _send(token, chat_id, html.escape(reply.text), reply_to=prompt_id,
-                thread_id=thread_id, keyboard=reply.keyboard)
+    if reply.photo:
+        await _send_photo(token, chat_id, reply.photo, html.escape(reply.text),
+                          reply_to=prompt_id, thread_id=thread_id, keyboard=reply.keyboard)
+    else:
+        await _send(token, chat_id, html.escape(reply.text), reply_to=prompt_id,
+                    thread_id=thread_id, keyboard=reply.keyboard)
 
 
 async def polling_loop() -> None:
@@ -1442,6 +2226,7 @@ async def polling_loop() -> None:
             if not cfg.enabled or not token:
                 await asyncio.sleep(5)
                 continue
+            await _ensure_bot_commands(token)
             data = await _api(token, "getUpdates", {
                 "offset": offset, "timeout": 45, "allowed_updates": ["message", "callback_query"],
             })

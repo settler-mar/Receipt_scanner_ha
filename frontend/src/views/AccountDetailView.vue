@@ -31,11 +31,21 @@ const importError = ref('')
 // Which store the interactive browser-login panel drives. Both AliExpress and
 // Prom.ua use the same headed-Chromium flow (screenshot streaming + manual
 // takeover); Prom skips the password step (phone + SMS only).
-const browserLoginSeg = computed<'aliexpress' | 'prom'>(() =>
-  account.value?.store.code === 'prom' ? 'prom' : 'aliexpress',
+const browserLoginSeg = computed<'aliexpress' | 'prom' | 'rozetka' | 'olx'>(() =>
+  account.value?.store.code === 'prom' ? 'prom' : account.value?.store.code === 'rozetka' ? 'rozetka' : account.value?.store.code === 'olx' ? 'olx' : 'aliexpress',
 )
 const usesBrowserLogin = computed(() =>
-  ['aliexpress', 'prom'].includes(account.value?.store.code ?? ''),
+  ['aliexpress', 'prom', 'rozetka', 'olx'].includes(account.value?.store.code ?? ''),
+)
+// Що саме лежить у `phone_number` для цього магазину — каже сам адаптер
+// (store.login_field), а не список кодів магазинів у фронтенді.
+const LOGIN_FIELD_LABELS: Record<string, string> = {
+  email: 'Email',
+  phone_or_email: 'Телефон або email',
+  phone: 'Телефон',
+}
+const loginFieldLabel = computed(
+  () => LOGIN_FIELD_LABELS[account.value?.store.login_field ?? 'phone'] ?? 'Телефон',
 )
 const aliLoginStep = ref<AliLoginStep | null>(null)
 const aliPassword = ref('')
@@ -102,7 +112,7 @@ async function takeOverAliBrowser() {
 
 function aliLoginValue(): string {
   const value = (account.value?.phone_number ?? '').replace(/[\s()\-]/g, '')
-  if (browserLoginSeg.value === 'prom') {
+  if (['prom', 'rozetka', 'olx'].includes(browserLoginSeg.value)) {
     const digits = value.replace(/\D/g, '')
     if (digits.length === 10 && digits.startsWith('0')) return '+38' + digits
     if (digits.startsWith('380')) return '+' + digits
@@ -281,6 +291,7 @@ function pollForActive() {
 
 onUnmounted(() => {
   stopAliProgressPolling()
+  stopRunsPolling()
   if (oauthPollTimer) clearInterval(oauthPollTimer)
   if (foxtrotApprovalTimer) clearInterval(foxtrotApprovalTimer)
   if (aliLoginStep.value?.session_id && aliLoginStep.value.step !== 'done') {
@@ -340,6 +351,9 @@ async function load() {
   account.value = accounts.find((a) => a.id === props.id) ?? null
   runs.value = runList
   receipts.value = receiptList.items
+  // A deep-history job started before a page reload is still running in the
+  // background — resume watching it instead of leaving progress silent.
+  if (runs.value[0]?.status === 'running' && !runsPollTimer) startRunsPolling()
   if (account.value?.schedule) {
     scheduleForm.value = {
       enabled: account.value.schedule.enabled,
@@ -350,6 +364,15 @@ async function load() {
 }
 
 onMounted(load)
+
+async function waitForRun(runId: string): Promise<CollectionRun> {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    const current = (await api.accounts.runs(props.id)).find((run) => run.id === runId)
+    if (current && current.status !== 'running') return current
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  throw new Error('Збір ще виконується — перевірте історію запусків пізніше.')
+}
 
 const editingAccount = ref(false)
 const accountForm = ref({ label: '', phone_number: '' })
@@ -390,6 +413,85 @@ async function saveToken() {
   await api.accounts.setToken(props.id, { access_token: tokenForm.value.access_token, extra })
   tokenForm.value.access_token = ''
   await load()
+}
+
+const testTokenBusy = ref(false)
+const testTokenResult = ref<{ ok: boolean; detail: string } | null>(null)
+
+async function testToken() {
+  testTokenBusy.value = true
+  testTokenResult.value = null
+  try {
+    testTokenResult.value = await api.bankTransactions.testToken(props.id)
+  } catch (e) {
+    testTokenResult.value = { ok: false, detail: (e as Error).message }
+  } finally {
+    testTokenBusy.value = false
+  }
+}
+
+const pollBusy = ref(false)
+const pollMessage = ref('')
+
+async function pollTransactions() {
+  pollBusy.value = true
+  pollMessage.value = ''
+  try {
+    const result = await api.bankTransactions.poll(props.id)
+    pollMessage.value = 'fetched' in result
+      ? `Отримано: ${result.fetched}, нових: ${result.created}`
+      : 'Розпочато'
+    await load()
+  } catch (e) {
+    pollMessage.value = (e as Error).message
+  } finally {
+    pollBusy.value = false
+  }
+}
+
+// Monobank throttles the statement endpoint to ~1 request per 31 days of
+// history per minute, so a wide range runs in the background — see
+// services/bank_transactions.run_deep_sync_in_background. Progress shows up
+// as new transactions and a Журнал entry, not a live progress bar.
+const deepHistoryOpen = ref(false)
+const deepHistoryDate = ref('')
+const deepHistoryBusy = ref(false)
+const deepHistoryMessage = ref('')
+
+// While a deep-history job is running in the background, its CollectionRun
+// row is the only place progress lives (services/bank_transactions.py commits
+// progress_current/progress_total to it after every throttled chunk) — poll
+// the run list until it leaves "running" instead of making the user refresh
+// the page repeatedly to see whether it's still going.
+let runsPollTimer: ReturnType<typeof setInterval> | null = null
+
+function stopRunsPolling() {
+  if (runsPollTimer) clearInterval(runsPollTimer)
+  runsPollTimer = null
+}
+
+function startRunsPolling() {
+  stopRunsPolling()
+  runsPollTimer = setInterval(async () => {
+    runs.value = await api.accounts.runs(props.id)
+    if (runs.value[0]?.status !== 'running') stopRunsPolling()
+  }, 3000)
+}
+
+async function loadDeepHistory() {
+  if (!deepHistoryDate.value) return
+  deepHistoryBusy.value = true
+  deepHistoryMessage.value = ''
+  try {
+    await api.bankTransactions.poll(props.id, `${deepHistoryDate.value}T00:00:00Z`)
+    deepHistoryMessage.value = 'Розпочато у фоні — прогрес видно нижче, в «Історії запусків».'
+    await load()
+    startRunsPolling()
+  } catch (e) {
+    deepHistoryMessage.value = (e as Error).message
+  } finally {
+    deepHistoryBusy.value = false
+  }
 }
 
 const cardNumberInput = ref('')
@@ -532,7 +634,8 @@ async function saveSchedule() {
 async function collectNow() {
   collecting.value = true
   try {
-    await api.accounts.collectNow(props.id)
+    const started = await api.accounts.collectNow(props.id)
+    await waitForRun(started.id)
     await load()
   } catch (e) {
     alert((e as Error).message)
@@ -544,7 +647,8 @@ async function collectNow() {
 async function collectAllAli() {
   collectingAll.value = true
   try {
-    await api.accounts.collectAll(props.id)
+    const started = await api.accounts.collectAll(props.id)
+    await waitForRun(started.id)
     await load()
   } catch (e) {
     alert((e as Error).message)
@@ -554,6 +658,7 @@ async function collectAllAli() {
 }
 
 const loggingOut = ref(false)
+const resettingError = ref(false)
 async function logout() {
   if (!confirm('Вийти з акаунта? Зібрані чеки залишаться, знадобиться повторний вхід.')) return
   loggingOut.value = true
@@ -562,6 +667,18 @@ async function logout() {
     await load()
   } finally {
     loggingOut.value = false
+  }
+}
+
+async function resetError() {
+  resettingError.value = true
+  try {
+    await api.accounts.resetError(props.id)
+    await load()
+  } catch (e) {
+    alert((e as Error).message)
+  } finally {
+    resettingError.value = false
   }
 }
 
@@ -590,12 +707,12 @@ function fmtDate(v: string | null) {
         {{ collecting ? 'Збір…' : 'Зібрати зараз' }}
       </button>
       <button
-        v-if="account.store.code === 'aliexpress' && account.status === 'active'"
+        v-if="account.store.capabilities.receipts && account.status === 'active'"
         class="secondary"
         :disabled="collecting || collectingAll"
         @click="collectAllAli"
       >
-        {{ collectingAll ? 'Завантажуємо всі…' : 'Завантажити всі' }}
+        {{ collectingAll ? 'Завантажуємо всю історію…' : 'Завантажити всю історію' }}
       </button>
       <button v-if="account.store.capabilities.manual_receipts" @click="addReceiptHere">+ Додати чек</button>
       <button class="secondary" @click="startEditAccount">Редагувати</button>
@@ -609,8 +726,11 @@ function fmtDate(v: string | null) {
         <input v-model="accountForm.label" />
       </div>
       <div class="form-row">
-        <label>Телефон</label>
-        <input v-model="accountForm.phone_number" placeholder="+380..." />
+        <label>{{ loginFieldLabel }}</label>
+        <input
+          v-model="accountForm.phone_number"
+          :placeholder="account?.store.login_field === 'email' ? 'you@example.com' : '+380...'"
+        />
       </div>
       <div class="toolbar" style="margin-bottom: 0">
         <button :disabled="savingAccount" @click="saveAccount">
@@ -626,7 +746,7 @@ function fmtDate(v: string | null) {
         <div>{{ account.store.name }}</div>
       </div>
       <div class="card">
-        <div class="stat-label">Телефон</div>
+        <div class="stat-label">{{ loginFieldLabel }}</div>
         <div>{{ account.phone_number ?? '—' }}</div>
       </div>
       <div class="card">
@@ -635,9 +755,48 @@ function fmtDate(v: string | null) {
       </div>
     </div>
 
+    <!-- A successful manual run clears `last_error`, so nightly failures used to
+         leave the page looking perfectly healthy. This block is driven by the
+         run history instead and stays until the failures stop. -->
+    <div
+      v-if="!account.last_error && account.failed_runs_24h"
+      class="card"
+      style="border-color: var(--warning); margin-bottom: 24px"
+    >
+      <h3 style="margin-top: 0">Збір даних збоїть</h3>
+      <p style="margin: 0">
+        За добу невдалих запусків: <strong>{{ account.failed_runs_24h }}</strong>.
+        Останній збій {{ fmtDateTime(account.last_failed_at) }}:
+        <span class="muted">{{ account.last_failed_error }}</span>
+      </p>
+      <p class="muted" style="margin: 6px 0 0">
+        Ручний збір міг пройти вдало й «затерти» помилку — перевірте
+        <RouterLink to="/logs">журнал</RouterLink> і за потреби увійдіть повторно.
+      </p>
+    </div>
+
     <p v-if="account.last_error" class="card" style="border-color: var(--danger); color: var(--danger)">
       {{ account.last_error }}
+      <button
+        v-if="account.last_error || account.status === 'needs_reauth' || account.status === 'error'"
+        class="secondary"
+        style="display: block; margin-top: 10px"
+        :disabled="resettingError"
+        @click="resetError"
+      >
+        {{ resettingError ? 'Скидаємо…' : 'Скинути помилку' }}
+      </button>
     </p>
+
+    <div
+      v-else-if="account.status === 'needs_reauth' || account.status === 'error'"
+      class="card"
+      style="border-color: var(--danger); color: var(--danger); margin-bottom: 24px"
+    >
+      <button class="secondary" :disabled="resettingError" @click="resetError">
+        {{ resettingError ? 'Скидаємо…' : 'Скинути помилку' }}
+      </button>
+    </div>
 
     <div
       v-if="account.status === 'active' && account.store.auth_type !== 'manual'"
@@ -784,10 +943,15 @@ function fmtDate(v: string | null) {
             Телефон і пароль передаються браузеру AliExpress лише для цього входу та не
             зберігаються. У базі залишиться тільки зашифрована браузерна сесія.
           </p>
-          <p v-else-if="account.store.code === 'prom'" class="muted" style="margin-top: -8px">
-            Відкриється браузер Prom.ua (єдиний обліковий запис Rozetka). Введіть номер
+          <p v-else-if="['prom', 'rozetka', 'olx'].includes(account.store.code)" class="muted" style="margin-top: -8px">
+            Відкриється браузер {{ account.store.name }}. Введіть номер
             телефону, потім SMS-код. У базі залишиться лише зашифрована браузерна сесія.
             Якщо щось піде не так — перехопіть керування браузером.
+          </p>
+          <p v-else-if="account.store.login_field === 'email'" class="muted" style="margin-top: -8px">
+            {{ account.store.name }} логінить лише за email — той самий, що й на сайті (вхід
+            через Google чи Facebook не підходить). Застосунок збереже лише зашифровану сесію,
+            пароль не зберігається.
           </p>
           <p v-else class="muted" style="margin-top: -8px">
             Введіть пароль від кабінету. Застосунок збереже лише зашифровану сесію — пароль
@@ -796,9 +960,11 @@ function fmtDate(v: string | null) {
           <p v-if="usesBrowserLogin ? aliLoginError : passwordLoginError" style="color: var(--danger)">
             {{ usesBrowserLogin ? aliLoginError : passwordLoginError }}
           </p>
-          <div class="form-row">
-            <label>{{ account.store.code === 'aliexpress' ? 'Телефон або email' : 'Телефон' }}</label>
-            <input :value="account.phone_number ?? ''" disabled placeholder="Спочатку вкажіть логін" />
+          <!-- Only shown while the login is still missing: once it's set, the
+               card grid above already displays it and this row is a duplicate. -->
+          <div v-if="!account.phone_number" class="form-row">
+            <label>{{ loginFieldLabel }}</label>
+            <input value="" disabled placeholder="Спочатку вкажіть логін" />
           </div>
           <template v-if="usesBrowserLogin">
             <div v-if="aliLoginStep" style="margin: 12px 0 16px">
@@ -840,7 +1006,7 @@ function fmtDate(v: string | null) {
               </div>
               <div v-if="aliLoginStep.step === 'manual'" class="toolbar" style="margin: 10px 0 0">
                 <button class="secondary" :disabled="aliManualBusy || !account.phone_number" @click="typeAliText(aliLoginValue())">
-                  {{ browserLoginSeg === 'prom' ? 'Ввести телефон' : 'Ввести логін' }}
+                  {{ ['prom', 'rozetka', 'olx'].includes(browserLoginSeg) ? 'Ввести телефон' : 'Ввести логін' }}
                 </button>
                 <button
                   v-if="browserLoginSeg === 'aliexpress'"
@@ -892,7 +1058,7 @@ function fmtDate(v: string | null) {
             </button>
           </template>
           <p v-if="!account.phone_number" class="muted" style="margin-bottom: 0">
-            Спочатку натисніть «Редагувати» й укажіть {{ account.store.code === 'aliexpress' ? 'телефон або email' : 'номер телефону' }}.
+            Спочатку натисніть «Редагувати» й укажіть {{ loginFieldLabel.toLowerCase() }}.
           </p>
           <p
             v-if="usesBrowserLogin && aliLoginStep && ['manual', 'error'].includes(aliLoginStep.step)"
@@ -987,7 +1153,88 @@ function fmtDate(v: string | null) {
       </template>
     </template>
 
-    <div v-if="account.store.capabilities.receipts" class="card" style="margin-bottom: 24px">
+    <template v-if="account.store.auth_type === 'api_token'">
+      <div class="card" style="margin-bottom: 24px">
+        <h3 style="margin-top: 0">Токен</h3>
+        <p class="muted" style="margin-top: -8px">
+          Особистий API-токен цього підключення. Кожне підключення (наприклад,
+          інша картка того самого банку) — окремий акаунт зі своїм токеном.
+        </p>
+        <p v-if="account.status === 'active'" class="muted" style="margin-top: -8px">
+          Токен збережено. Вставте новий, щоб замінити його.
+        </p>
+        <div class="form-row">
+          <label>Токен</label>
+          <PasswordInput
+            v-model="tokenForm.access_token"
+            autocomplete="off"
+            :placeholder="account.status === 'active' ? '••••••••' : 'Вставте токен'"
+          />
+        </div>
+        <div class="toolbar">
+          <button :disabled="!tokenForm.access_token.trim()" @click="saveToken">Зберегти токен</button>
+          <button
+            v-if="account.store.capabilities.token_test"
+            class="secondary"
+            :disabled="testTokenBusy || account.status !== 'active'"
+            @click="testToken"
+          >
+            {{ testTokenBusy ? 'Перевірка…' : 'Перевірити токен' }}
+          </button>
+        </div>
+        <p
+          v-if="testTokenResult"
+          :style="{ color: testTokenResult.ok ? 'var(--success)' : 'var(--danger)' }"
+        >
+          {{ testTokenResult.detail }}
+        </p>
+      </div>
+
+      <div
+        v-if="account.store.capabilities.transactions && account.status === 'active'"
+        class="card"
+        style="margin-bottom: 24px"
+      >
+        <h3 style="margin-top: 0">Виписка</h3>
+        <p class="muted" style="margin-top: -8px">
+          Отримується за розкладом нижче, або одразу кнопкою.
+        </p>
+        <div class="toolbar">
+          <button :disabled="pollBusy" @click="pollTransactions">
+            {{ pollBusy ? 'Отримання…' : 'Отримати зараз' }}
+          </button>
+          <RouterLink to="/bank-transactions">Переглянути транзакції</RouterLink>
+        </div>
+        <p v-if="pollMessage" class="muted">{{ pollMessage }}</p>
+
+        <div style="margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px">
+          <button class="secondary" @click="deepHistoryOpen = !deepHistoryOpen">
+            {{ deepHistoryOpen ? 'Сховати' : 'Завантажити глибшу історію' }}
+          </button>
+          <div v-if="deepHistoryOpen" style="margin-top: 10px">
+            <p class="muted" style="margin-top: 0">
+              Monobank віддає виписку частинами по 31 дню з обмеженням приблизно
+              1 запит на хвилину — за старіший період завантаження триває
+              кілька хвилин і йде у фоні; сторінка не чекає на нього.
+            </p>
+            <div class="form-row">
+              <label>Отримати з дати</label>
+              <input v-model="deepHistoryDate" type="date" />
+            </div>
+            <button :disabled="deepHistoryBusy || !deepHistoryDate" @click="loadDeepHistory">
+              {{ deepHistoryBusy ? 'Запускаємо…' : 'Почати завантаження' }}
+            </button>
+            <p v-if="deepHistoryMessage" class="muted">{{ deepHistoryMessage }}</p>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <div
+      v-if="account.store.capabilities.receipts || account.store.capabilities.transactions"
+      class="card"
+      style="margin-bottom: 24px"
+    >
       <h3 style="margin-top: 0">Розклад збору</h3>
       <div class="form-row">
         <label><input type="checkbox" v-model="scheduleForm.enabled" style="width: auto" /> Увімкнено</label>
@@ -1030,7 +1277,7 @@ function fmtDate(v: string | null) {
       </button>
     </div>
 
-    <template v-if="account.store.capabilities.receipts">
+    <template v-if="account.store.capabilities.receipts || account.store.capabilities.transactions">
       <h3>Історія запусків</h3>
       <table>
         <thead>
@@ -1040,6 +1287,7 @@ function fmtDate(v: string | null) {
             <th>Статус</th>
             <th>Знайдено</th>
             <th>Нових</th>
+            <th>Прогрес</th>
             <th>Помилка</th>
           </tr>
         </thead>
@@ -1050,10 +1298,29 @@ function fmtDate(v: string | null) {
             <td><span class="badge" :class="r.status === 'success' ? 'badge-active' : 'badge-error'">{{ r.status }}</span></td>
             <td>{{ r.receipts_found }}</td>
             <td>{{ r.receipts_new }}</td>
+            <td>
+              <template v-if="r.progress_total">
+                <div style="display: flex; align-items: center; gap: 6px">
+                  <div style="width: 60px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden">
+                    <div
+                      :style="{
+                        width: `${Math.round(((r.progress_current ?? 0) / r.progress_total) * 100)}%`,
+                        height: '100%',
+                        background: r.status === 'error' ? 'var(--danger)' : 'var(--accent)',
+                      }"
+                    ></div>
+                  </div>
+                  <span class="muted" style="font-size: 12px; white-space: nowrap">
+                    {{ r.progress_current ?? 0 }}/{{ r.progress_total }}
+                  </span>
+                </div>
+              </template>
+              <span v-else class="muted">—</span>
+            </td>
             <td class="muted">{{ r.error_message ?? '—' }}</td>
           </tr>
           <tr v-if="!runs.length">
-            <td colspan="6" class="muted">Ще не було жодного запуску</td>
+            <td colspan="7" class="muted">Ще не було жодного запуску</td>
           </tr>
         </tbody>
       </table>

@@ -9,6 +9,7 @@ import base64
 import datetime as dt
 import io
 import re
+import secrets
 import uuid
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from html.parser import HTMLParser
@@ -90,6 +91,15 @@ class _TableParser(HTMLParser):
             self._row = None
 
 
+class MetroSessionExpired(AdapterError):
+    """METRO rejected the installation session and it can be registered again."""
+
+
+def generate_cart_number() -> str:
+    """Return a valid human cart number for the automatic re-registration flow."""
+    return f"{secrets.randbelow(251) + 50:03d}"
+
+
 def _invoice_items(invoice: dict) -> list[NormalizedItem]:
     direct = invoice.get("items") or invoice.get("products") or invoice.get("lines")
     if isinstance(direct, list):
@@ -103,8 +113,11 @@ def _invoice_items(invoice: dict) -> list[NormalizedItem]:
             qty = _money(row.get("quantity", 1)) or 1
             total = _money(row.get("totalPrice", row.get("total", row.get("amount", 0))))
             unit_price = _money(row.get("unitPrice", row.get("price", 0))) or (total / qty if qty else total)
+            code = next((row.get(key) for key in ("productCode", "product_code", "article", "sku", "code") if row.get(key)), None)
+            barcode = row.get("barcode") or row.get("ean") or row.get("gtin")
             result.append(NormalizedItem(name=str(name), quantity=qty, unit_price=unit_price,
-                                         total_price=total, barcode=str(row.get("barcode")) if row.get("barcode") else None,
+                                         total_price=total, barcode=str(barcode) if barcode else None,
+                                         product_code=str(code) if code else None,
                                          discount=_money(row.get("discount", 0))))
         return result
 
@@ -121,7 +134,9 @@ def _invoice_items(invoice: dict) -> list[NormalizedItem]:
                 text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(decoded)).pages)
             except Exception:
                 return []
-            return _pdf_invoice_items(text)
+            items = _pdf_invoice_items(text)
+            _validate_pdf_invoice_totals(text, items)
+            return items
         html = decoded.decode("utf-8", errors="replace")
     else:
         html = str(encoded)
@@ -146,7 +161,10 @@ def _invoice_items(invoice: dict) -> list[NormalizedItem]:
 def _pdf_invoice_items(text: str) -> list[NormalizedItem]:
     """Parse the product rows from METRO UA's invoice PDF text layer."""
     row_pattern = re.compile(
-        r"\d{2}\.\d{2}\.\d{4}\s+(\d{7}):\s+(.+?)\s+\.\s+"
+        # The PDF has at least two layouts: some rows have ``.`` between the
+        # product name and customs code, while others run the name directly
+        # into the code.  Do not require the separator or a space after ``:``.
+        r"\d{2}\.\d{2}\.\d{4}\s+(\d{7}):\s*(.+?)\s+\.?\s*"
         r"\d{10}\s+\S+\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$"
     )
     items: list[NormalizedItem] = []
@@ -157,13 +175,49 @@ def _pdf_invoice_items(text: str) -> list[NormalizedItem]:
             continue
         product_code, name, quantity, unit_price, total_price = match.groups()
         items.append(NormalizedItem(
-            name=name.strip(),
+            name=name.strip(" ."),
             quantity=_money(quantity),
             unit_price=_money(unit_price),
             total_price=_money(total_price),
-            barcode=product_code,
+            barcode=product_code,  # compatibility with existing matching/UI
+            product_code=product_code,
         ))
     return items
+
+
+def _last_amount_on_line(text: str, marker: str) -> Decimal | None:
+    """Return the last money amount on a labelled invoice summary line."""
+    for line in text.splitlines():
+        if marker.casefold() not in line.casefold():
+            continue
+        amounts = re.findall(r"\d[\d ]*[.,]\d{2}", line)
+        if amounts:
+            return Decimal(str(_money(amounts[-1].replace(" ", ""))))
+    return None
+
+
+def _validate_pdf_invoice_totals(text: str, items: list[NormalizedItem]) -> None:
+    """Reject a parsed invoice when its lines cannot explain its total.
+
+    METRO's line amounts are before VAT, while the invoice total includes the
+    aggregate VAT.  Checking this before grossing up the lines catches a
+    parser that silently dropped rows (the old parser kept only three of the
+    seven rows in the supplied invoice).
+    """
+    vat = _last_amount_on_line(text, "Податок на додану вартість")
+    total = _last_amount_on_line(text, "Загальна сума з ПДВ")
+    if total is None:
+        return
+    if not items:
+        raise AdapterError("METRO: в счёте есть итог, но не распознаны товарные строки")
+    if vat is None:
+        return
+    line_total = sum((Decimal(str(item.total_price)) for item in items), Decimal("0"))
+    if abs(line_total + vat - total) > Decimal("0.02"):
+        raise AdapterError(
+            "METRO: сума рядків чека не сходиться з підсумком "
+            f"({line_total + vat} != {total})"
+        )
 
 
 def _distribute_receipt_total(items: list[NormalizedItem], receipt_total: object) -> list[NormalizedItem]:
@@ -276,6 +330,9 @@ class MetroAdapter(BaseAdapter):
             "customerId": registered_customer_id,
             "device_uuid": device_uuid,
             "device_id": device_id,
+            # Persist the physical card identifier so an expired installation
+            # can be registered again without asking the user to scan it.
+            "card_barcode": card_barcode,
         })
         return session
 
@@ -289,7 +346,7 @@ class MetroAdapter(BaseAdapter):
             response = await client.post(f"{BASE_URL}/v4/order/historical/paid",
                                          json={"id": 0, "customerId": customer_id})
             if response.status_code in {401, 403}:
-                raise AdapterError("METRO: сесія прострочена — підключіть пристрій повторно")
+                raise MetroSessionExpired("METRO: сесія прострочена")
             if response.status_code != 200:
                 raise AdapterError(f"METRO: історія покупок повернула {response.status_code}")
             history = _payload(response.json())

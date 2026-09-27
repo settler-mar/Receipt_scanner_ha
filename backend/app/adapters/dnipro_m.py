@@ -42,7 +42,8 @@ from patchright.async_api import Browser, BrowserContext, Page, Playwright, asyn
 from pypdf import PdfReader
 
 from app.adapters.base import (ROTATED_ACCESS_TOKEN_KEY, AdapterError, AuthResult,
-    BaseAdapter, CatalogProduct, LoyaltyBalance, NormalizedItem, NormalizedReceipt)
+    BaseAdapter, CatalogProduct, LoyaltyBalance, NormalizedItem, NormalizedReceipt,
+    NormalizedReceiptComponent)
 
 BASE_URL = "https://dnipro-m.ua"
 AUTH_SESSION_TTL = 10 * 60
@@ -536,11 +537,17 @@ def _normalize(o: dict) -> NormalizedReceipt:
             item.has_warranty = True
             item.warranty_text = "Гарантійний талон Дніпро-М"
             item.warranty_checked_at = checked_at
+    components = ([NormalizedReceiptComponent(
+        kind="discount", amount=-abs(_to_float(debit) or 0.0), code="bonuses_debiting_amount",
+        label="Списані бонуси", source="dnipro_m.order",
+        raw={"bonuses_debiting_amount": debit},
+    )] if _to_float(debit) else [])
     return NormalizedReceipt(external_id=str(o["order_number"]), purchased_at=purchased_at,
         total_amount=_to_float(o.get("total")) or 0.0, shop_name=o.get("delivery_name"),
         shop_address=delivery_data.get("address") or o.get("delivery_city_name"),
         payment_type=o.get("payment_name"), channel="online" if o.get("creation_provider") == "site" else "offline",
         items=items,
+        components=components,
         bonuses=_to_float(current_bonus) if current_bonus not in (None, "") else None,
         bonuses_used=_to_float(debit) if debit is not None else None,
         has_warranty=has_warranty, raw=o)

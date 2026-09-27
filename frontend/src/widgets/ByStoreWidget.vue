@@ -2,7 +2,13 @@
 import { computed } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api } from '@/lib/api'
-import { fmtMoney, fmtMoneyFull, rangeDateFromShort, rangeParams } from '@/lib/dashboardFmt'
+import {
+  fmtMoney,
+  fmtMoneyFull,
+  METRIC_COLORS,
+  rangeDateFromShort,
+  rangeParams,
+} from '@/lib/dashboardFmt'
 import { useWidgetData } from '@/composables/useWidgetData'
 import { fmtShare, useChartTooltip } from '@/composables/useChartTooltip'
 import ChartTooltip from '@/components/ChartTooltip.vue'
@@ -51,8 +57,12 @@ const tooltipRows = computed(() => {
       value: s.receipt_count ? fmtMoneyFull(s.total_spent / s.receipt_count) : '—',
     },
     { label: 'Частка витрат', value: fmtShare(s.total_spent, totalSpent.value) },
-    { label: 'Знижки', value: fmtMoneyFull(s.total_discount), color: 'var(--success)' },
-    { label: 'Бонуси', value: fmtMoneyFull(s.total_bonuses), color: 'var(--accent)' },
+    {
+      label: 'Знижки',
+      value: fmtMoneyFull(s.total_discount),
+      color: METRIC_COLORS.total_discount,
+    },
+    { label: 'Бонуси', value: fmtMoneyFull(s.total_bonuses), color: METRIC_COLORS.total_bonuses },
   ]
 })
 </script>

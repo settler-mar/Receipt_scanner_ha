@@ -7,12 +7,14 @@ only the receipt branch may reach app.services.ai.
 """
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import datetime as dt
 import logging
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -41,7 +43,7 @@ from app.models.scanner import (
     ScanStatus,
 )
 from app.scanner.aspect import color_stats, image_dimensions, route
-from app.scanner.pipeline import ScanOutcome, scan_receipt_bytes
+from app.scanner.pipeline import AiReading, ScanOutcome, scan_receipt_bytes
 from app.scanner.reconcile import reconcile
 from app.scanner import seller_lookup
 from app.services import inbox as inbox_svc
@@ -50,6 +52,7 @@ from app.services.categorize import apply_known_categories
 from app.services.shopping_list import match_receipt
 from app.services.manual_dedup import find_duplicate, find_receipt_by_fiscal, ingestion_lock
 from app.services.exchange_rates import rate_to_uah
+from app.services.reconciliation import recalculate_receipt
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +180,7 @@ def _merge_normalized(db: Session, existing: Receipt, nr: NormalizedReceipt) -> 
         existing.items.clear()
         for item in nr.items:
             existing.items.append(ReceiptItem(
-                name=item.name, barcode=item.barcode, category_raw=item.category,
+                name=item.name, barcode=item.barcode, product_code=item.product_code or item.barcode, category_raw=item.category,
                 quantity=item.quantity, unit=item.unit, unit_price=item.unit_price,
                 total_price=item.total_price, discount=item.discount,
             ))
@@ -210,6 +213,8 @@ def _persist_receipt_unlocked(db: Session, account: Account, nr: NormalizedRecei
         # version reconciles and is demonstrably more complete.
         changed = _merge_normalized(db, existing, nr)
         if changed:
+            db.flush()
+            recalculate_receipt(db, existing)
             db.commit()
             db.refresh(existing)
         return existing
@@ -239,11 +244,12 @@ def _persist_receipt_unlocked(db: Session, account: Account, nr: NormalizedRecei
     db.add(receipt)
     for it in nr.items:
         db.add(ReceiptItem(
-            receipt=receipt, name=it.name, barcode=it.barcode,
+            receipt=receipt, name=it.name, barcode=it.barcode, product_code=it.product_code or it.barcode,
             category_raw=it.category, quantity=it.quantity, unit=it.unit,
             unit_price=it.unit_price, total_price=it.total_price, discount=it.discount,
         ))
     db.flush()
+    recalculate_receipt(db, receipt)
     apply_known_categories(db, receipt)
     try:
         match_receipt(db, receipt)  # ROADMAP.md Крок 2 auto-tick — best-effort
@@ -285,22 +291,40 @@ class UploadResult(BaseModel):
 
 
 async def _handle_receipt(db: Session, data: bytes, filename: str | None, media_type: str,
-                          *, fiscal_override=None, ai_first: bool = False) -> UploadResult:
+                          *, fiscal_override=None, ai_first: bool = False,
+                          ai_after: tuple[str, str] | None = None,
+                          qr_scan=None, job: "ScanJob | None" = None,
+                          ai_images: list[bytes] | None = None,
+                          uploader: str | None = None) -> UploadResult:
     from app.services import ai  # receipt branch only
 
-    job = ScanJob(source_filename=filename, status=ScanStatus.pending)
-    db.add(job)
-    db.commit()
-    db.refresh(job)
+    if job is None:
+        job = ScanJob(source_filename=filename, status=ScanStatus.pending)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        detail = f"{filename or 'фото'} · {len(data) // 1024} КБ"
+        if uploader:
+            detail += f" · від {uploader}"
+        scan_jobs.record_event(db, job, "upload", detail=detail)
     SCAN_INPUT_DIR.mkdir(parents=True, exist_ok=True)
     scan_input_path(job.id).write_bytes(data)
 
-    async def _ai_ocr() -> dict | None:
+    # A receipt shot in parts goes to the model as its own frames, not as the
+    # glued picture: the seam is an approximation, the originals are not. The
+    # local stages keep working on `data`, which is what the glue is good for.
+    vision_frames = list(ai_images) if ai_images else [data]
+
+    async def _ai_ocr() -> AiReading:
         try:
-            return await ai.ocr_receipt(db, data, media_type)
+            reading = await ai.ocr_receipt(db, vision_frames[0], media_type,
+                                           start_after=ai_after,
+                                           extra_images=vision_frames[1:] or None)
         except Exception as exc:  # noqa: BLE001
             logger.info("AI OCR unavailable: %s", exc)
-            return None
+            return AiReading(None)
+        return AiReading(reading.data, service=reading.service, model=reading.model,
+                         steps=reading.steps, attempts=reading.attempts)
 
     def _known_receipt(fiscal) -> str | None:
         found = find_receipt_by_fiscal(db, fiscal)
@@ -315,6 +339,7 @@ async def _handle_receipt(db: Session, data: bytes, filename: str | None, media_
             fiscal_override=fiscal_override,
             ai_first=ai_first,
             known_receipt=_known_receipt,
+            qr_scan=qr_scan,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("scan pipeline crashed")
@@ -326,7 +351,20 @@ async def _handle_receipt(db: Session, data: bytes, filename: str | None, media_
     job.method = outcome.method
     job.confidence = outcome.confidence
     job.raw_ocr = {
+        # The history outlives the run that is being recorded: a re-scan of the
+        # same photo is another entry in this row's life, not a fresh row.
+        "events": (job.raw_ocr or {}).get("events") or [],
         "notes": outcome.notes,
+        # Which AI step read it, and every step this run spent getting there —
+        # the anchor both UIs escalate from, and the answer to "why did this
+        # receipt cost two model calls".
+        "ai": ({"service": outcome.ai_service, "model": outcome.ai_model,
+                "steps": outcome.ai_steps} if outcome.ai_service else None),
+        # Stage-by-stage record of this run: what ran, what it found, what it
+        # cost. Read back per receipt in both UIs, and aggregated by
+        # /scans/stats — the only way to tell an expensive photo from an
+        # expensive route.
+        "trace": [dataclasses.asdict(step) for step in outcome.trace],
         "fiscal_url": outcome.fiscal.raw_url if outcome.fiscal else None,
         "qr_state": outcome.qr_state,
         "ocr_available": outcome.ocr_available,
@@ -336,6 +374,11 @@ async def _handle_receipt(db: Session, data: bytes, filename: str | None, media_
             if outcome.reconciliation else None
         ),
     }
+
+    for step in outcome.trace:
+        scan_jobs.record_event(db, job, step.stage, actor="auto", outcome=step.outcome,
+                               detail=step.detail, ms=step.ms,
+                               tokens_in=step.tokens_in, tokens_out=step.tokens_out)
 
     receipt_id: str | None = None
     duplicate = False
@@ -472,6 +515,8 @@ async def resolve_series(job_id: str, choice: str = Query(...),
     job = db.get(ScanJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Сканування не знайдено")
+    scan_jobs.record_event(db, job, "series",
+                           detail="один чек" if choice == "one" else "різні чеки")
     try:
         return _series_out(await series_scan.resolve(db, job, choice))
     except ValueError as exc:
@@ -492,12 +537,12 @@ async def upload(file: UploadFile, db: Session = Depends(get_db)):
 
     media_type = file.content_type or "image/jpeg"
     try:
-        shape = image_dimensions(data)
+        shape = await asyncio.to_thread(image_dimensions, data)
     except Exception as exc:  # noqa: BLE001 — not a decodable image
         raise HTTPException(status_code=400, detail=f"Не вдалося прочитати зображення: {exc}") from exc
 
     try:
-        color = color_stats(data)
+        color = await asyncio.to_thread(color_stats, data)
     except Exception:  # noqa: BLE001 — colour signal is optional, shape still works
         color = None
 
@@ -828,6 +873,14 @@ class ScanJobOut(BaseModel):
     # Set when another scan already filed this same receipt: the id of the first
     # one, so the journal can show which rows are copies of the same purchase.
     duplicate_of: str | None = None
+    # "QR" / "ДПС кабінет" / "AI: Google Gemini / gemini-…" — what actually read
+    # this photo, shown in both UIs so the user can tell a fiscal document from
+    # a model's reading at a glance.
+    recognised_by: str = ""
+    # The next step of the OCR route after the one already spent, when there is
+    # one: {"service", "model", "label"}. Absent once the route is exhausted —
+    # that is what hides the "спробувати сильнішу AI" action.
+    next_ai: dict | None = None
 
 
 def _draft_purchased_at(draft: dict) -> dt.datetime | None:
@@ -841,10 +894,13 @@ def _draft_purchased_at(draft: dict) -> dt.datetime | None:
 
 
 def _scan_job_out(job: ScanJob, receipt: Receipt | None,
-                  duplicate_of: str | None = None) -> ScanJobOut:
+                  duplicate_of: str | None = None,
+                  next_ai: dict | None = None) -> ScanJobOut:
     draft = (job.raw_ocr or {}).get("draft") or {}
     return ScanJobOut(
         duplicate_of=duplicate_of,
+        recognised_by=scan_jobs.recognised_by(job),
+        next_ai=next_ai,
         id=job.id, source_filename=job.source_filename,
         status=job.status.value if hasattr(job.status, "value") else str(job.status),
         method=job.method, confidence=job.confidence,
@@ -890,14 +946,42 @@ def list_scans(db: Session = Depends(get_db), limit: int = Query(default=50, le=
         if job.receipt_id in receipts:
             first_scan.setdefault(job.receipt_id, job.id)
 
+    escalation = _escalation_resolver(db)
     return [
         _scan_job_out(
             j, receipts.get(j.receipt_id) if j.receipt_id else None,
             duplicate_of=(first_scan.get(j.receipt_id)
                           if j.receipt_id and first_scan.get(j.receipt_id) != j.id else None),
+            next_ai=escalation(j),
         )
         for j in rows
     ]
+
+
+def _escalation_resolver(db: Session):
+    """The "next AI step" lookup, with the route config read once for the list.
+
+    Every row resolves against the same current route: the step is found by the
+    service+model pair the row used, so a route the user has reordered since
+    still escalates in the order they now see in Settings.
+    """
+    from app.services import ai
+
+    try:
+        cfg = ai.load_config(db)
+    except Exception:  # noqa: BLE001 — a broken AI config must not blank the journal
+        logger.warning("could not read the AI config for the scan journal", exc_info=True)
+        return lambda _job: None
+
+    def resolve(job: ScanJob) -> dict | None:
+        used = scan_jobs.used_ai_step(job)
+        step = ai.next_ocr_step(db, used, cfg=cfg)
+        if step is None:
+            return None
+        service, model, label = step
+        return {"service": service, "model": model, "label": label}
+
+    return resolve
 
 
 @router.post("/scans/{job_id}/save-draft", response_model=ScanJobOut)
@@ -913,7 +997,8 @@ def save_scan_draft(job_id: str, db: Session = Depends(get_db)):
     except scan_jobs.ScanJobError as exc:
         raise HTTPException(status_code=404 if "не знайдено" in str(exc) else 409,
                             detail=str(exc)) from exc
-    out = _scan_job_out(scan_jobs.get_job(db, job_id), receipt)
+    job = scan_jobs.get_job(db, job_id)
+    out = _scan_job_out(job, receipt, next_ai=_escalation_resolver(db)(job))
     if duplicate:
         # The draft turned out to describe a purchase already on file; the row
         # now points at that receipt, which the draft has just filled out.
@@ -938,7 +1023,7 @@ def archive_scan(job_id: str, archived: bool = Query(default=True),
     except scan_jobs.ScanJobError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     receipt = db.get(Receipt, job.receipt_id) if job.receipt_id else None
-    return _scan_job_out(job, receipt)
+    return _scan_job_out(job, receipt, next_ai=_escalation_resolver(db)(job))
 
 class BulkScanIn(BaseModel):
     """One action over several journal rows."""
@@ -961,6 +1046,7 @@ class BulkScanOut(BaseModel):
     done: int
     failed: int
     results: list[BulkScanResultItem]
+    queued: bool = False
 
 
 # Rerunning recognition costs a model call per row, so a stray "select all" over
@@ -969,15 +1055,17 @@ BULK_MAX = 50
 
 
 @router.post("/scans/bulk", response_model=BulkScanOut)
-async def bulk_scans(payload: BulkScanIn, db: Session = Depends(get_db)):
+def bulk_scans(
+    payload: BulkScanIn,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """Apply one action to several scans, reporting each row separately.
 
     Rows are independent: one that cannot be archived (already gone) or rescanned
     (its image was never stored) must not stop the rest, so every row gets its own
     ok/detail instead of the whole batch failing on the first problem.
     """
-    from app.services import series_scan
-
     ids = list(dict.fromkeys(payload.ids))  # keep order, drop repeats
     if not ids:
         raise HTTPException(status_code=400, detail="Не вибрано жодного сканування")
@@ -988,6 +1076,19 @@ async def bulk_scans(payload: BulkScanIn, db: Session = Depends(get_db)):
                               "rescan_ai", "save_draft"}:
         raise HTTPException(status_code=400, detail=f"Невідома дія {payload.action!r}")
 
+    if payload.action in {"rescan", "rescan_ai"}:
+        background.add_task(
+            scan_jobs.run_rescan_batch,
+            ids,
+            ai_first=payload.action == "rescan_ai",
+        )
+        return BulkScanOut(
+            done=0,
+            failed=0,
+            queued=True,
+            results=[BulkScanResultItem(id=job_id, ok=True, detail="queued") for job_id in ids],
+        )
+
     results: list[BulkScanResultItem] = []
     for job_id in ids:
         try:
@@ -997,15 +1098,6 @@ async def bulk_scans(payload: BulkScanIn, db: Session = Depends(get_db)):
                 scan_jobs.delete_job(db, job_id, with_receipt=payload.with_receipt)
             elif payload.action == "save_draft":
                 scan_jobs.save_draft(db, job_id)
-            else:
-                ai_first = payload.action == "rescan_ai"
-                job = db.get(ScanJob, job_id)
-                if job is None:
-                    raise scan_jobs.ScanJobError("Сканування не знайдено")
-                if series_scan.is_series(job) and not job.receipt_id:
-                    await series_scan.rescan_series(db, job, ai_first=ai_first)
-                else:
-                    await scan_jobs.rescan_job(db, job_id, ai_first=ai_first)
             results.append(BulkScanResultItem(id=job_id, ok=True))
         except (scan_jobs.ScanJobError, ValueError) as exc:
             results.append(BulkScanResultItem(id=job_id, ok=False, detail=str(exc)))
@@ -1051,10 +1143,15 @@ def delete_scan(job_id: str, with_receipt: bool = Query(default=False),
 
 @router.post("/scans/{job_id}/rescan", response_model=UploadResult)
 async def rescan_scan(job_id: str, ai: bool = Query(default=False),
-                      replace: bool = Query(default=False), db: Session = Depends(get_db)):
+                      replace: bool = Query(default=False),
+                      escalate: bool = Query(default=False),
+                      db: Session = Depends(get_db)):
     """Re-run recognition on the stored image. `ai=true` skips local OCR and
-    templates and goes straight to AI vision; `replace=true` allows rerunning a
-    scan that already produced a receipt, replacing it with the new result.
+    templates and goes straight to AI vision; `escalate=true` additionally
+    resumes the AI route *after* the step already spent on this photo, reusing
+    the QR verdict instead of paying for the ladder again; `replace=true` allows
+    rerunning a scan that already produced a receipt, replacing it with the new
+    result.
 
     A scan glued from several photos re-runs all of its frames — rerunning only
     the first one would silently turn a three-photo receipt into a one-photo one.
@@ -1064,8 +1161,9 @@ async def rescan_scan(job_id: str, ai: bool = Query(default=False),
     try:
         job = db.get(ScanJob, job_id)
         if job is not None and series_scan.is_series(job) and not job.receipt_id:
-            return await series_scan.rescan_series(db, job, ai_first=ai)
-        return await scan_jobs.rescan_job(db, job_id, ai_first=ai, replace=replace)
+            return await series_scan.rescan_series(db, job, ai_first=ai, escalate=escalate)
+        return await scan_jobs.rescan_job(db, job_id, ai_first=ai, replace=replace,
+                                          escalate=escalate)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except scan_jobs.ScanJobError as exc:
@@ -1074,16 +1172,78 @@ async def rescan_scan(job_id: str, ai: bool = Query(default=False),
 
 @router.get("/scans/stats")
 def scan_stats(db: Session = Depends(get_db)):
-    rows = db.execute(select(ScanJob.method)).scalars().all()
+    """How recognition is actually performing, across every scan on file.
+
+    Three questions this has to answer, because each one changes a different
+    decision: how often the local QR ladder wins (it is free — every scan it
+    settles is a model call not made), which rung of that ladder pays off (the
+    ladder is ordered by expected value and only real receipts can confirm that
+    order), and which model reads receipts well enough to be worth its place in
+    the route.
+    """
+    rows = db.execute(select(ScanJob.method, ScanJob.confidence, ScanJob.raw_ocr)).all()
     total = len(rows)
     by_method: dict[str, int] = {}
-    for m in rows:
-        by_method[m or "none"] = by_method.get(m or "none", 0) + 1
-    ai_count = by_method.get("ai", 0)
+    qr_states: dict[str, int] = {}
+    variants: dict[str, int] = {}
+    stage_ms: dict[str, int] = {}
+    models: dict[str, dict] = {}
+    escalated = ai_scans = qr_ms = qr_decoded = 0
+
+    for method, confidence, raw in rows:
+        by_method[method or "none"] = by_method.get(method or "none", 0) + 1
+        raw = raw or {}
+        state = str(raw.get("qr_state") or "unknown")
+        qr_states[state] = qr_states.get(state, 0) + 1
+        steps = ((raw.get("ai") or {}).get("steps")) or []
+        if len(steps) > 1:
+            escalated += 1
+        for step in raw.get("trace") or []:
+            stage = str(step.get("stage") or "")
+            stage_ms[stage] = stage_ms.get(stage, 0) + int(step.get("ms") or 0)
+            if stage == "qr":
+                qr_ms += int(step.get("ms") or 0)
+                if step.get("outcome") == "ok":
+                    qr_decoded += 1
+                    # "zxing · roi_max_rgb · кадр 2" — the rung is the second part.
+                    parts = [p.strip() for p in str(step.get("detail") or "").split("·")]
+                    if len(parts) > 1:
+                        variants[parts[1]] = variants.get(parts[1], 0) + 1
+            elif stage == "ai":
+                ai_scans += 1
+                name = str(step.get("detail") or "").split("—")[0].strip() or "?"
+                row = models.setdefault(name, {"calls": 0, "ok": 0, "ms": 0,
+                                               "tokens_in": 0, "tokens_out": 0})
+                row["calls"] += 1
+                row["ok"] += 1 if step.get("outcome") == "ok" else 0
+                row["ms"] += int(step.get("ms") or 0)
+                row["tokens_in"] += int(step.get("tokens_in") or 0)
+                row["tokens_out"] += int(step.get("tokens_out") or 0)
+
+    traced = sum(1 for _m, _c, raw in rows if (raw or {}).get("trace"))
+    ai_count = sum(n for m, n in by_method.items() if m and m.startswith("ai"))
     return {
         "total": total,
         "by_method": by_method,
         "ai_share": round(ai_count / total, 3) if total else 0.0,
+        "saved_share": round(
+            sum(1 for _m, c, _r in rows if c == "high") / total, 3) if total else 0.0,
+        # Scans whose QR settled the receipt without any model call.
+        "qr_states": qr_states,
+        "qr_decoded_share": round(qr_decoded / traced, 3) if traced else 0.0,
+        "qr_avg_ms": round(qr_ms / traced) if traced else 0,
+        # Which rendering of the ladder decoded the code, most-used first.
+        "qr_variants": dict(sorted(variants.items(), key=lambda kv: -kv[1])),
+        "stage_ms": stage_ms,
+        "ai_calls": ai_scans,
+        "ai_escalated": escalated,
+        "ai_models": {
+            name: {**row, "avg_ms": round(row["ms"] / row["calls"]) if row["calls"] else 0}
+            for name, row in sorted(models.items(), key=lambda kv: -kv[1]["calls"])
+        },
+        # Rows written before the trace existed carry none of this, so the
+        # shares above are over `traced`, not over `total`.
+        "traced": traced,
     }
 
 

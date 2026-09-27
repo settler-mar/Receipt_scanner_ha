@@ -30,8 +30,23 @@ def test_full_history_state_is_namespaced_and_consumes_transient_options():
     assert request.load_all is True
     assert request.known_keys == {"10", "20"}
     assert request.initial_backfill is False
+    assert request.refresh_details is False
+    assert request.detail_known_keys == set()
     assert FullHistoryImport.LOAD_ALL_OPTION not in extra
     assert FullHistoryImport.STOP_KEYS_OPTION not in extra
+
+
+def test_full_history_can_refresh_provider_details_after_history_is_loaded():
+    extra = {
+        FullHistoryImport.marker_key("store-a"): True,
+        **FullHistoryImport.options(["10"], refresh_details=True),
+    }
+    request = FullHistoryImport.consume(extra, "store-a")
+
+    assert request.refresh_details is True
+    assert request.initial_backfill is True
+    assert request.detail_known_keys == set()
+    assert FullHistoryImport.REFRESH_DETAILS_OPTION not in extra
 
 
 def test_paginated_collector_stops_at_known_record_without_store_specific_code():

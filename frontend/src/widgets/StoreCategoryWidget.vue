@@ -73,7 +73,7 @@ function toggleRoot(key: string) {
 
 const depth = (c: StoreCategoryRow) => (c.path === '' ? 0 : c.path.split('/').length - 1)
 const parentPath = (c: StoreCategoryRow) => c.path.split('/').slice(0, -1).join('/')
-const rootKey = (c: StoreCategoryRow) => (c.path === '' ? 'uncat' : c.path.split('/')[0])
+const rootKey = (c: StoreCategoryRow) => (c.path === '' ? 'uncat' : c.path.split('/')[0] ?? c.path)
 
 const allStores = computed(() => data.value?.stores ?? [])
 const stores = computed(() => allStores.value.filter((s) => !hiddenStores.value.has(s.store_code)))

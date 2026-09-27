@@ -1,0 +1,17 @@
+---
+description: Backend architecture and validation rules
+globs: backend/**/*.py
+alwaysApply: false
+---
+
+# Backend rules
+
+- Routers in `backend/app/api/` validate requests, call services, and return
+  schemas. Keep business logic in `services`; provider calls in `adapters`.
+- Adapters must not access the database. External calls need timeout,
+  authentication-failure, and parse-failure handling.
+- Store timestamps as UTC-naive values. Preserve existing SQLite data and use a
+  guarded upgrade or Alembic migration for schema changes.
+- Add or update a focused fixture-based test for changed behavior.
+- Run the narrowest check with:
+  `cd backend && venv/bin/python -m pytest -q tests/<relevant_test>.py`

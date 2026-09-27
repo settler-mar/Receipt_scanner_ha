@@ -54,3 +54,15 @@ export function kyivInputToISO(local: string): string {
     60000
   return new Date(asUtc.getTime() - offsetMin * 60000).toISOString()
 }
+
+/** Uptime seconds → "3 д 4 год", "4 год 12 хв", "12 хв", "45 с". */
+export function fmtUptime(seconds: number | null | undefined): string {
+  if (seconds == null || seconds < 0) return '—'
+  const d = Math.floor(seconds / 86400)
+  const h = Math.floor((seconds % 86400) / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  if (d) return `${d} д ${h} год`
+  if (h) return `${h} год ${m} хв`
+  if (m) return `${m} хв`
+  return `${seconds} с`
+}

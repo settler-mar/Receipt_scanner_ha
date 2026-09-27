@@ -18,6 +18,9 @@ const range = computed(() => {
 // ?discount=0 → pre-discount (gross) amounts, matching the dashboard checkbox;
 // the widget's own checkbox can flip it for this embed (not persisted here).
 const includeDiscount = ref(!['0', 'false'].includes(String(route.query.discount ?? '')))
+// Widget settings aren't persisted from an embed — the widget falls back to its
+// own defaults, and a change lives only for this page's lifetime.
+const options = ref<Record<string, unknown> | null>(null)
 </script>
 
 <template>
@@ -27,7 +30,9 @@ const includeDiscount = ref(!['0', 'false'].includes(String(route.query.discount
       v-if="meta"
       :range="range"
       :include-discount="meta.supportsDiscount ? includeDiscount : undefined"
+      :options="meta.supportsOptions ? options : undefined"
       @update:include-discount="includeDiscount = $event"
+      @update:options="options = $event"
     />
     <div v-else class="card">
       <p class="muted">Невідомий віджет: {{ widgetKey }}</p>

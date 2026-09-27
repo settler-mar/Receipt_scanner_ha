@@ -672,3 +672,54 @@ def test_a_fiscal_qr_still_lets_a_single_line_receipt_through(monkeypatch):
     outcome = asyncio.run(scan_receipt_bytes(_png(400, 1400), ai_ocr=fuel_ai,
                                              enable_tax_cabinet=False))
     assert outcome.confidence == "high"
+
+
+def test_the_model_that_read_the_photo_is_recorded(monkeypatch):
+    """Which service and model produced a reading is part of the outcome: both
+    UIs show it, and the "stronger AI" action escalates from that exact pair."""
+    from app.scanner.fiscal_qr import QR_NONE, QrScan
+    from app.scanner.pipeline import AiReading
+
+    monkeypatch.setattr("app.scanner.pipeline.scan_qr", lambda _image: QrScan(QR_NONE))
+
+    async def routed_ai():
+        return AiReading(
+            {"shop_name": "МАГАЗИН", "total_amount": 100.0,
+             "items": [{"name": "Хліб", "total_price": 60.0},
+                       {"name": "Молоко", "total_price": 40.0}]},
+            service="google", model="gemini-a",
+            steps=["google/gemini-nano", "google/gemini-a"],
+        )
+
+    outcome = asyncio.run(scan_receipt_bytes(_png(400, 1400), ai_ocr=routed_ai))
+    assert (outcome.ai_service, outcome.ai_model) == ("google", "gemini-a")
+    assert outcome.ai_steps == ["google/gemini-nano", "google/gemini-a"]
+    # A run that cost two models says so, since that is what route tuning reads.
+    assert any("AI route:" in note for note in outcome.notes)
+
+
+def test_a_replayed_scan_reuses_the_qr_verdict_instead_of_decoding_again():
+    """Escalating to a stronger model must not re-run the QR ladder: it already
+    ran over these exact bytes and can only reach the same answer, at the cost of
+    seconds the user sits through."""
+    from app.scanner.fiscal_qr import QR_UNREADABLE, QrScan
+
+    calls = []
+
+    async def ai_ocr():
+        return {"total_amount": 50.0, "items": [{"name": "Кава", "total_price": 50.0}]}
+
+    import app.scanner.pipeline as pipeline
+
+    original = pipeline.scan_qr
+    pipeline.scan_qr = lambda image: calls.append(image) or QrScan("none")
+    try:
+        outcome = asyncio.run(scan_receipt_bytes(
+            _png(400, 1400), ai_ocr=ai_ocr, qr_scan=QrScan(QR_UNREADABLE)))
+    finally:
+        pipeline.scan_qr = original
+
+    assert calls == [], "the ladder must not run a second time"
+    assert outcome.qr_state == QR_UNREADABLE
+    # And the verdict still governs: an unreadable QR outranks a vision reading.
+    assert outcome.confidence == "low"

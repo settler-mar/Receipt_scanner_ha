@@ -5,6 +5,7 @@ from app.adapters.epicentrk import EpicentrKAdapter
 from app.adapters.fora import ForaAdapter
 from app.adapters.fozzy import FozzyAdapter
 from app.adapters.metro import MetroAdapter
+from app.adapters.monobank import MonobankAdapter
 from app.adapters.bars import BarsAdapter
 from app.adapters.brsm import BrsmAdapter
 from app.adapters.scanner import ScannerAdapter
@@ -14,11 +15,15 @@ from app.adapters.wog import WogAdapter
 from app.adapters.upg import UpgAdapter
 from app.adapters.foxtrot import FoxtrotAdapter
 from app.adapters.klo import KloAdapter
+from app.adapters.liki import LikiAdapter
 from app.adapters.vencon import VenconAdapter
 from app.adapters.prom import PromAdapter
+from app.adapters.rozetka import RozetkaAdapter
 from app.adapters.aliexpress import AliExpressAdapter
 from app.adapters.brain import BrainAdapter
 from app.adapters.eva import EvaAdapter
+from app.adapters.tabletki import TabletkiAdapter
+from app.adapters.olx import OlxAdapter
 
 _ADAPTERS: dict[str, BaseAdapter] = {
     "atb": AtbAdapter(),
@@ -38,9 +43,14 @@ _ADAPTERS: dict[str, BaseAdapter] = {
     "klo": KloAdapter(),
     "vencon": VenconAdapter(),
     "prom": PromAdapter(),
+    "rozetka": RozetkaAdapter(),
     "aliexpress": AliExpressAdapter(),
     "brain": BrainAdapter(),
     "eva": EvaAdapter(),
+    "liki": LikiAdapter(),
+    "tabletki": TabletkiAdapter(),
+    "olx": OlxAdapter(),
+    "monobank": MonobankAdapter(),
 }
 
 

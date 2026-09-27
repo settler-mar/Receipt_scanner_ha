@@ -9,21 +9,54 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from app.api import (accounts, categories, dashboard, duplicates, fiscal_queue, inbox, oauth, product_images,
-                     products, receipts, settings as settings_api, shopping_list,
-                     stores, telegram_log, voice, warranties, widgets)
+from app.api import (accounts, bank_transaction_rules, bank_transactions, categories, dashboard,
+                     duplicates, fiscal_queue, inbox, logs, nav, oauth, product_images, products,
+                     receipts, settings as settings_api, raw_responses, shopping_list, stores,
+                     telegram_log, voice, warranties, widgets)
 from app.core.config import settings
-from app.db import Base, engine, ensure_schema_upgrades, run_migrations
+from app.db import Base, SessionLocal, engine, ensure_schema_upgrades, run_migrations
 from app.mcp_server import mcp_app
 from app.models import models  # noqa: F401 — registers tables on Base.metadata
 from app.models import scanner as scanner_models  # noqa: F401 — Крок 3 tables on Base.metadata
 from app.models import shopping as shopping_models  # noqa: F401 — Крок 2 tables on Base.metadata
+from app.models import prompts as prompt_models  # noqa: F401 — editable AI prompt tables
 from app.scheduler import start_scheduler
 from app.seed import seed_categories, seed_stores
 from app.services.telegram import polling_loop as telegram_polling_loop
+from app.services import prompt_catalog
 
 
 _STARTED_AT = dt.datetime.now(dt.timezone.utc)
+
+
+def _app_version() -> str:
+    """Build version for /api/health.
+
+    The image bakes it in as RS_VERSION (Dockerfile BUILD_VERSION). Outside a
+    container fall back to the checked-out commit, so a dev run still reports
+    something identifiable instead of a constant.
+    """
+    env = os.environ.get("RS_VERSION")
+    if env:
+        return env
+    try:
+        import subprocess
+
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if sha.returncode == 0 and sha.stdout.strip():
+            return f"dev+{sha.stdout.strip()}"
+    except Exception:
+        pass
+    return "dev"
+
+
+_VERSION = _app_version()
 
 
 @asynccontextmanager
@@ -34,6 +67,8 @@ async def lifespan(app: FastAPI):
     # are still there onto the data directory the deployment mounts.
     inbox.migrate_legacy_scan_inputs()
     run_migrations()
+    with SessionLocal() as db:
+        prompt_catalog.ensure_defaults(db)
     seed_stores()
     seed_categories()
     start_scheduler()
@@ -63,12 +98,15 @@ app.include_router(stores.router)
 app.include_router(accounts.router)
 app.include_router(categories.router)
 app.include_router(receipts.router)
+app.include_router(raw_responses.router)
 app.include_router(dashboard.router)
 app.include_router(widgets.router)
 app.include_router(products.router)
 app.include_router(product_images.router)
 app.include_router(warranties.router)
 app.include_router(oauth.router)
+app.include_router(bank_transactions.router)
+app.include_router(bank_transaction_rules.router)
 app.include_router(settings_api.router)
 app.include_router(inbox.router)
 app.include_router(fiscal_queue.router)
@@ -76,6 +114,8 @@ app.include_router(shopping_list.router)
 app.include_router(duplicates.router)
 app.include_router(voice.router)
 app.include_router(telegram_log.router)
+app.include_router(logs.router)
+app.include_router(nav.router)
 
 # Own MCP server (ROADMAP.md Крок 4) — Streamable HTTP at /mcp, LAN-only like
 # the REST API. Mounted after every /api router so it can't shadow one.
@@ -88,6 +128,7 @@ def health():
     uptime_seconds = int((now - _STARTED_AT).total_seconds())
     return {
         "status": "ok",
+        "version": _VERSION,
         "started_at": _STARTED_AT.isoformat(),
         "uptime_seconds": uptime_seconds,
         "uptime": str(dt.timedelta(seconds=uptime_seconds)),

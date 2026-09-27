@@ -1,0 +1,19 @@
+---
+description: Vue frontend architecture and validation rules
+globs: frontend/src/**/*.{ts,vue}
+alwaysApply: false
+---
+
+# Frontend rules
+
+- Use Vue 3 Composition API with `<script setup lang="ts">` and existing
+  components/CSS variables.
+- Put shared HTTP calls in `frontend/src/lib`, API types in
+  `frontend/src/types`, pages in `views`, and reusable UI in `components` or
+  `widgets`.
+- Preserve current Ukrainian/Russian wording and handle loading, empty, and
+  error states.
+- Keep the UI dense and operational; do not add a UI library without a clear
+  need.
+- Before checks, use Node 22.18+ or 24.12+. Run `cd frontend && npm run build`.
+  Known pre-existing type errors are documented in `AGENTS.md`.

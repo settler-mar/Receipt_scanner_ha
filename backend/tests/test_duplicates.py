@@ -144,6 +144,40 @@ def test_far_time_is_not_candidate(db):
     assert db.query(models.DuplicateGroup).count() == 0
 
 
+def test_same_amount_and_items_with_different_order_time_needs_review(db):
+    """An order timestamp can differ from the fiscal receipt timestamp by
+    hours; matching basket evidence should still surface the pair for review."""
+    fiscal_time = dt.datetime(2026, 9, 21, 15, 29, 2, tzinfo=dt.timezone.utc)
+    order_time = dt.datetime(2026, 9, 21, 9, 0, tzinfo=dt.timezone.utc)
+    receipt(
+        db, "scanner", "fiscal:4001396988:bWmxvOu915U", fiscal_time, 424.50,
+        raw={"seller_edrpou": "46121710"}, items=0,
+    )
+    fiscal = db.query(models.Receipt).filter_by(external_id="fiscal:4001396988:bWmxvOu915U").one()
+    db.add_all([
+        models.ReceiptItem(receipt=fiscal, name="Назоферон спрей назал. 100 000 МО/мл фл. 5мл №1 Фармак", quantity=1, total_price=236.50),
+        models.ReceiptItem(receipt=fiscal, name="Панадол Бебі сусп. орал. 120мг/5мл фл. 100мл Фармаклер", quantity=1, total_price=188.00),
+    ])
+    receipt(
+        db, "manual", "order:639139279", order_time, 424.50,
+        raw={"source": "pharmacy_preorder", "reservation_type": "pharmacy_pickup"},
+        shop="Аптека", address="Святопетрівське", items=0,
+    )
+    order = db.query(models.Receipt).filter_by(external_id="order:639139279").one()
+    db.add_all([
+        models.ReceiptItem(receipt=order, name="Панадол Бебі суспензія оральна 120 мг/5 мл флакон 100 мл", quantity=1, total_price=188.00),
+        models.ReceiptItem(receipt=order, name="Назоферон спрей назальний 100 000 МО/мл флакон 5 мл 1 шт", quantity=1, total_price=236.50),
+    ])
+    db.commit()
+
+    run = duplicates.run_duplicate_search(db)
+
+    assert run.candidates_new == 1
+    group = db.query(models.DuplicateGroup).one()
+    assert group.status == models.DuplicateStatus.needs_review
+    assert "similar item composition" in group.reasons
+
+
 def test_ambiguous_same_amount_needs_review(db):
     t = dt.datetime(2026, 9, 1, 10, 0, tzinfo=dt.timezone.utc)
     receipt(db, "metro", "m1", t, 100.00, shop="Магазин A", address="Адреса A", payment="cash")
@@ -155,10 +189,17 @@ def test_ambiguous_same_amount_needs_review(db):
     assert group.status == models.DuplicateStatus.needs_review
 
 
-def test_merge_moves_rich_items_and_preserves_tags_then_rollback(db):
+def test_merge_moves_rich_items_and_preserves_tags_then_rollback(db, monkeypatch, tmp_path):
     t = dt.datetime(2026, 9, 1, 10, 0, tzinfo=dt.timezone.utc)
     rich = receipt(db, "metro", "m1", t, 7061.43, raw={"rrn": "99"}, items=15, tags=("metro_trip",))
     sparse = receipt(db, "scanner", "s1", t + dt.timedelta(minutes=2), 7061.43, raw={"rrn": "99"}, items=1, tags=("tax_copy",))
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    source_photo = photo_dir / f"{sparse.id}.jpg"
+    source_photo.write_bytes(b"receipt-photo")
+    sparse.photo_filename = source_photo.name
+    db.commit()
+    monkeypatch.setattr(duplicates, "PHOTO_DIR", photo_dir)
     duplicates.run_duplicate_search(db)
     group = db.query(models.DuplicateGroup).one()
 
@@ -171,6 +212,8 @@ def test_merge_moves_rich_items_and_preserves_tags_then_rollback(db):
     assert len(rich.items) == 15
     assert {t.tag for t in rich.tags} == {"metro_trip", "tax_copy"}
     assert sparse.raw["merged_into_receipt_id"] == rich.id
+    assert rich.photo_filename == f"{rich.id}.jpg"
+    assert (photo_dir / rich.photo_filename).read_bytes() == b"receipt-photo"
     assert len(rich.raw["source_receipts"]) == 2
     assert [r["id"] for r in duplicates.group_payload(db, group)["receipts"]] == [rich.id]
     visible = list_receipts(

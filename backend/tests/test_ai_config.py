@@ -1,5 +1,6 @@
 """Config/persistence/routing for app.services.ai (no live model calls)."""
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -104,10 +105,11 @@ def test_cloud_key_is_encrypted_at_rest_and_masked(db):
 
 
 def test_usage_meter_resets_per_month(db):
-    ai._record_usage(db, backend="cloud", tokens_in=10, tokens_out=5)
+    ai._record_usage(db, backend="cloud", tokens_in=10, tokens_out=5, cached_tokens=8)
     ai._record_usage(db, backend="local")
     usage = ai.load_usage(db)
     assert usage["cloud_tokens_in"] == 10 and usage["cloud_calls"] == 1 and usage["local_calls"] == 1
+    assert usage["cloud_cached_tokens"] == 8
 
     db.get(models.AppSetting, ai.USAGE_KEY).value = {
         "month": "1999-01", "cloud_tokens_in": 999, "cloud_tokens_out": 0,
@@ -144,7 +146,7 @@ def test_run_walks_the_priority_list(db):
 
         return call
 
-    assert asyncio.run(ai._run(db, cfg, "normalize", make_call=make_call)) == {"query": "молоко"}
+    assert asyncio.run(ai._run(db, cfg, "normalize", make_call=make_call)).value == {"query": "молоко"}
     # The model comes from the provider's active list when the route leaves it empty.
     assert used == [("local", "qwen2.5:3b-instruct"), ("anthropic", "claude-haiku-4-5")]
 
@@ -167,7 +169,7 @@ def test_a_target_without_key_or_switched_off_is_skipped(db):
         called.append(provider)
         return _ok
 
-    assert asyncio.run(ai._run(db, cfg, "normalize", make_call=make_call)) == {"query": "молоко"}
+    assert asyncio.run(ai._run(db, cfg, "normalize", make_call=make_call)).value == {"query": "молоко"}
     assert called == ["mistral"]   # the disabled provider never got a turn
 
 
@@ -187,7 +189,7 @@ def test_cloud_dropped_when_over_budget_but_local_still_runs(db):
         seen.append(provider)
         return _ok
 
-    assert asyncio.run(ai._run(db, cfg, "normalize", make_call=make_call)) == {"query": "молоко"}
+    assert asyncio.run(ai._run(db, cfg, "normalize", make_call=make_call)).value == {"query": "молоко"}
     assert seen == ["local"]   # the paid target was skipped, the free one ran
 
 
@@ -212,7 +214,7 @@ def test_vision_skips_local_targets(db):
                                         media_type="image/jpeg", max_tokens=64))
     finally:
         ai._cloud_vision = original
-    assert out == '{"items": []}'
+    assert out.value == '{"items": []}'
     assert seen == [("openai", "gpt-4o")]
 
 
@@ -233,7 +235,7 @@ def test_custom_provider_needs_a_base_url_but_no_key(db):
     cfg.provider("custom_openai_vllm").base_url = "http://localhost:8000/v1"
     ai.save_config(db, cfg)
     assert ai.provider_ready(db, ai.load_config(db), "custom_openai_vllm") is None
-    assert asyncio.run(ai._run(db, cfg, "normalize", make_call=lambda p, m: _ok)) == {"query": "молоко"}
+    assert asyncio.run(ai._run(db, cfg, "normalize", make_call=lambda p, m: _ok)).value == {"query": "молоко"}
 
 
 def test_multiple_custom_providers_have_distinct_keys(db):
@@ -338,10 +340,36 @@ def test_run_meters_and_logs_local_and_errors(db):
     assert len(log) == 2
 
 
+def test_run_meters_and_logs_cached_cloud_tokens(db):
+    cfg = ai.load_config(db)
+    _enable(cfg, "openai", "gpt-4o-mini")
+    cfg.routing["normalize"] = [_target("openai", "gpt-4o-mini")]
+    ai.save_config(db, cfg)
+    ai.set_cloud_key(db, "openai", "sk-x")
+
+    async def cloud_ok():
+        return {"query": "молоко"}, 1400, 8, '{"query": "молоко"}', 1280
+
+    asyncio.run(ai._run(db, cfg, "normalize", make_call=lambda p, m: cloud_ok))
+
+    assert ai.load_usage(db)["cloud_cached_tokens"] == 1280
+    assert ai.recent_log(db)[0]["cached_tokens"] == 1280
+
+
 def test_build_classify_prompt_contains_names_and_taxonomy():
     system, user = ai.build_classify_prompt(["молоко", "хліб"], ["продукти", "продукти/овочі"])
-    assert "молоко" in user and "продукти/овочі" in user and "category_path" in user
+    assert "молоко" in user
+    assert "продукти/овочі" in system and "category_path" in system
     assert "JSON" in system.upper() or "json" in system
+
+
+def test_build_classify_prompt_contains_store_and_clarification_context():
+    _, user = ai.build_classify_prompt(
+        ["омивач"],
+        ["авто", "авто/рідини"],
+        {"омивач": {"store_name": "Аврора", "clarification": "для скла авто"}},
+    )
+    assert "Аврора" in user and "для скла авто" in user and '"name": "омивач"' in user
 
 
 def test_anthropic_workspace_id_becomes_a_header():
@@ -349,6 +377,30 @@ def test_anthropic_workspace_id_becomes_a_header():
     assert with_ws.default_headers.get("anthropic-workspace-id") == "wrkspc_1"
     without = ai._anthropic_client("k", None)
     assert "anthropic-workspace-id" not in without.default_headers
+
+
+def test_anthropic_marks_stable_system_prompt_for_caching(monkeypatch):
+    sent = {}
+
+    class Messages:
+        async def create(self, **kwargs):
+            sent.update(kwargs)
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text='{"ok": true}')],
+                usage=SimpleNamespace(input_tokens=20, output_tokens=3,
+                                      cache_creation_input_tokens=1000,
+                                      cache_read_input_tokens=0),
+            )
+
+    monkeypatch.setattr(ai, "_anthropic_client",
+                        lambda key, workspace_id=None: SimpleNamespace(messages=Messages()))
+    result = asyncio.run(ai._anthropic_call(
+        "sk-x", model="claude-sonnet-5", system="stable rules", content="dynamic",
+        max_tokens=100,
+    ))
+
+    assert sent["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert result == ('{"ok": true}', 1020, 3, 0)
 
 
 def test_routing_gains_tasks_added_after_the_config_was_saved():
@@ -500,3 +552,62 @@ def test_per_provider_model_endpoint(tmp_path, monkeypatch):
     assert speech["live"] is False and speech["models"] == []
     assert speech["stt"] == ai.STT_MODEL_CHOICES[ai.GOOGLE_STT]
     assert missing.status_code == 404
+
+
+def test_one_receipt_shot_in_parts_is_one_model_call(db):
+    """A receipt taller than the frame is photographed in parts, and the parts
+    are one document: one call carrying every frame, or the answer comes back as
+    three short receipts instead of one long one."""
+    cfg = ai.load_config(db)
+    _enable(cfg, "openai", "gpt-4o-mini")
+    cfg.routing["ocr"] = [_target("openai", "gpt-4o-mini")]
+    ai.save_config(db, cfg)
+    ai.set_cloud_key(db, "openai", "sk-x")
+
+    calls = []
+    reply = ('{"total_amount": 90.0, "items": [{"name": "Хліб", "total_price": 90.0}]}')
+
+    async def fake_openai(base_url, key, *, model, messages, max_tokens):
+        calls.append(messages)
+        return reply, 7, 3
+
+    original, ai._openai_call = ai._openai_call, fake_openai
+    try:
+        out = asyncio.run(ai.ocr_receipt(db, b"frame-1", "image/jpeg",
+                                         extra_images=[b"frame-2", b"frame-3"]))
+    finally:
+        ai._openai_call = original
+
+    assert out.data["total_amount"] == 90.0
+    assert (out.service, out.model) == ("openai", "gpt-4o-mini")
+    assert len(calls) == 1, "one receipt must not cost three calls"
+    content = calls[0][-1]["content"]
+    assert sum(1 for part in content if part["type"] == "image_url") == 3
+    # And the model is told what the three pictures are, or it answers per image.
+    system = calls[0][0]["content"]
+    assert "ONE receipt" in system and "do not repeat an item" in system
+
+
+def test_a_single_photo_says_nothing_about_parts(db):
+    """The multi-frame instructions are not free — they are dropped for the
+    ordinary one-photo receipt, which is nearly every receipt."""
+    cfg = ai.load_config(db)
+    _enable(cfg, "openai", "gpt-4o-mini")
+    cfg.routing["ocr"] = [_target("openai", "gpt-4o-mini")]
+    ai.save_config(db, cfg)
+    ai.set_cloud_key(db, "openai", "sk-x")
+
+    calls = []
+
+    async def fake_openai(base_url, key, *, model, messages, max_tokens):
+        calls.append(messages)
+        return '{"total_amount": 5.0, "items": [{"name": "Кава", "total_price": 5.0}]}', 1, 1
+
+    original, ai._openai_call = ai._openai_call, fake_openai
+    try:
+        asyncio.run(ai.ocr_receipt(db, b"one-frame", "image/jpeg"))
+    finally:
+        ai._openai_call = original
+
+    assert "ONE receipt" not in calls[0][0]["content"]
+    assert sum(1 for p in calls[0][-1]["content"] if p["type"] == "image_url") == 1

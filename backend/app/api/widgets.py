@@ -53,12 +53,22 @@ def _spend_trend(db, date_from, date_to, include_discount=True):
     return {
         "summary": {
             "total_spent": round(sum(p.total_spent for p in points), 2),
+            "total_discount": round(sum(p.total_discount for p in points), 2),
+            "total_bonuses": round(sum(p.total_bonuses for p in points), 2),
+            "total_bonuses_used": round(sum(p.total_bonuses_used for p in points), 2),
             "buckets": len(points),
             "first_period": points[0].period if points else None,
             "last_period": points[-1].period if points else None,
         },
         "items": [
-            {"period": p.period, "total_spent": round(p.total_spent, 2), "receipt_count": p.receipt_count}
+            {
+                "period": p.period,
+                "total_spent": round(p.total_spent, 2),
+                "receipt_count": p.receipt_count,
+                "total_discount": round(p.total_discount, 2),
+                "total_bonuses": round(p.total_bonuses, 2),
+                "total_bonuses_used": round(p.total_bonuses_used, 2),
+            }
             for p in points
         ],
     }
@@ -81,8 +91,39 @@ def _by_store(db, date_from, date_to, include_discount=True):
                 "receipt_count": r.receipt_count,
                 "total_spent": round(r.total_spent, 2),
                 "total_discount": round(r.total_discount, 2),
+                "total_bonuses": round(r.total_bonuses, 2),
+                "total_bonuses_used": round(r.total_bonuses_used, 2),
             }
             for r in rows
+        ],
+    }
+
+
+def _savings(db, date_from, date_to, include_discount=True):
+    """Discounts and loyalty per store — the detail behind the "Заощаджено" and
+    bonus stat cards. Amounts here never depend on `include_discount`; the flag
+    only moves `total_spent`, which this widget reports as the pre-discount base
+    the discount percentage is taken from."""
+    rows = dash.by_store(db=db, date_from=date_from, date_to=date_to, include_discount=include_discount)
+    gross = sum(r.total_spent + (r.total_discount if include_discount else 0) for r in rows)
+    total_discount = sum(r.total_discount for r in rows)
+    return {
+        "summary": {
+            "total_discount": round(total_discount, 2),
+            "total_bonuses": round(sum(r.total_bonuses for r in rows), 2),
+            "total_bonuses_used": round(sum(r.total_bonuses_used for r in rows), 2),
+            "discount_pct": round(total_discount / gross * 100, 1) if gross else 0.0,
+        },
+        "items": [
+            {
+                "store_code": r.store_code,
+                "store_name": r.store_name,
+                "total_discount": round(r.total_discount, 2),
+                "total_bonuses": round(r.total_bonuses, 2),
+                "total_bonuses_used": round(r.total_bonuses_used, 2),
+            }
+            for r in rows
+            if r.total_discount or r.total_bonuses or r.total_bonuses_used
         ],
     }
 
@@ -220,6 +261,7 @@ WIDGETS: dict[str, tuple[str, object, bool]] = {
     "spend-trend": ("Витрати за період", _spend_trend, True),
     "by-store": ("Витрати за магазином", _by_store, True),
     "by-channel": ("Онлайн / офлайн", _by_channel, True),
+    "savings": ("Заощадження та бонуси", _savings, True),
     "by-category": ("Витрати за категоріями", _by_category, True),
     "store-category": ("Магазини × категорії", _store_category, True),
     "fuel-prices": ("Ціни на паливо", _fuel_prices, False),
@@ -236,7 +278,7 @@ def list_widgets():
 
 
 @router.get("/{key}")
-async def get_widget(
+def get_widget(
     key: str,
     db: Session = Depends(get_db),
     date_from: dt.datetime | None = None,
@@ -248,9 +290,10 @@ async def get_widget(
         raise HTTPException(status_code=404, detail=f"Unknown widget: {key}")
     label, builder, _supports_range = entry
 
+    # All registered builders are synchronous SQLAlchemy/dashboard functions.
+    # Keeping this handler synchronous makes FastAPI run it in its worker pool
+    # instead of blocking the event loop with aggregate queries.
     result = builder(db, date_from, date_to, include_discount)
-    if hasattr(result, "__await__"):
-        result = await result
 
     return {
         "widget": key,

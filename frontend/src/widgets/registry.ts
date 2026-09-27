@@ -8,6 +8,8 @@ export interface WidgetMeta {
   supportsRange: boolean
   /** Whether the dashboard's "враховувати знижку" checkbox changes this widget. */
   supportsDiscount: boolean
+  /** Whether the widget keeps its own settings blob in the stored layout. */
+  supportsOptions?: boolean
   defaultVisible: boolean
 }
 
@@ -27,6 +29,7 @@ export const WIDGETS: WidgetMeta[] = [
     title: 'Витрати за період',
     supportsRange: true,
     supportsDiscount: true,
+    supportsOptions: true,
     defaultVisible: true,
     component: defineAsyncComponent(() => import('./SpendTrendWidget.vue')),
   },
@@ -45,6 +48,14 @@ export const WIDGETS: WidgetMeta[] = [
     supportsDiscount: true,
     defaultVisible: true,
     component: defineAsyncComponent(() => import('./ByChannelWidget.vue')),
+  },
+  {
+    key: 'savings',
+    title: 'Заощадження та бонуси',
+    supportsRange: true,
+    supportsDiscount: true,
+    defaultVisible: true,
+    component: defineAsyncComponent(() => import('./SavingsWidget.vue')),
   },
   {
     key: 'by-category',

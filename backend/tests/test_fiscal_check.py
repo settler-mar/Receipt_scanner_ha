@@ -33,6 +33,20 @@ def check():
                            raw_url="https://cabinet.tax.gov.ua/cashregs/check?id=20960071")
 
 
+def test_mac_id_is_the_document_the_tax_office_addresses():
+    """This ПРРО numbers receipts within the shift in E/@NO (5641 here) and
+    carries the ДПС document id in MAC/@ID — the id the QR link holds and the
+    cabinet names the download after. Keying on NO made two different purchases
+    of the same till share one identity, so the second import was merged into
+    the first, totals and all."""
+    check = parse_check_xml(
+        (pathlib.Path(__file__).parent / "fixtures" / "fiscal_check_mac_id.xml").read_bytes())
+    assert check.document_id == "bWmxvOu915U"
+    assert check.fiscal_number == "4001396988"
+    assert check.to_normalized_receipt().external_id == "fiscal:4001396988:bWmxvOu915U"
+    assert check.total == 424.50
+
+
 def test_header(check):
     assert check.fiscal_number == "3000878603"
     assert check.document_id == "20960071"
@@ -189,6 +203,7 @@ def test_item_barcodes_from_xml(xml_only_check):
     assert [l.barcode for l in xml_only_check.lines] == ["4823086123236", "4820075504250"]
     receipt = xml_only_check.to_normalized_receipt()
     assert receipt.items[0].barcode == "4823086123236"
+    assert receipt.items[0].product_code == "00000000001011"
     assert receipt.raw["seller_tax_number"] == "300000000001"
 
 
@@ -199,3 +214,13 @@ def test_known_tax_number_names_the_retail_brand():
     assert check.seller_name == "АТБ"
     assert check.seller_edrpou is None      # ЄДРПОУ is not derivable from ПН
     assert check.cashier == "Приватний П. П."
+
+
+def test_oldi_xml_names_the_shop_from_its_tax_number():
+    """The ПРРО document carries no sign at all — only ПН 2473884265 05 and the
+    single meta row "ЧЕК:8.2489.123" — so the brand has to come from the ПН."""
+    check = parse_check_xml((FIXTURE.parent / "fiscal_check_oldi.xml").read_bytes())
+    assert check.seller_tax_number == "247388426505"
+    assert check.seller_edrpou is None      # a 12-digit ПН is not an ЄДРПОУ
+    assert check.seller_name == "ОЛДИ"
+    assert check.to_normalized_receipt().shop_name == "ОЛДИ"
